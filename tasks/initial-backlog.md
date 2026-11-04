@@ -9,9 +9,9 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | PREP-002 | Revisar configuração PostgreSQL local existente | PREP-001 | Concluída — revisão estática; `docker compose -f infra/postgres/docker-compose.yml config --quiet` passou. |
 | PREP-003 | Configuração, logs e erros | PREP-006 | Concluída — `specs/server-foundation.md`; `cargo fmt --all -- --check`, `cargo check --workspace` e `cargo clippy --workspace --all-targets -- -D warnings` passaram. |
 | PREP-004 | Migrations/metadados iniciais | PREP-002, PREP-003, PREP-006, AUTH-001, ADR-0002 | Concluída — `specs/metadata-migrations.md`; `cargo run -p pgrustadmin-server -- migrate` aplicou v1/v2 e o catálogo confirmou constraints/versões. |
-| PREP-005 | CI fmt/test/Clippy | PREP-006 | Concluída — workflow em `.github/workflows/ci.yml`; comandos conferidos, sem execução remota por ainda não haver commit/push. |
+| PREP-005 | CI fmt/test/Clippy | PREP-006 | Concluída — workflow em `.github/workflows/ci.yml`; o resultado da primeira execução remota será registrado na PR de tarefa. |
 | AUTH-001 | Modelo de usuário | PREP-003, ADR-0002 | Concluída — `specs/metadata-schema.md`; UUID v4, email trim/lowercase e tipos do usuário em `app-core`; fmt, check e Clippy passaram. |
-| AUTH-002 | Argon2id | AUTH-001 | Pendente — `specs/authentication.md` |
+| AUTH-002 | Argon2id | AUTH-001 | Concluída — `specs/authentication.md`; parâmetros Argon2id e hash PHC implementados; 2 testes unitários, fmt, check e Clippy passaram. |
 | AUTH-004 | Modelo e armazenamento de sessões | AUTH-002, PREP-004 | Pendente |
 | AUTH-003 | Login/logout | AUTH-002, AUTH-004 | Pendente |
 | AUTH-005 | Autorização por recurso | AUTH-004 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-AUTH-002 (Argon2id) é a próxima tarefa de implementação. O workflow CI já inclui `cargo test --workspace`; os testes não foram executados localmente.
+AUTH-002 está concluída. O próximo item é AUTH-004 (modelo e armazenamento de sessões); revisar as decisões ainda abertas sobre token/cookie e duração antes de congelar o esquema.

@@ -1,6 +1,7 @@
 use std::{ffi::OsStr, io, net::SocketAddr};
 
 use axum::Router;
+pub mod auth;
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
