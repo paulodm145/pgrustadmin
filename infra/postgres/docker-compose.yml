@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: pgrustadmin-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pgrustadmin_dev
+      POSTGRES_USER: pgrustadmin
+      POSTGRES_PASSWORD: pgrustadmin_dev
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgrustadmin_pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgrustadmin -d pgrustadmin_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  pgrustadmin_pgdata:

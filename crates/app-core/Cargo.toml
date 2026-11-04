@@ -1,0 +1,7 @@
+[package]
+name = "pgrustadmin-app-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+uuid.workspace = true

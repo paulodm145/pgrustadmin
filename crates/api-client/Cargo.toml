@@ -1,0 +1,4 @@
+[package]
+name = "pgrustadmin-api-client"
+version.workspace = true
+edition.workspace = true
