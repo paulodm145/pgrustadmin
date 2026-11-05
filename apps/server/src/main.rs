@@ -1,7 +1,8 @@
 use std::{ffi::OsStr, io, net::SocketAddr};
 
-use axum::Router;
 pub mod auth;
+
+use auth::handlers::router as auth_router;
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -33,11 +34,20 @@ async fn run() -> io::Result<()> {
 
 async fn run_server() -> io::Result<()> {
     let bind_addr = configured_bind_addr()?;
+    let database_url = std::env::var("PGRUSTADMIN_METADATA_DATABASE_URL").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "PGRUSTADMIN_METADATA_DATABASE_URL is required to run the server",
+        )
+    })?;
+    let metadata_pool = connect_metadata_pool(&database_url)
+        .await
+        .map_err(|_| io::Error::other("could not connect to metadata database"))?;
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
     tracing::info!(%local_addr, "server listening");
-    axum::serve(listener, Router::new()).await
+    axum::serve(listener, auth_router(metadata_pool)).await
 }
 
 async fn migrate_metadata() -> io::Result<()> {

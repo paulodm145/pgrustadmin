@@ -3,7 +3,7 @@
 Gerenciador PostgreSQL com TUI, API/servidor e interfaces futuras Web e Desktop.
 
 ## Estado
-Workspace Rust preparado, com inicialização básica do servidor e migration inicial de metadados. As funcionalidades do MVP continuam pendentes; a presença de uma especificação não significa que estejam implementadas.
+Workspace Rust preparado. O servidor inclui migrations explícitas de metadados, hashing Argon2id e endpoints iniciais de login/logout/sessão; os demais recursos do MVP continuam pendentes. A presença de uma especificação não significa que uma funcionalidade esteja implementada.
 
 ## MVP
 - PostgreSQL como único banco administrado.
