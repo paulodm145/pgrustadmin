@@ -11,6 +11,7 @@ Consulte `docs/development/spec-driven-workflow.md` para o ciclo de cada tarefa.
 5. AUTH-001 — modelo de usuário definido; decisões registradas em ADR-0002 e `specs/metadata-schema.md`.
 6. PREP-004 — migrations iniciais aplicadas ao PostgreSQL local; detalhes em `specs/metadata-migrations.md`.
 7. PREP-005 — workflow CI configurado em `.github/workflows/ci.yml` e especificado em `specs/ci.md`.
-8. AUTH-002 — Argon2id concluído conforme `specs/authentication.md`; próxima tarefa: AUTH-004, definir armazenamento de sessões antes de implementar login/logout.
+8. AUTH-002 — Argon2id concluído conforme `specs/authentication.md`.
+9. AUTH-004 — armazenamento de sessões expiráveis e revogáveis concluído; próxima tarefa: AUTH-003, login/logout, usando Bearer com validade fixa de 12 horas.
 
 Ao iniciar cada tarefa, identificar sua especificação, dependências e critérios verificáveis. Registrar bloqueios e validações reais no backlog. Não implementar enquanto houver decisão necessária sem resposta.

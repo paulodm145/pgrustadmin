@@ -4,6 +4,6 @@ Login obrigatório. Senhas com Argon2id v19, parâmetros m=19456 KiB, t=2, p=1 e
 
 Aceite: login válido cria sessão; inválido retorna erro genérico; sessão expirada/revogada é recusada; usuário não acessa recursos de outro por alteração de ID; logout invalida sessão.
 
-Em aberto: token/cookie, duração/renovação, CSRF se cookie, rate limit e recuperação de senha.
+Decisão inicial: clientes enviam um token opaco no cabeçalho `Authorization: Bearer`. O servidor gera um UUID v4 com 122 bits aleatórios, entrega o token uma vez e persiste somente seu hash SHA-256. A sessão expira em 12 horas, sem renovação no MVP. O token Bearer evita CSRF baseado em cookies; clientes web devem proteger a sessão contra XSS. Rate limit e recuperação de senha permanecem em aberto.
 
 Hashing e verificação são operações síncronas que consomem CPU/memória. Handlers async devem executá-las fora do worker Tokio quando a API de autenticação for implementada.
