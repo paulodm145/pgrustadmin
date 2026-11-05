@@ -12,7 +12,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | PREP-005 | CI fmt/test/Clippy | PREP-006 | Concluída — workflow em `.github/workflows/ci.yml`; o resultado da primeira execução remota será registrado na PR de tarefa. |
 | AUTH-001 | Modelo de usuário | PREP-003, ADR-0002 | Concluída — `specs/metadata-schema.md`; UUID v4, email trim/lowercase e tipos do usuário em `app-core`; fmt, check e Clippy passaram. |
 | AUTH-002 | Argon2id | AUTH-001 | Concluída — `specs/authentication.md`; parâmetros Argon2id e hash PHC implementados; 2 testes unitários, fmt, check e Clippy passaram. |
-| AUTH-004 | Modelo e armazenamento de sessões | AUTH-002, PREP-004 | Pendente |
+| AUTH-004 | Modelo e armazenamento de sessões | AUTH-002, PREP-004 | Concluída — `specs/authentication.md`, `specs/metadata-schema.md`; migration v3 e operações SQLx para criar, validar e revogar sessões; fmt, testes, check, Clippy e aplicação local da migration passaram. |
 | AUTH-003 | Login/logout | AUTH-002, AUTH-004 | Pendente |
 | AUTH-005 | Autorização por recurso | AUTH-004 | Pendente |
 | CON-001 | CRUD conexões | AUTH-005 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-AUTH-002 está concluída. O próximo item é AUTH-004 (modelo e armazenamento de sessões); revisar as decisões ainda abertas sobre token/cookie e duração antes de congelar o esquema.
+AUTH-004 está concluída conforme `specs/authentication.md` e `specs/metadata-schema.md`; próxima tarefa: AUTH-003 (login/logout), usando Bearer opaco com validade fixa de 12 horas. Clientes web precisam proteger tokens contra XSS.
