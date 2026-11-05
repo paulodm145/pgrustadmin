@@ -1,6 +1,7 @@
 //! Integração PostgreSQL do PGRustAdmin.
 
-use sqlx::{PgPool, migrate::MigrateError, postgres::PgPoolOptions};
+pub use sqlx::PgPool;
+use sqlx::{migrate::MigrateError, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 static METADATA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -60,4 +61,14 @@ pub async fn revoke_session(pool: &PgPool, token_hash: &[u8; 32]) -> Result<bool
     .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+pub async fn find_user_for_login(
+    pool: &PgPool,
+    normalized_email: &str,
+) -> Result<Option<(Uuid, String, bool)>, sqlx::Error> {
+    sqlx::query_as("SELECT id, password_hash, is_active FROM users WHERE email = $1")
+        .bind(normalized_email)
+        .fetch_optional(pool)
+        .await
 }

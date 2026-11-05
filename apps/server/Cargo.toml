@@ -13,3 +13,4 @@ pgrustadmin-app-core.workspace = true
 argon2.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+serde.workspace = true
