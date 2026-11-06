@@ -1,5 +1,7 @@
 use std::fmt;
 
+use axum::http::{HeaderMap, header::AUTHORIZATION};
+use pgrustadmin_postgres_driver::{PgPool, PostgresError, session_user_id};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -32,6 +34,28 @@ impl fmt::Debug for SessionToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionToken([REDACTED])")
     }
+}
+
+pub(crate) fn token_hash_from_headers(headers: &HeaderMap) -> Option<[u8; 32]> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+
+    if !scheme.eq_ignore_ascii_case("Bearer") || token.is_empty() || token.contains(' ') {
+        return None;
+    }
+
+    Some(SessionToken::hash(token))
+}
+
+pub(crate) async fn session_user_id_from_headers(
+    pool: &PgPool,
+    headers: &HeaderMap,
+) -> Result<Option<Uuid>, PostgresError> {
+    let Some(token_hash) = token_hash_from_headers(headers) else {
+        return Ok(None);
+    };
+
+    session_user_id(pool, &token_hash).await
 }
 
 #[cfg(test)]

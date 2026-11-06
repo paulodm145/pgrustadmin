@@ -15,7 +15,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | AUTH-004 | Modelo e armazenamento de sessões | AUTH-002, PREP-004 | Concluída — `specs/authentication.md`, `specs/metadata-schema.md`; migration v3 e operações SQLx para criar, validar e revogar sessões; fmt, testes, check, Clippy e aplicação local da migration passaram. |
 | AUTH-003 | Login/logout | AUTH-002, AUTH-004 | Concluída — `specs/authentication.md`, `specs/api.md`; endpoints login/logout/sessão, falha genérica, Argon2id fora do worker Tokio; fmt, 6 testes, check, Clippy e smoke HTTP com PostgreSQL passaram. |
 | CON-002 | Criptografia credenciais | ADR-0003 | Concluída — `specs/connections.md`; envelope XChaCha20-Poly1305 versionado, chave Base64 por ambiente, AAD proprietário/conexão, backup/perda/rotação definidos; 11 testes, fmt, check e Clippy passaram. |
-| CON-001 | CRUD conexões | AUTH-004, CON-002 | Pendente |
+| CON-001 | CRUD conexões | AUTH-004, CON-002 | Concluída — `specs/connections.md`, `specs/api.md`; migration v4, CRUD paginado e owner-filtered, segredo cifrado; 13 testes, fmt, check, Clippy, migration e smoke HTTP com dois usuários passaram. |
 | AUTH-005 | Autorização por recurso | CON-001 | Pendente — validar isolamento por proprietário em recurso real; evitar camada genérica sem uso. |
 | CON-003 | Teste conexão | CON-001, AUTH-005 | Pendente |
 | CON-004 | TLS/timeouts | CON-003 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-CON-002 está concluída conforme `specs/connections.md` e ADR-0003. Próxima sequência: implementar CRUD de conexões com filtro obrigatório por proprietário (CON-001), depois validar isolamento no recurso concreto (AUTH-005). O runtime conecta ao banco de metadados sem aplicar migrations automaticamente.
+CON-001 está concluída conforme `specs/connections.md` e `specs/api.md`; próxima tarefa: AUTH-005, consolidar e testar isolamento por recurso em conexões. O runtime conecta ao banco de metadados sem aplicar migrations automaticamente.
