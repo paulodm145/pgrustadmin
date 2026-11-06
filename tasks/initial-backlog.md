@@ -17,7 +17,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | CON-002 | Criptografia credenciais | ADR-0003 | Concluída — `specs/connections.md`; envelope XChaCha20-Poly1305 versionado, chave Base64 por ambiente, AAD proprietário/conexão, backup/perda/rotação definidos; 11 testes, fmt, check e Clippy passaram. |
 | CON-001 | CRUD conexões | AUTH-004, CON-002 | Concluída — `specs/connections.md`, `specs/api.md`; migration v4, CRUD paginado e owner-filtered, segredo cifrado; 13 testes, fmt, check, Clippy, migration e smoke HTTP com dois usuários passaram. |
 | AUTH-005 | Autorização por recurso | CON-001 | Concluída — teste HTTP/PostgreSQL com duas sessões confirma lista isolada e `404` cruzado em GET/PUT/DELETE; CI usa PostgreSQL efêmero; 14 testes, fmt, check e Clippy passaram. |
-| CON-003 | Teste conexão | CON-001, AUTH-005 | Pendente |
+| CON-003 | Teste conexão | CON-001, AUTH-005 | Concluída — POST protegido busca credencial por owner, descriptografa em memória e testa PostgreSQL; integração confirma sucesso, falha sanitizada e 404 para outro usuário. |
 | CON-004 | TLS/timeouts | CON-003 | Pendente |
 | API-001 | API base | PREP-003 | Pendente |
 | API-002 | Cliente HTTP | API-001 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-AUTH-005 está concluída com teste automatizado de ownership. Próxima tarefa: CON-003, testar uma conexão PostgreSQL cadastrada com erro sanitizado. O runtime conecta ao banco de metadados sem aplicar migrations automaticamente.
+CON-003 está concluída com teste real de sucesso/falha contra PostgreSQL. Próxima tarefa: CON-004, aplicar timeout e validar TLS/erros do teste de conexão. O runtime conecta ao banco de metadados sem aplicar migrations automaticamente.

@@ -12,6 +12,8 @@ Para CON-002, usar XChaCha20-Poly1305 via RustCrypto. A chave vem de `PGRUSTADMI
 
 Aceite CON-001: CRUD isolado por usuário, ownership verificado no servidor e no SQL, senha nunca retornada nem persistida em texto puro, paginação e conflito de nome documentados.
 
+`POST /api/v1/connections/{id}/test` testa a credencial armazenada, exige autenticação e ownership e responde `200` com `{ "success": true|false }`. Falhas de conexão não retornam a mensagem original do driver. O endpoint descriptografa a credencial em memória e a consulta ao registro é limitada ao proprietário.
+
 Aceite CON-003: teste de conexão distingue sucesso/falha sem vazar segredo e integra com PostgreSQL real. Aceite CON-004: TLS e timeout aplicados e erros sanitizados.
 
 Aceite adicional para CON-002: texto puro só é recuperado com a mesma chave, UUID do proprietário e UUID da conexão; alteração no envelope, chave ou contexto falha fechada; versão desconhecida é rejeitada.
