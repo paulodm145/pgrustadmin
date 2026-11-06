@@ -1,6 +1,7 @@
 use std::{ffi::OsStr, io, net::SocketAddr};
 
 pub mod auth;
+pub mod credentials;
 
 use auth::handlers::router as auth_router;
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};

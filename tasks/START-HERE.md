@@ -13,6 +13,9 @@ Consulte `docs/development/spec-driven-workflow.md` para o ciclo de cada tarefa.
 7. PREP-005 — workflow CI configurado em `.github/workflows/ci.yml` e especificado em `specs/ci.md`.
 8. AUTH-002 — Argon2id concluído conforme `specs/authentication.md`.
 9. AUTH-004 — armazenamento de sessões expiráveis e revogáveis concluído.
-10. AUTH-003 — login/logout e validação de sessão Bearer concluídos; próxima tarefa: AUTH-005, autorização por recurso.
+10. AUTH-003 — login/logout e validação de sessão Bearer concluídos.
+11. CON-002 — proteção de credenciais em repouso concluída conforme ADR-0003.
+12. CON-001 — próxima: CRUD de conexões com isolamento por proprietário.
+13. AUTH-005 — validar a autorização no recurso concreto de conexões; não criar camada sem uso.
 
 Ao iniciar cada tarefa, identificar sua especificação, dependências e critérios verificáveis. Registrar bloqueios e validações reais no backlog. Não implementar enquanto houver decisão necessária sem resposta.
