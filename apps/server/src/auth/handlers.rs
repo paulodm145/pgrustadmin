@@ -1,21 +1,19 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use pgrustadmin_app_core::{EmailAddress, PasswordHash};
 use pgrustadmin_postgres_driver::PgPool;
-use pgrustadmin_postgres_driver::{
-    create_session, find_user_for_login, revoke_session, session_user_id,
-};
+use pgrustadmin_postgres_driver::{create_session, find_user_for_login, revoke_session};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
     password::{PasswordError, hash_password, verify_password},
-    session::SessionToken,
+    session::{SessionToken, session_user_id_from_headers, token_hash_from_headers},
 };
 
 const SESSION_LIFETIME_SECONDS: u64 = 12 * 60 * 60;
@@ -111,7 +109,7 @@ async fn login(State(pool): State<PgPool>, Json(request): Json<LoginRequest>) ->
 }
 
 async fn logout(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
-    if let Some(token_hash) = bearer_token_hash(&headers)
+    if let Some(token_hash) = token_hash_from_headers(&headers)
         && revoke_session(&pool, &token_hash).await.is_err()
     {
         return internal_error();
@@ -121,26 +119,11 @@ async fn logout(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
 }
 
 async fn current_session(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
-    let Some(token_hash) = bearer_token_hash(&headers) else {
-        return unauthorized();
-    };
-
-    match session_user_id(&pool, &token_hash).await {
+    match session_user_id_from_headers(&pool, &headers).await {
         Ok(Some(user_id)) => (StatusCode::OK, Json(SessionResponse { user_id })).into_response(),
         Ok(None) => unauthorized(),
         Err(_) => internal_error(),
     }
-}
-
-fn bearer_token_hash(headers: &HeaderMap) -> Option<[u8; 32]> {
-    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, token) = value.split_once(' ')?;
-
-    if !scheme.eq_ignore_ascii_case("Bearer") || token.is_empty() || token.contains(' ') {
-        return None;
-    }
-
-    Some(SessionToken::hash(token))
 }
 
 fn invalid_credentials() -> Response {
@@ -177,7 +160,7 @@ fn internal_error() -> Response {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 
-    use super::bearer_token_hash;
+    use crate::auth::session::token_hash_from_headers;
 
     #[test]
     fn bearer_token_hash_accepts_case_insensitive_scheme() {
@@ -188,7 +171,7 @@ mod tests {
         );
 
         assert_eq!(
-            bearer_token_hash(&headers),
+            token_hash_from_headers(&headers),
             Some(crate::auth::session::SessionToken::hash("opaque-token"))
         );
     }
@@ -200,7 +183,7 @@ mod tests {
             if !value.is_empty() {
                 headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
             }
-            assert_eq!(bearer_token_hash(&headers), None);
+            assert_eq!(token_hash_from_headers(&headers), None);
         }
     }
 }

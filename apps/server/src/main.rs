@@ -1,9 +1,12 @@
 use std::{ffi::OsStr, io, net::SocketAddr};
 
+use axum::Router;
 pub mod auth;
+pub mod connections;
 pub mod credentials;
 
 use auth::handlers::router as auth_router;
+use connections::router as connections_router;
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -48,7 +51,10 @@ async fn run_server() -> io::Result<()> {
     let local_addr = listener.local_addr()?;
 
     tracing::info!(%local_addr, "server listening");
-    axum::serve(listener, auth_router(metadata_pool)).await
+    let app = Router::new()
+        .merge(auth_router(metadata_pool.clone()))
+        .merge(connections_router(metadata_pool));
+    axum::serve(listener, app).await
 }
 
 async fn migrate_metadata() -> io::Result<()> {
