@@ -20,7 +20,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | CON-003 | Teste conexão | CON-001, AUTH-005 | Concluída — POST protegido busca credencial por owner, descriptografa em memória e testa PostgreSQL; integração confirma sucesso, falha sanitizada e 404 para outro usuário. |
 | CON-004 | TLS/timeouts | CON-003 | Concluída — TLS obrigatório sem downgrade quando habilitado; timeout total de 5 s; erro do driver reduzido a `success: false`; teste unitário confirma modos TLS e integração valida conexão real. |
 | API-001 | API base | PREP-003 | Concluída — health/version públicos e respostas JSON com códigos estáveis para rota/método ausentes; testes cobrindo os quatro contratos. |
-| API-002 | Cliente HTTP | API-001 | Pendente |
+| API-002 | Cliente HTTP | API-001 | Concluída — cliente reqwest reutilizável, URL/env local, timeout, TLS Rustls, auth e conexões tipados; token e senha protegidos, erros sem body arbitrário; 3 testes de cliente e suíte workspace passaram. |
 | TUI-001 | Loop eventos/layout | PREP-001 | Pendente |
 | TUI-002 | Login TUI | API-002/AUTH-003 | Pendente |
 | TUI-003 | Conexões TUI | TUI-002/CON-001 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-API-001 está concluída com health/version e fallback JSON para 404/405. Próxima tarefa: API-002, cliente HTTP tipado que consome os contratos existentes de autenticação e conexões.
+API-002 está concluída com cliente assíncrono tipado para autenticação e conexões. Próxima tarefa: TUI-001, iniciar o loop de eventos e layout do terminal.
