@@ -2,3 +2,9 @@
 name = "pgrustadmin-tui"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+ratatui.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+tokio.workspace = true

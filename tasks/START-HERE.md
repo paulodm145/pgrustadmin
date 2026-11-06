@@ -21,5 +21,6 @@ Consulte `docs/development/spec-driven-workflow.md` para o ciclo de cada tarefa.
 15. CON-004 — política TLS sem downgrade, timeout e resposta sanitizada concluídos; próxima tarefa: API-001.
 16. API-001 — health/version e erros JSON para 404/405 concluídos; próxima tarefa: API-002, cliente HTTP tipado.
 17. API-002 — cliente assíncrono tipado para autenticação e conexões concluído; próxima tarefa: TUI-001, loop e layout.
+18. TUI-001 — loop assíncrono e layout responsivo concluídos; próxima tarefa: TUI-002, login e sessão.
 
 Ao iniciar cada tarefa, identificar sua especificação, dependências e critérios verificáveis. Registrar bloqueios e validações reais no backlog. Não implementar enquanto houver decisão necessária sem resposta.
