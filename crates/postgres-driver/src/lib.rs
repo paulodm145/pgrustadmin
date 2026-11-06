@@ -1,7 +1,11 @@
 //! Integração PostgreSQL do PGRustAdmin.
 
+use sqlx::{
+    Connection,
+    migrate::MigrateError,
+    postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
+};
 pub use sqlx::{Error as PostgresError, PgPool};
-use sqlx::{migrate::MigrateError, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 static METADATA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -24,6 +28,53 @@ pub struct ConnectionData<'a> {
     pub database_name: &'a str,
     pub username: &'a str,
     pub tls_enabled: bool,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct StoredConnectionCredentials {
+    pub host: String,
+    pub port: i32,
+    pub database_name: String,
+    pub username: String,
+    pub tls_enabled: bool,
+    pub credential_envelope: Vec<u8>,
+}
+
+pub async fn find_connection_credentials_for_owner(
+    pool: &PgPool,
+    owner_id: Uuid,
+    connection_id: Uuid,
+) -> Result<Option<StoredConnectionCredentials>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT host, port, database_name, username, tls_enabled, credential_envelope \
+         FROM connections WHERE owner_id = $1 AND id = $2",
+    )
+    .bind(owner_id)
+    .bind(connection_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn test_database_connection(
+    connection: &StoredConnectionCredentials,
+    password: &str,
+) -> Result<(), sqlx::Error> {
+    let port = u16::try_from(connection.port)
+        .map_err(|_| sqlx::Error::Protocol("stored database port is invalid".into()))?;
+    let ssl_mode = if connection.tls_enabled {
+        PgSslMode::Require
+    } else {
+        PgSslMode::Disable
+    };
+    let options = PgConnectOptions::new()
+        .host(&connection.host)
+        .port(port)
+        .database(&connection.database_name)
+        .username(&connection.username)
+        .password(password)
+        .ssl_mode(ssl_mode);
+    let connection = sqlx::PgConnection::connect_with(&options).await?;
+    connection.close().await
 }
 
 pub async fn connect_metadata_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {

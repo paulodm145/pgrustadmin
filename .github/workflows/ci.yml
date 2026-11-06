@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PGRUSTADMIN_TEST_DATABASE_URL: postgres://pgrustadmin:pgrustadmin_test@127.0.0.1:5432/pgrustadmin_test
+      PGRUSTADMIN_TEST_CONNECTION_PASSWORD: pgrustadmin_test
+      PGRUSTADMIN_TEST_CONNECTION_PORT: 5432
       PGRUSTADMIN_CREDENTIAL_KEY: KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=
     services:
       postgres:

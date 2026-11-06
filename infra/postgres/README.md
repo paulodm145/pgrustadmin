@@ -35,6 +35,8 @@ O teste de autorização precisa de um banco descartável. Crie-o uma vez:
 ```bash
 docker compose -f infra/postgres/docker-compose.yml exec -T postgres createdb -U pgrustadmin pgrustadmin_test
 export PGRUSTADMIN_TEST_DATABASE_URL='postgresql://pgrustadmin:pgrustadmin_dev@127.0.0.1:55432/pgrustadmin_test'
+export PGRUSTADMIN_TEST_CONNECTION_PASSWORD='pgrustadmin_dev'
+export PGRUSTADMIN_TEST_CONNECTION_PORT=55432
 export PGRUSTADMIN_CREDENTIAL_KEY='KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio='
 cargo test --workspace
 ```

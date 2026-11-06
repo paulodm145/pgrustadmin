@@ -10,8 +10,8 @@ use axum::{
 };
 use pgrustadmin_postgres_driver::{
     ConnectionData, ConnectionSummary, PgPool, PostgresError, create_connection,
-    delete_connection_for_owner, find_connection_for_owner, list_connections_for_owner,
-    update_connection_for_owner,
+    delete_connection_for_owner, find_connection_credentials_for_owner, find_connection_for_owner,
+    list_connections_for_owner, test_database_connection, update_connection_for_owner,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -27,6 +27,7 @@ pub fn router(pool: PgPool) -> Router {
             "/api/v1/connections/{id}",
             get(read).put(update).delete(remove),
         )
+        .route("/api/v1/connections/{id}/test", axum::routing::post(test))
         .with_state(pool)
 }
 
@@ -86,6 +87,46 @@ struct ConnectionListResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: &'static str,
+}
+
+#[derive(Serialize)]
+struct ConnectionTestResponse {
+    success: bool,
+}
+
+async fn test(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    connection_path: Result<Path<Uuid>, PathRejection>,
+) -> Response {
+    let owner_id = match authenticated_owner(&pool, &headers).await {
+        Ok(owner_id) => owner_id,
+        Err(error) => return authentication_error_response(error),
+    };
+    let Ok(Path(connection_id)) = connection_path else {
+        return bad_request();
+    };
+    let connection =
+        match find_connection_credentials_for_owner(&pool, owner_id, connection_id).await {
+            Ok(Some(connection)) => connection,
+            Ok(None) => return not_found(),
+            Err(_) => return internal_error(),
+        };
+    let cipher = match CredentialCipher::from_env() {
+        Ok(cipher) => cipher,
+        Err(_) => return credential_configuration_error(),
+    };
+    let password = match cipher.decrypt(&connection.credential_envelope, owner_id, connection_id) {
+        Ok(password) => password,
+        Err(_) => return internal_error(),
+    };
+    let Ok(password) = std::str::from_utf8(&password) else {
+        return internal_error();
+    };
+    let success = test_database_connection(&connection, password)
+        .await
+        .is_ok();
+    (StatusCode::OK, Json(ConnectionTestResponse { success })).into_response()
 }
 
 async fn list(
@@ -555,13 +596,20 @@ mod tests {
             .expect("create second owner session");
 
         let app = super::router(pool.clone());
+        let test_password = env::var("PGRUSTADMIN_TEST_CONNECTION_PASSWORD")
+            .expect("test connection password must be configured");
+        let test_port = env::var("PGRUSTADMIN_TEST_CONNECTION_PORT")
+            .expect("test connection port must be configured")
+            .parse::<u16>()
+            .expect("test connection port must be valid");
         let payload = serde_json::json!({
             "name": "authorization test",
             "host": "127.0.0.1",
-            "port": 5432,
-            "database": "sample",
-            "username": "readonly",
-            "password": "test-credential"
+            "port": test_port,
+            "database": "pgrustadmin_test",
+            "username": "pgrustadmin",
+            "tls_enabled": false,
+            "password": test_password
         });
         let created = send_request(
             app.clone(),
@@ -580,9 +628,63 @@ mod tests {
         let connection_id = created_json["id"]
             .as_str()
             .expect("response has connection ID");
-        assert_eq!(created_json["tls_enabled"], true);
+        assert_eq!(created_json["tls_enabled"], false);
         assert!(created_json.get("password").is_none());
         assert!(created_json.get("credential_envelope").is_none());
+
+        let connection_test = send_request(
+            app.clone(),
+            Method::POST,
+            &format!("/api/v1/connections/{connection_id}/test"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(connection_test.status(), StatusCode::OK);
+        let test_body = to_bytes(connection_test.into_body(), 4096)
+            .await
+            .expect("read connection test response");
+        let test_json: serde_json::Value =
+            serde_json::from_slice(&test_body).expect("decode connection test response");
+        assert_eq!(test_json, serde_json::json!({"success": true}));
+
+        let mut invalid_credentials = payload.clone();
+        invalid_credentials["password"] = serde_json::json!("incorrect-test-password");
+        let updated = send_request(
+            app.clone(),
+            Method::PUT,
+            &format!("/api/v1/connections/{connection_id}"),
+            Some(owner_token.as_str()),
+            Some(invalid_credentials),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+        let failed_test = send_request(
+            app.clone(),
+            Method::POST,
+            &format!("/api/v1/connections/{connection_id}/test"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(failed_test.status(), StatusCode::OK);
+        let failed_body = to_bytes(failed_test.into_body(), 4096)
+            .await
+            .expect("read failed connection test response");
+        let failed_json: serde_json::Value =
+            serde_json::from_slice(&failed_body).expect("decode failed connection test response");
+        assert_eq!(failed_json, serde_json::json!({"success": false}));
+        assert!(!String::from_utf8_lossy(&failed_body).contains("incorrect-test-password"));
+
+        let other_owner_test = send_request(
+            app.clone(),
+            Method::POST,
+            &format!("/api/v1/connections/{connection_id}/test"),
+            Some(other_owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(other_owner_test.status(), StatusCode::NOT_FOUND);
 
         for (method, body) in [
             (Method::GET, None),
