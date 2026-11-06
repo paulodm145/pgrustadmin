@@ -14,10 +14,10 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | AUTH-002 | Argon2id | AUTH-001 | Concluída — `specs/authentication.md`; parâmetros Argon2id e hash PHC implementados; 2 testes unitários, fmt, check e Clippy passaram. |
 | AUTH-004 | Modelo e armazenamento de sessões | AUTH-002, PREP-004 | Concluída — `specs/authentication.md`, `specs/metadata-schema.md`; migration v3 e operações SQLx para criar, validar e revogar sessões; fmt, testes, check, Clippy e aplicação local da migration passaram. |
 | AUTH-003 | Login/logout | AUTH-002, AUTH-004 | Concluída — `specs/authentication.md`, `specs/api.md`; endpoints login/logout/sessão, falha genérica, Argon2id fora do worker Tokio; fmt, 6 testes, check, Clippy e smoke HTTP com PostgreSQL passaram. |
-| AUTH-005 | Autorização por recurso | AUTH-004 | Pendente |
-| CON-001 | CRUD conexões | AUTH-005 | Pendente |
-| CON-002 | Criptografia credenciais | ADR-0003 | Pendente |
-| CON-003 | Teste conexão | CON-001 | Pendente |
+| CON-002 | Criptografia credenciais | ADR-0003 | Concluída — `specs/connections.md`; envelope XChaCha20-Poly1305 versionado, chave Base64 por ambiente, AAD proprietário/conexão, backup/perda/rotação definidos; 11 testes, fmt, check e Clippy passaram. |
+| CON-001 | CRUD conexões | AUTH-004, CON-002 | Pendente |
+| AUTH-005 | Autorização por recurso | CON-001 | Pendente — validar isolamento por proprietário em recurso real; evitar camada genérica sem uso. |
+| CON-003 | Teste conexão | CON-001, AUTH-005 | Pendente |
 | CON-004 | TLS/timeouts | CON-003 | Pendente |
 | API-001 | API base | PREP-003 | Pendente |
 | API-002 | Cliente HTTP | API-001 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-AUTH-003 está concluída conforme `specs/authentication.md` e `specs/api.md`; próxima tarefa: AUTH-005 (autorização por recurso). O runtime conecta ao banco de metadados para atender requisições, sem aplicar migrations automaticamente.
+CON-002 está concluída conforme `specs/connections.md` e ADR-0003. Próxima sequência: implementar CRUD de conexões com filtro obrigatório por proprietário (CON-001), depois validar isolamento no recurso concreto (AUTH-005). O runtime conecta ao banco de metadados sem aplicar migrations automaticamente.
