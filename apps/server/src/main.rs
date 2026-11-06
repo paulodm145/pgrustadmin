@@ -1,10 +1,12 @@
 use std::{ffi::OsStr, io, net::SocketAddr};
 
 use axum::Router;
+pub mod api;
 pub mod auth;
 pub mod connections;
 pub mod credentials;
 
+use api::router as api_router;
 use auth::handlers::router as auth_router;
 use connections::router as connections_router;
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
@@ -52,6 +54,7 @@ async fn run_server() -> io::Result<()> {
 
     tracing::info!(%local_addr, "server listening");
     let app = Router::new()
+        .merge(api_router())
         .merge(auth_router(metadata_pool.clone()))
         .merge(connections_router(metadata_pool));
     axum::serve(listener, app).await
