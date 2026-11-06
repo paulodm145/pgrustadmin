@@ -23,4 +23,6 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+`cargo test --workspace` inclui teste HTTP/PostgreSQL e exige `PGRUSTADMIN_TEST_DATABASE_URL` apontando para uma base descartável; veja `infra/postgres/README.md`.
+
 CI executa esses comandos em push e pull request via `.github/workflows/ci.yml`.

@@ -16,6 +16,6 @@ Consulte `docs/development/spec-driven-workflow.md` para o ciclo de cada tarefa.
 10. AUTH-003 — login/logout e validação de sessão Bearer concluídos.
 11. CON-002 — proteção de credenciais em repouso concluída conforme ADR-0003.
 12. CON-001 — CRUD de conexões com isolamento por proprietário concluído.
-13. AUTH-005 — próxima: consolidar e testar a autorização no recurso de conexões com dois usuários.
+13. AUTH-005 — teste automatizado de autorização com dois usuários concluído; próxima tarefa: CON-003, testar uma conexão cadastrada.
 
 Ao iniciar cada tarefa, identificar sua especificação, dependências e critérios verificáveis. Registrar bloqueios e validações reais no backlog. Não implementar enquanto houver decisão necessária sem resposta.
