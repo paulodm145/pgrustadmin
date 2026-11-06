@@ -14,6 +14,8 @@ Aceite CON-001: CRUD isolado por usuário, ownership verificado no servidor e no
 
 `POST /api/v1/connections/{id}/test` testa a credencial armazenada, exige autenticação e ownership e responde `200` com `{ "success": true|false }`. Falhas de conexão não retornam a mensagem original do driver. O endpoint descriptografa a credencial em memória e a consulta ao registro é limitada ao proprietário.
 
+CON-004: `tls_enabled=true` usa `sslmode=require`, sem fallback para conexão sem TLS; `false` desativa TLS explicitamente. A conexão de teste tem limite fixo de 5 segundos. Erro de rede, autenticação, TLS ou timeout retorna `success: false` sem detalhes do driver. `require` exige criptografia e só valida a CA quando uma CA raiz está configurada pelo ambiente; validação do nome do servidor e configuração de certificados não fazem parte deste MVP.
+
 Aceite CON-003: teste de conexão distingue sucesso/falha sem vazar segredo e integra com PostgreSQL real. Aceite CON-004: TLS e timeout aplicados e erros sanitizados.
 
 Aceite adicional para CON-002: texto puro só é recuperado com a mesma chave, UUID do proprietário e UUID da conexão; alteração no envelope, chave ou contexto falha fechada; versão desconhecida é rejeitada.

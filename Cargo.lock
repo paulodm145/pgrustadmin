@@ -973,6 +973,7 @@ name = "pgrustadmin-postgres-driver"
 version = "0.1.0"
 dependencies = [
  "sqlx",
+ "tokio",
  "uuid",
 ]
 

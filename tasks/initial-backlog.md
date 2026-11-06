@@ -18,7 +18,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | CON-001 | CRUD conexões | AUTH-004, CON-002 | Concluída — `specs/connections.md`, `specs/api.md`; migration v4, CRUD paginado e owner-filtered, segredo cifrado; 13 testes, fmt, check, Clippy, migration e smoke HTTP com dois usuários passaram. |
 | AUTH-005 | Autorização por recurso | CON-001 | Concluída — teste HTTP/PostgreSQL com duas sessões confirma lista isolada e `404` cruzado em GET/PUT/DELETE; CI usa PostgreSQL efêmero; 14 testes, fmt, check e Clippy passaram. |
 | CON-003 | Teste conexão | CON-001, AUTH-005 | Concluída — POST protegido busca credencial por owner, descriptografa em memória e testa PostgreSQL; integração confirma sucesso, falha sanitizada e 404 para outro usuário. |
-| CON-004 | TLS/timeouts | CON-003 | Pendente |
+| CON-004 | TLS/timeouts | CON-003 | Concluída — TLS obrigatório sem downgrade quando habilitado; timeout total de 5 s; erro do driver reduzido a `success: false`; teste unitário confirma modos TLS e integração valida conexão real. |
 | API-001 | API base | PREP-003 | Pendente |
 | API-002 | Cliente HTTP | API-001 | Pendente |
 | TUI-001 | Loop eventos/layout | PREP-001 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-CON-003 está concluída com teste real de sucesso/falha contra PostgreSQL. Próxima tarefa: CON-004, aplicar timeout e validar TLS/erros do teste de conexão. O runtime conecta ao banco de metadados sem aplicar migrations automaticamente.
+CON-004 está concluída com timeout e política TLS documentados e validados. Próxima tarefa: API-001, estabelecer a base compartilhada da API conforme a especificação. O runtime conecta ao banco de metadados sem aplicar migrations automaticamente.

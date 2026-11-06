@@ -18,5 +18,6 @@ Consulte `docs/development/spec-driven-workflow.md` para o ciclo de cada tarefa.
 12. CON-001 — CRUD de conexões com isolamento por proprietário concluído.
 13. AUTH-005 — teste automatizado de autorização com dois usuários concluído; próxima tarefa: CON-003, testar uma conexão cadastrada.
 14. CON-003 — teste protegido da conexão PostgreSQL cadastrada concluído; próxima tarefa: CON-004, timeout e validação do TLS.
+15. CON-004 — política TLS sem downgrade, timeout e resposta sanitizada concluídos; próxima tarefa: API-001.
 
 Ao iniciar cada tarefa, identificar sua especificação, dependências e critérios verificáveis. Registrar bloqueios e validações reais no backlog. Não implementar enquanto houver decisão necessária sem resposta.

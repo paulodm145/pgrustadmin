@@ -6,7 +6,10 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
 };
 pub use sqlx::{Error as PostgresError, PgPool};
+use std::time::Duration;
 use uuid::Uuid;
+
+const CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 static METADATA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -59,6 +62,19 @@ pub async fn test_database_connection(
     connection: &StoredConnectionCredentials,
     password: &str,
 ) -> Result<(), sqlx::Error> {
+    let options = connection_options(connection, password)?;
+    tokio::time::timeout(CONNECTION_TEST_TIMEOUT, async {
+        let connection = sqlx::PgConnection::connect_with(&options).await?;
+        connection.close().await
+    })
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
+fn connection_options(
+    connection: &StoredConnectionCredentials,
+    password: &str,
+) -> Result<PgConnectOptions, sqlx::Error> {
     let port = u16::try_from(connection.port)
         .map_err(|_| sqlx::Error::Protocol("stored database port is invalid".into()))?;
     let ssl_mode = if connection.tls_enabled {
@@ -73,8 +89,7 @@ pub async fn test_database_connection(
         .username(&connection.username)
         .password(password)
         .ssl_mode(ssl_mode);
-    let connection = sqlx::PgConnection::connect_with(&options).await?;
-    connection.close().await
+    Ok(options)
 }
 
 pub async fn connect_metadata_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
@@ -242,4 +257,31 @@ pub async fn delete_connection_for_owner(
         .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod connection_options_tests {
+    use super::{PgSslMode, StoredConnectionCredentials, connection_options};
+
+    fn connection(tls_enabled: bool) -> StoredConnectionCredentials {
+        StoredConnectionCredentials {
+            host: "db.example.test".to_owned(),
+            port: 5432,
+            database_name: "app".to_owned(),
+            username: "app_user".to_owned(),
+            tls_enabled,
+            credential_envelope: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn requires_tls_when_enabled_and_disables_it_when_explicitly_disabled() {
+        let secure = connection_options(&connection(true), "test-password")
+            .expect("valid connection options");
+        assert!(matches!(secure.get_ssl_mode(), PgSslMode::Require));
+
+        let local = connection_options(&connection(false), "test-password")
+            .expect("valid connection options");
+        assert!(matches!(local.get_ssl_mode(), PgSslMode::Disable));
+    }
 }
