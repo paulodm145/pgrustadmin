@@ -441,6 +441,19 @@ fn internal_error() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Method, Request, StatusCode, header::AUTHORIZATION},
+        response::Response,
+    };
+    use pgrustadmin_postgres_driver::{
+        connect_metadata_pool, create_session, run_metadata_migrations,
+    };
+    use std::env;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
     use super::{ConnectionRequest, validate_request};
 
     fn request() -> ConnectionRequest {
@@ -500,5 +513,145 @@ mod tests {
         let mut request = request();
         request.password = None;
         request
+    }
+
+    #[tokio::test]
+    async fn connection_endpoints_enforce_owner_scope() {
+        let database_url = env::var("PGRUSTADMIN_TEST_DATABASE_URL")
+            .expect("PGRUSTADMIN_TEST_DATABASE_URL is required for database tests");
+        let pool = connect_metadata_pool(&database_url)
+            .await
+            .expect("connect to the isolated test metadata database");
+        run_metadata_migrations(&pool)
+            .await
+            .expect("apply metadata migrations to the test database");
+
+        let owner_id = Uuid::new_v4();
+        let other_owner_id = Uuid::new_v4();
+        let owner_email = format!("{}@example.test", owner_id);
+        let other_owner_email = format!("{}@example.test", other_owner_id);
+        for (user_id, email) in [
+            (owner_id, &owner_email),
+            (other_owner_id, &other_owner_email),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (id, email, password_hash, is_active) \
+                 VALUES ($1, $2, 'test-only-hash', TRUE)",
+            )
+            .bind(user_id)
+            .bind(email)
+            .execute(&pool)
+            .await
+            .expect("insert isolated test user");
+        }
+
+        let owner_token = crate::auth::session::SessionToken::generate();
+        let other_owner_token = crate::auth::session::SessionToken::generate();
+        create_session(&pool, owner_id, &owner_token.token_hash())
+            .await
+            .expect("create owner session");
+        create_session(&pool, other_owner_id, &other_owner_token.token_hash())
+            .await
+            .expect("create second owner session");
+
+        let app = super::router(pool.clone());
+        let payload = serde_json::json!({
+            "name": "authorization test",
+            "host": "127.0.0.1",
+            "port": 5432,
+            "database": "sample",
+            "username": "readonly",
+            "password": "test-credential"
+        });
+        let created = send_request(
+            app.clone(),
+            Method::POST,
+            "/api/v1/connections",
+            Some(owner_token.as_str()),
+            Some(payload.clone()),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_body = to_bytes(created.into_body(), 4096)
+            .await
+            .expect("read creation response");
+        let created_json: serde_json::Value =
+            serde_json::from_slice(&created_body).expect("decode creation response");
+        let connection_id = created_json["id"]
+            .as_str()
+            .expect("response has connection ID");
+        assert_eq!(created_json["tls_enabled"], true);
+        assert!(created_json.get("password").is_none());
+        assert!(created_json.get("credential_envelope").is_none());
+
+        for (method, body) in [
+            (Method::GET, None),
+            (Method::PUT, Some(payload.clone())),
+            (Method::DELETE, None),
+        ] {
+            let response = send_request(
+                app.clone(),
+                method,
+                &format!("/api/v1/connections/{connection_id}"),
+                Some(other_owner_token.as_str()),
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let other_owner_list = send_request(
+            app.clone(),
+            Method::GET,
+            "/api/v1/connections",
+            Some(other_owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(other_owner_list.status(), StatusCode::OK);
+        let list_body = to_bytes(other_owner_list.into_body(), 4096)
+            .await
+            .expect("read list response");
+        let list_json: serde_json::Value =
+            serde_json::from_slice(&list_body).expect("decode list response");
+        assert_eq!(list_json["items"], serde_json::json!([]));
+
+        let delete_owner_record = send_request(
+            app,
+            Method::DELETE,
+            &format!("/api/v1/connections/{connection_id}"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(delete_owner_record.status(), StatusCode::NO_CONTENT);
+
+        sqlx::query("DELETE FROM users WHERE id = $1 OR id = $2")
+            .bind(owner_id)
+            .bind(other_owner_id)
+            .execute(&pool)
+            .await
+            .expect("remove isolated test users and sessions");
+        pool.close().await;
+    }
+
+    async fn send_request(
+        app: Router,
+        method: Method,
+        uri: &str,
+        token: Option<&str>,
+        payload: Option<serde_json::Value>,
+    ) -> Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if payload.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let body = payload.map_or_else(Body::empty, |value| Body::from(value.to_string()));
+        app.oneshot(builder.body(body).expect("build test request"))
+            .await
+            .expect("connection router responds")
     }
 }

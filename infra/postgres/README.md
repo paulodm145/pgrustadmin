@@ -29,3 +29,14 @@ cargo run -p pgrustadmin-server
 O endpoint de login autentica usuários ativos já cadastrados em `users`; criação/provisionamento de usuários ainda não tem comando ou endpoint definido.
 
 Antes de cadastrar conexões após a implementação de CON-001, gere uma chave de 32 bytes com `openssl rand -base64 32` e forneça-a em `PGRUSTADMIN_CREDENTIAL_KEY`. Guarde a mesma chave fora do PostgreSQL e junto ao plano de backup: trocar ou perder a chave torna credenciais já cifradas irrecuperáveis. Não gere uma chave nova em cada inicialização.
+
+O teste de autorização precisa de um banco descartável. Crie-o uma vez:
+
+```bash
+docker compose -f infra/postgres/docker-compose.yml exec -T postgres createdb -U pgrustadmin pgrustadmin_test
+export PGRUSTADMIN_TEST_DATABASE_URL='postgresql://pgrustadmin:pgrustadmin_dev@127.0.0.1:55432/pgrustadmin_test'
+export PGRUSTADMIN_CREDENTIAL_KEY='KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio='
+cargo test --workspace
+```
+
+A chave acima é somente uma fixture pública de teste. Não a use para conexões reais.
