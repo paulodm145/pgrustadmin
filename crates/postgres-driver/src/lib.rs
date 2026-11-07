@@ -847,3 +847,19 @@ pub async fn delete_sql_file_for_owner(
     .fetch_optional(pool)
     .await
 }
+
+/// Inserts an active user; a duplicate email is a unique violation.
+pub async fn create_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    email: &str,
+    password_hash: &str,
+) -> Result<(), PostgresError> {
+    sqlx::query("INSERT INTO users (id, email, password_hash, is_active) VALUES ($1, $2, $3, TRUE)")
+        .bind(user_id)
+        .bind(email)
+        .bind(password_hash)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
