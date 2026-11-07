@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, PoisonError},
+    time::Instant,
 };
 
 use axum::{
@@ -15,7 +16,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use pgrustadmin_postgres_driver::{PgPool, PostgresError, ScriptOutcome, execute_script};
+use pgrustadmin_postgres_driver::{
+    PgPool, PostgresError, ResultSet, ScriptOutcome, execute_script,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,30 +31,71 @@ const MAX_SQL_BYTES: usize = 1_048_576;
 const MAX_REQUEST_BYTES: usize = 8 * MAX_SQL_BYTES;
 const MAX_RUNNING_PER_OWNER: usize = 5;
 const MAX_RETAINED_PER_OWNER: usize = 50;
+const MAX_RESULTS_WITH_ROWS_PER_OWNER: usize = 10;
 const CONNECTION_FAILED_MESSAGE: &str = "Could not connect to the database or read its response.";
+const STOPPED_MESSAGE: &str = "The execution stopped unexpectedly.";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Counts {
+    statement_count: u64,
+    rows_returned: u64,
+    rows_affected: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum ExecutionState {
     Running,
-    Succeeded(ScriptOutcome),
+    Succeeded {
+        counts: Counts,
+        /// Rows of the last statement; `None` once retention discarded them.
+        rows: Option<ResultSet>,
+    },
     Failed {
         code: Option<String>,
         message: String,
     },
 }
 
-#[derive(Clone)]
 struct ExecutionEntry {
     owner_id: Uuid,
     connection_id: Uuid,
     database: String,
     /// Start order, used to evict the oldest finished executions.
     sequence: u64,
+    /// Finish order, used to keep rows only for the most recent results.
+    finish_sequence: Option<u64>,
+    duration_ms: Option<u64>,
     state: ExecutionState,
+}
+
+/// Status of an execution without its rows, cheap to copy for polling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatusView {
+    connection_id: Uuid,
+    database: String,
+    duration_ms: Option<u64>,
+    state: ViewState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ViewState {
+    Running,
+    Succeeded(Counts),
+    Failed {
+        code: Option<String>,
+        message: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct RunningLimitReached;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResultError {
+    NotFound,
+    Unavailable,
+    Expired,
+}
 
 /// Executions shared between request handlers and the tasks running SQL.
 ///
@@ -69,16 +113,41 @@ struct RegistryState {
     next_sequence: u64,
 }
 
+impl RegistryState {
+    /// Drops stored rows of all but the most recent finished results of `owner_id`.
+    fn expire_old_rows(&mut self, owner_id: Uuid) {
+        let mut with_rows: Vec<(u64, &mut ExecutionEntry)> = self
+            .entries
+            .values_mut()
+            .filter(|entry| {
+                entry.owner_id == owner_id
+                    && matches!(entry.state, ExecutionState::Succeeded { rows: Some(_), .. })
+            })
+            .filter_map(|entry| entry.finish_sequence.map(|sequence| (sequence, entry)))
+            .collect();
+        with_rows.sort_by_key(|(sequence, _)| std::cmp::Reverse(*sequence));
+        for (_, entry) in with_rows.into_iter().skip(MAX_RESULTS_WITH_ROWS_PER_OWNER) {
+            if let ExecutionState::Succeeded { rows, .. } = &mut entry.state {
+                *rows = None;
+            }
+        }
+    }
+}
+
 impl ExecutionRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        // Entries stay consistent even if a holder panicked: each update is a
+        // single insert/remove/assignment.
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn start(
         &self,
         owner_id: Uuid,
         connection_id: Uuid,
         database: &str,
     ) -> Result<Uuid, RunningLimitReached> {
-        // Entries stay consistent even if a holder panicked: each update is a
-        // single insert/remove/assignment.
-        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.lock();
         let owned: Vec<(Uuid, u64, bool)> = state
             .entries
             .iter()
@@ -109,26 +178,110 @@ impl ExecutionRegistry {
                 connection_id,
                 database: database.to_owned(),
                 sequence,
+                finish_sequence: None,
+                duration_ms: None,
                 state: ExecutionState::Running,
             },
         );
         Ok(id)
     }
 
-    fn finish(&self, id: Uuid, result: ExecutionState) {
-        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(entry) = state.entries.get_mut(&id) {
-            entry.state = result;
-        }
+    fn finish(&self, id: Uuid, result: ExecutionState, duration_ms: u64) {
+        let mut state = self.lock();
+        let finish_sequence = state.next_sequence;
+        state.next_sequence += 1;
+        let Some(entry) = state.entries.get_mut(&id) else {
+            return;
+        };
+        entry.state = result;
+        entry.duration_ms = Some(duration_ms);
+        entry.finish_sequence = Some(finish_sequence);
+        let owner_id = entry.owner_id;
+        state.expire_old_rows(owner_id);
     }
 
-    fn get(&self, owner_id: Uuid, id: Uuid) -> Option<ExecutionEntry> {
-        let state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        state
+    fn status(&self, owner_id: Uuid, id: Uuid) -> Option<StatusView> {
+        let state = self.lock();
+        let entry = state
+            .entries
+            .get(&id)
+            .filter(|entry| entry.owner_id == owner_id)?;
+        let view = match &entry.state {
+            ExecutionState::Running => ViewState::Running,
+            ExecutionState::Succeeded { counts, .. } => ViewState::Succeeded(*counts),
+            ExecutionState::Failed { code, message } => ViewState::Failed {
+                code: code.clone(),
+                message: message.clone(),
+            },
+        };
+        Some(StatusView {
+            connection_id: entry.connection_id,
+            database: entry.database.clone(),
+            duration_ms: entry.duration_ms,
+            state: view,
+        })
+    }
+
+    fn result(&self, owner_id: Uuid, id: Uuid) -> Result<ResultSet, ResultError> {
+        let state = self.lock();
+        let entry = state
             .entries
             .get(&id)
             .filter(|entry| entry.owner_id == owner_id)
-            .cloned()
+            .ok_or(ResultError::NotFound)?;
+        match &entry.state {
+            ExecutionState::Succeeded {
+                rows: Some(rows), ..
+            } => Ok(rows.clone()),
+            ExecutionState::Succeeded { rows: None, .. } => Err(ResultError::Expired),
+            ExecutionState::Running | ExecutionState::Failed { .. } => {
+                Err(ResultError::Unavailable)
+            }
+        }
+    }
+}
+
+/// Records a failure if the execution task ends without reporting, for
+/// example when it panics or is aborted, so it never stays `running`.
+struct FinishGuard {
+    registry: Arc<ExecutionRegistry>,
+    id: Uuid,
+    started: Instant,
+    finished: bool,
+}
+
+impl FinishGuard {
+    fn new(registry: Arc<ExecutionRegistry>, id: Uuid) -> Self {
+        Self {
+            registry,
+            id,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn finish(mut self, result: ExecutionState) {
+        self.finished = true;
+        self.registry.finish(self.id, result, self.elapsed_ms());
+    }
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.registry.finish(
+                self.id,
+                ExecutionState::Failed {
+                    code: None,
+                    message: STOPPED_MESSAGE.to_owned(),
+                },
+                self.elapsed_ms(),
+            );
+        }
     }
 }
 
@@ -145,6 +298,7 @@ pub fn router(pool: PgPool) -> Router {
             post(start),
         )
         .route("/api/v1/executions/{id}", get(status))
+        .route("/api/v1/executions/{id}/result", get(result))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(ExecutionsState {
             pool,
@@ -170,6 +324,8 @@ struct ExecutionResponse {
     database: String,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<ResultResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ExecutionErrorResponse>,
@@ -180,6 +336,15 @@ struct ResultResponse {
     statement_count: u64,
     rows_returned: u64,
     rows_affected: u64,
+}
+
+#[derive(Serialize)]
+struct ResultRowsResponse {
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    stored_rows: usize,
+    total_rows: u64,
+    truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -221,10 +386,10 @@ async fn start(
         return error_response(StatusCode::TOO_MANY_REQUESTS, "execution_limit_reached");
     };
 
-    let registry = Arc::clone(&state.registry);
+    let guard = FinishGuard::new(Arc::clone(&state.registry), id);
     tokio::spawn(async move {
         let result = execute_script(&connection, &database, &password, sql).await;
-        registry.finish(id, execution_state(result));
+        guard.finish(execution_state(result));
     });
     (
         StatusCode::ACCEPTED,
@@ -248,21 +413,21 @@ async fn status(
     let Ok(Path(id)) = path else {
         return bad_request();
     };
-    let Some(entry) = state.registry.get(owner_id, id) else {
+    let Some(view) = state.registry.status(owner_id, id) else {
         return error_response(StatusCode::NOT_FOUND, "not_found");
     };
-    let (status, result, error) = match entry.state {
-        ExecutionState::Running => ("running", None, None),
-        ExecutionState::Succeeded(outcome) => (
+    let (status, result, error) = match view.state {
+        ViewState::Running => ("running", None, None),
+        ViewState::Succeeded(counts) => (
             "succeeded",
             Some(ResultResponse {
-                statement_count: outcome.statement_count,
-                rows_returned: outcome.rows_returned,
-                rows_affected: outcome.rows_affected,
+                statement_count: counts.statement_count,
+                rows_returned: counts.rows_returned,
+                rows_affected: counts.rows_affected,
             }),
             None,
         ),
-        ExecutionState::Failed { code, message } => (
+        ViewState::Failed { code, message } => (
             "failed",
             None,
             Some(ExecutionErrorResponse { code, message }),
@@ -270,20 +435,55 @@ async fn status(
     };
     Json(ExecutionResponse {
         id,
-        connection_id: entry.connection_id,
-        database: entry.database,
+        connection_id: view.connection_id,
+        database: view.database,
         status,
+        duration_ms: view.duration_ms,
         result,
         error,
     })
     .into_response()
 }
 
+async fn result(
+    State(state): State<ExecutionsState>,
+    headers: HeaderMap,
+    path: Result<Path<Uuid>, PathRejection>,
+) -> Response {
+    let owner_id = match authenticated_owner(&state.pool, &headers).await {
+        Ok(owner_id) => owner_id,
+        Err(error) => return authentication_error_response(error),
+    };
+    let Ok(Path(id)) = path else {
+        return bad_request();
+    };
+    match state.registry.result(owner_id, id) {
+        Ok(rows) => Json(ResultRowsResponse {
+            stored_rows: rows.rows.len(),
+            columns: rows.columns,
+            rows: rows.rows,
+            total_rows: rows.total_rows,
+            truncated: rows.truncated,
+        })
+        .into_response(),
+        Err(ResultError::NotFound) => error_response(StatusCode::NOT_FOUND, "not_found"),
+        Err(ResultError::Unavailable) => error_response(StatusCode::CONFLICT, "result_unavailable"),
+        Err(ResultError::Expired) => error_response(StatusCode::GONE, "result_expired"),
+    }
+}
+
 /// Keeps PostgreSQL's SQLSTATE and primary message for errors in the user's
 /// SQL; any other failure gets a generic message without driver text.
 fn execution_state(result: Result<ScriptOutcome, PostgresError>) -> ExecutionState {
     match result {
-        Ok(outcome) => ExecutionState::Succeeded(outcome),
+        Ok(outcome) => ExecutionState::Succeeded {
+            counts: Counts {
+                statement_count: outcome.statement_count,
+                rows_returned: outcome.rows_returned,
+                rows_affected: outcome.rows_affected,
+            },
+            rows: Some(outcome.result),
+        },
         Err(error) => match error.as_database_error() {
             Some(database_error) => ExecutionState::Failed {
                 code: database_error.code().map(|code| code.into_owned()),
@@ -315,16 +515,23 @@ mod tests {
         http::{Method, Request, StatusCode, header::AUTHORIZATION},
     };
     use pgrustadmin_postgres_driver::{
-        PostgresError, ScriptOutcome, connect_metadata_pool, create_session,
-        run_metadata_migrations,
+        PostgresError, ResultSet, connect_metadata_pool, create_session, run_metadata_migrations,
     };
     use tower::ServiceExt;
     use uuid::Uuid;
 
     use super::{
-        CONNECTION_FAILED_MESSAGE, ExecutionRegistry, ExecutionState, MAX_RETAINED_PER_OWNER,
-        MAX_RUNNING_PER_OWNER, RunningLimitReached, execution_state,
+        CONNECTION_FAILED_MESSAGE, Counts, ExecutionRegistry, ExecutionState, FinishGuard,
+        MAX_RESULTS_WITH_ROWS_PER_OWNER, MAX_RETAINED_PER_OWNER, MAX_RUNNING_PER_OWNER,
+        ResultError, RunningLimitReached, STOPPED_MESSAGE, ViewState, execution_state,
     };
+
+    fn succeeded() -> ExecutionState {
+        ExecutionState::Succeeded {
+            counts: Counts::default(),
+            rows: Some(ResultSet::default()),
+        }
+    }
 
     #[test]
     fn registry_limits_running_executions_per_owner() {
@@ -343,15 +550,18 @@ mod tests {
                 .is_ok()
         );
 
-        registry.finish(ids[0], ExecutionState::Succeeded(ScriptOutcome::default()));
+        registry.finish(ids[0], succeeded(), 7);
         assert!(registry.start(owner, Uuid::new_v4(), "app").is_ok());
         assert!(
-            registry.get(Uuid::new_v4(), ids[0]).is_none(),
+            registry.status(Uuid::new_v4(), ids[0]).is_none(),
             "owner scoped"
         );
+        let view = registry.status(owner, ids[0]).expect("status");
+        assert_eq!(view.state, ViewState::Succeeded(Counts::default()));
+        assert_eq!(view.duration_ms, Some(7));
         assert_eq!(
-            registry.get(owner, ids[0]).map(|entry| entry.state),
-            Some(ExecutionState::Succeeded(ScriptOutcome::default()))
+            registry.status(owner, ids[1]).expect("status").duration_ms,
+            None
         );
     }
 
@@ -362,21 +572,83 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..MAX_RETAINED_PER_OWNER {
             let id = registry.start(owner, Uuid::new_v4(), "app").expect("start");
-            registry.finish(id, ExecutionState::Succeeded(ScriptOutcome::default()));
+            registry.finish(id, succeeded(), 1);
             ids.push(id);
         }
         let running = registry.start(owner, Uuid::new_v4(), "app").expect("start");
         assert!(
-            registry.get(owner, ids[0]).is_none(),
+            registry.status(owner, ids[0]).is_none(),
             "oldest finished evicted"
         );
-        assert!(registry.get(owner, ids[1]).is_some());
-        assert!(registry.get(owner, running).is_some());
+        assert!(registry.status(owner, ids[1]).is_some());
+        assert!(registry.status(owner, running).is_some());
         registry.start(owner, Uuid::new_v4(), "app").expect("start");
-        assert!(registry.get(owner, ids[1]).is_none());
+        assert!(registry.status(owner, ids[1]).is_none());
         assert!(
-            registry.get(owner, running).is_some(),
+            registry.status(owner, running).is_some(),
             "running never evicted"
+        );
+    }
+
+    #[test]
+    fn registry_keeps_rows_only_for_recent_results() {
+        let registry = ExecutionRegistry::default();
+        let owner = Uuid::new_v4();
+        let ids: Vec<Uuid> = (0..=MAX_RESULTS_WITH_ROWS_PER_OWNER)
+            .map(|_| {
+                let id = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+                registry.finish(id, succeeded(), 1);
+                id
+            })
+            .collect();
+        assert_eq!(registry.result(owner, ids[0]), Err(ResultError::Expired));
+        assert!(registry.status(owner, ids[0]).is_some(), "status survives");
+        assert_eq!(registry.result(owner, ids[1]), Ok(ResultSet::default()));
+        assert_eq!(
+            registry.result(Uuid::new_v4(), ids[1]),
+            Err(ResultError::NotFound)
+        );
+
+        let running = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        assert_eq!(
+            registry.result(owner, running),
+            Err(ResultError::Unavailable)
+        );
+        registry.finish(
+            running,
+            ExecutionState::Failed {
+                code: None,
+                message: "x".to_owned(),
+            },
+            1,
+        );
+        assert_eq!(
+            registry.result(owner, running),
+            Err(ResultError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn dropped_execution_task_is_recorded_as_failed() {
+        let registry = std::sync::Arc::new(ExecutionRegistry::default());
+        let owner = Uuid::new_v4();
+        let id = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        drop(FinishGuard::new(std::sync::Arc::clone(&registry), id));
+        let view = registry.status(owner, id).expect("status");
+        assert_eq!(
+            view.state,
+            ViewState::Failed {
+                code: None,
+                message: STOPPED_MESSAGE.to_owned(),
+            }
+        );
+        assert!(view.duration_ms.is_some());
+
+        let finished = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        FinishGuard::new(std::sync::Arc::clone(&registry), finished).finish(succeeded());
+        assert_eq!(
+            registry.status(owner, finished).expect("status").state,
+            ViewState::Succeeded(Counts::default())
         );
     }
 
@@ -458,16 +730,21 @@ mod tests {
             &start_path,
             owner,
             Some(serde_json::json!({
-                "sql": "CREATE TEMP TABLE t (x int);\n\
-                        INSERT INTO t VALUES (1), (2), (3);\n\
-                        SELECT x FROM t WHERE x > 1;"
+                "sql": "CREATE TEMP TABLE t (x int, label text);\n\
+                        INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'ção');\n\
+                        SELECT x, label FROM t WHERE x > 1 ORDER BY x;"
             })),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(started["status"], "running");
         let execution_id = started["id"].as_str().expect("execution id").to_owned();
-        let finished = wait_for(&app, &execution_id, owner).await;
+        let mut finished = wait_for(&app, &execution_id, owner).await;
+        assert!(finished["duration_ms"].is_u64(), "{finished}");
+        finished
+            .as_object_mut()
+            .expect("status object")
+            .remove("duration_ms");
         assert_eq!(
             finished,
             serde_json::json!({
@@ -479,15 +756,68 @@ mod tests {
             })
         );
 
-        let (status, _) = send(
-            app.clone(),
-            Method::GET,
-            &format!("/api/v1/executions/{execution_id}"),
-            Some(other_token.as_str()),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let result_path = format!("/api/v1/executions/{execution_id}/result");
+        let (status, rows) = send(app.clone(), Method::GET, &result_path, owner, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            rows,
+            serde_json::json!({
+                "columns": ["x", "label"],
+                "rows": [["2", null], ["3", "ção"]],
+                "stored_rows": 2,
+                "total_rows": 2,
+                "truncated": false,
+            })
+        );
+
+        for path in [
+            format!("/api/v1/executions/{execution_id}"),
+            result_path.clone(),
+        ] {
+            let (status, _) = send(
+                app.clone(),
+                Method::GET,
+                &path,
+                Some(other_token.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+
+        for (sql, stored, total) in [
+            ("SELECT g FROM generate_series(1, 1001) AS g", 1000, 1001),
+            (
+                "SELECT repeat('x', 1048576) FROM generate_series(1, 6)",
+                5,
+                6,
+            ),
+            ("SELECT 1; CREATE TEMP TABLE e (x int)", 0, 0),
+        ] {
+            let (_, started) = send(
+                app.clone(),
+                Method::POST,
+                &start_path,
+                owner,
+                Some(serde_json::json!({ "sql": sql })),
+            )
+            .await;
+            let id = started["id"].as_str().expect("id").to_owned();
+            assert_eq!(wait_for(&app, &id, owner).await["status"], "succeeded");
+            let (status, rows) = send(
+                app.clone(),
+                Method::GET,
+                &format!("/api/v1/executions/{id}/result"),
+                owner,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(rows["stored_rows"], stored, "{sql}");
+            assert_eq!(rows["total_rows"], total, "{sql}");
+            assert_eq!(rows["truncated"], stored != total, "{sql}");
+            assert_eq!(rows["rows"].as_array().map(Vec::len), Some(stored), "{sql}");
+        }
 
         let (_, started) = send(
             app.clone(),
@@ -507,6 +837,23 @@ mod tests {
                 .contains("SELEC")
         );
         assert!(failed.get("result").is_none());
+        assert!(failed["duration_ms"].is_u64());
+        let (status, unavailable) = send(
+            app.clone(),
+            Method::GET,
+            &format!(
+                "/api/v1/executions/{}/result",
+                started["id"].as_str().expect("id")
+            ),
+            owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            unavailable,
+            serde_json::json!({"error": "result_unavailable"})
+        );
 
         for payload in [
             serde_json::json!({"sql": "  \n "}),
@@ -597,7 +944,7 @@ mod tests {
             .await
             .expect("execution router responds");
         let status = response.status();
-        let bytes = to_bytes(response.into_body(), 16 * 1024)
+        let bytes = to_bytes(response.into_body(), 16 * 1024 * 1024)
             .await
             .expect("read response body");
         let json = if bytes.is_empty() {

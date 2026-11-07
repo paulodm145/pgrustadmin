@@ -351,18 +351,73 @@ pub async fn list_indexes(
     .map_err(|_| sqlx::Error::PoolTimedOut)?
 }
 
-/// Counts gathered while running a user script.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Rows kept per result; further rows are counted but not stored.
+pub const MAX_RESULT_ROWS: usize = 1000;
+/// UTF-8 bytes of values kept per result.
+pub const MAX_RESULT_BYTES: usize = 5 * 1024 * 1024;
+
+/// Columns and text values of one statement's rows, bounded by the limits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResultSet {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub total_rows: u64,
+    pub truncated: bool,
+    stored_bytes: usize,
+}
+
+impl ResultSet {
+    fn push(&mut self, row: &sqlx::postgres::PgRow) -> Result<(), sqlx::Error> {
+        use sqlx::{Column as _, Row as _, ValueRef as _};
+
+        if self.total_rows == 0 {
+            self.columns = row
+                .columns()
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect();
+        }
+        self.total_rows += 1;
+        if self.truncated {
+            return Ok(());
+        }
+        let mut values = Vec::with_capacity(row.len());
+        let mut row_bytes = 0;
+        for index in 0..row.len() {
+            let raw = row.try_get_raw(index)?;
+            if raw.is_null() {
+                values.push(None);
+            } else {
+                // The simple query protocol returns every value in text format.
+                let text = raw.as_str().map_err(sqlx::Error::Decode)?;
+                row_bytes += text.len();
+                values.push(Some(text.to_owned()));
+            }
+        }
+        if self.rows.len() >= MAX_RESULT_ROWS || self.stored_bytes + row_bytes > MAX_RESULT_BYTES {
+            self.truncated = true;
+        } else {
+            self.stored_bytes += row_bytes;
+            self.rows.push(values);
+        }
+        Ok(())
+    }
+}
+
+/// What running a user script produced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScriptOutcome {
     pub statement_count: u64,
     /// Rows returned by the last completed statement.
     pub rows_returned: u64,
     /// Rows affected as reported for the last completed statement.
     pub rows_affected: u64,
+    /// Rows of the last completed statement, within the result limits.
+    pub result: ResultSet,
 }
 
 /// Runs arbitrary user SQL on a fresh autocommit connection to `database`
-/// with the simple query protocol. Rows are counted, never stored.
+/// with the simple query protocol, keeping only the last statement's rows.
 pub async fn execute_script(
     connection: &StoredConnectionCredentials,
     database: &str,
@@ -380,18 +435,19 @@ pub async fn execute_script(
         // Arbitrary SQL is the feature: it is deliberately neither parsed nor filtered.
         let mut results = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_many(&mut connection);
         let mut outcome = ScriptOutcome::default();
-        let mut current_rows = 0_u64;
+        let mut current = ResultSet::default();
         while let Some(item) = results.try_next().await? {
             match item {
                 sqlx::Either::Left(result) => {
+                    let finished = std::mem::take(&mut current);
                     outcome = ScriptOutcome {
                         statement_count: outcome.statement_count + 1,
-                        rows_returned: current_rows,
+                        rows_returned: finished.total_rows,
                         rows_affected: result.rows_affected(),
+                        result: finished,
                     };
-                    current_rows = 0;
                 }
-                sqlx::Either::Right(_) => current_rows += 1,
+                sqlx::Either::Right(row) => current.push(&row)?,
             }
         }
         outcome

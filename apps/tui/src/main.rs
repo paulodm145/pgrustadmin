@@ -13,17 +13,19 @@ use crossterm::{
 use futures_util::StreamExt;
 use pgrustadmin_api_client::{
     ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
-    ConnectionInput, ConnectionTest, Database, Execution, ExecutionStatus, Index, Relation,
-    RelationKind, RelationRef, Schema, SqlFile, SqlFileContent,
+    ConnectionInput, ConnectionTest, Database, Execution, ExecutionRows, ExecutionStatus, Index,
+    Relation, RelationKind, RelationRef, Schema, SqlFile, SqlFileContent,
 };
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs,
+    },
 };
-use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId};
+use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId, TabResult};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -31,6 +33,8 @@ use zeroize::Zeroizing;
 const RELATION_PAGE_SIZE: usize = 100;
 const FILE_LIST_SIZE: u64 = 100;
 const EXECUTION_POLL_INTERVAL: Duration = Duration::from_millis(300);
+const RESULT_PAGE_ROWS: isize = 10;
+const MAX_RESULT_COLUMN_WIDTH: usize = 40;
 /// View index of the SQL tabs section; catalog views use 2..=5.
 const SQL_VIEW: usize = 6;
 const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
@@ -128,6 +132,12 @@ enum UiAction {
     CreateFile(TabId),
     OverwriteFile(TabId),
     ExecuteSql(TabId),
+}
+
+/// A finished execution and, when it succeeded, the request for its rows.
+struct FinishedExecution {
+    execution: Execution,
+    rows: Option<Result<ExecutionRows, ApiError>>,
 }
 
 /// Name typed for "save as" on one SQL tab.
@@ -307,7 +317,9 @@ struct App {
     /// Authenticated client copy for execution polling, which runs beside
     /// other API operations.
     execution_client: Option<ApiClient>,
-    executions: Vec<(TabId, JoinHandle<Result<Execution, ApiError>>)>,
+    executions: Vec<(TabId, JoinHandle<Result<FinishedExecution, ApiError>>)>,
+    /// Whether the SQL section's arrow keys scroll the active tab's result.
+    result_focus: bool,
     selected_relation: usize,
     relation_page: u64,
     form: Option<ConnectionForm>,
@@ -364,6 +376,7 @@ impl App {
             file_picker: None,
             execution_client: None,
             executions: Vec::new(),
+            result_focus: false,
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -539,11 +552,15 @@ impl App {
             ScreenState::Authenticating => {}
             ScreenState::Authenticated(_) => {
                 if self.view == SQL_VIEW {
+                    if self.handle_result_key(key.code) {
+                        return UiAction::None;
+                    }
                     match key.code {
                         KeyCode::Char(']') => self.sql_tabs.select_next(),
                         KeyCode::Char('[') => self.sql_tabs.select_previous(),
                         KeyCode::Enter | KeyCode::Char('i') if self.sql_tabs.active().is_some() => {
                             self.sql_editing = true;
+                            self.result_focus = false;
                         }
                         KeyCode::Char('w') => {
                             if let Some(tab) = self.sql_tabs.active() {
@@ -583,7 +600,8 @@ impl App {
                                 self.close_sql_tab();
                             }
                         }
-                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 1,
+                        KeyCode::Tab => self.toggle_result_focus(),
+                        KeyCode::Left | KeyCode::Right => self.view = 1,
                         _ => {}
                     }
                 } else if self.view == 5 {
@@ -856,6 +874,9 @@ impl App {
         let connection_id = tab.connection_id;
         let database = tab.database.clone();
         tab.execution = TabExecution::Running;
+        // An old result must not be mistaken for the one being produced.
+        tab.result = None;
+        self.result_focus = false;
         self.message.clear();
         let handle = tokio::spawn(async move {
             let started = client
@@ -864,9 +885,15 @@ impl App {
             loop {
                 tokio::time::sleep(EXECUTION_POLL_INTERVAL).await;
                 let execution = client.execution(started.id).await?;
-                if execution.status != ExecutionStatus::Running {
-                    return Ok(execution);
+                if execution.status == ExecutionStatus::Running {
+                    continue;
                 }
+                let rows = if execution.status == ExecutionStatus::Succeeded {
+                    Some(client.execution_rows(started.id).await)
+                } else {
+                    None
+                };
+                return Ok(FinishedExecution { execution, rows });
             }
         });
         self.executions.push((tab_id, handle));
@@ -883,31 +910,94 @@ impl App {
         }
     }
 
-    fn finish_execution(&mut self, tab_id: TabId, result: Result<Execution, ApiError>) {
+    fn finish_execution(&mut self, tab_id: TabId, result: Result<FinishedExecution, ApiError>) {
         let Some(tab) = self.sql_tabs.get_mut(tab_id) else {
             return;
         };
-        tab.execution = match result {
-            Ok(Execution {
+        let (execution, rows) = match result {
+            Ok(FinishedExecution { execution, rows }) => (execution, rows),
+            Err(error) => {
+                tab.execution = TabExecution::Failed {
+                    code: None,
+                    message: execution_error_message(error).to_owned(),
+                    duration_ms: None,
+                };
+                return;
+            }
+        };
+        let duration_ms = execution.duration_ms;
+        tab.execution = match execution {
+            Execution {
                 status: ExecutionStatus::Succeeded,
-                result: Some(result),
+                result: Some(counts),
                 ..
-            }) => TabExecution::Succeeded(result),
-            Ok(Execution {
+            } => TabExecution::Succeeded {
+                counts,
+                duration_ms,
+            },
+            Execution {
                 error: Some(error), ..
-            }) => TabExecution::Failed {
+            } => TabExecution::Failed {
                 code: error.code,
                 message: error.message,
+                duration_ms,
             },
-            Ok(_) => TabExecution::Failed {
+            _ => TabExecution::Failed {
                 code: None,
                 message: "The API returned an incomplete execution.".to_owned(),
-            },
-            Err(error) => TabExecution::Failed {
-                code: None,
-                message: execution_error_message(error).to_owned(),
+                duration_ms,
             },
         };
+        match rows {
+            Some(Ok(rows)) => tab.result = Some(TabResult::new(rows)),
+            Some(Err(error)) => {
+                tab.result = None;
+                self.message = format!(
+                    "Result rows are unavailable: {}",
+                    execution_error_message(error)
+                );
+            }
+            None => tab.result = None,
+        }
+    }
+
+    /// Scrolls the focused result; returns whether the key was consumed.
+    fn handle_result_key(&mut self, code: KeyCode) -> bool {
+        if !self.result_focus {
+            return false;
+        }
+        let Some(result) = self
+            .sql_tabs
+            .active_mut()
+            .and_then(|tab| tab.result.as_mut())
+        else {
+            self.result_focus = false;
+            return false;
+        };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => result.scroll_rows(-1),
+            KeyCode::Down | KeyCode::Char('j') => result.scroll_rows(1),
+            KeyCode::PageUp => result.scroll_rows(-RESULT_PAGE_ROWS),
+            KeyCode::PageDown => result.scroll_rows(RESULT_PAGE_ROWS),
+            KeyCode::Left | KeyCode::Char('h') => result.scroll_columns(-1),
+            KeyCode::Right | KeyCode::Char('l') => result.scroll_columns(1),
+            _ => return false,
+        }
+        true
+    }
+
+    fn toggle_result_focus(&mut self) {
+        if self.result_focus {
+            self.result_focus = false;
+        } else if self
+            .sql_tabs
+            .active()
+            .is_some_and(|tab| tab.result.is_some())
+        {
+            self.result_focus = true;
+        } else {
+            self.message = "This tab has no result yet. Press e to execute.".to_owned();
+        }
     }
 
     fn request_quit(&mut self) {
@@ -1587,7 +1677,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
         "n: new   e: edit   t: test   c: databases   d: delete   s: SQL   [ / ]: pages   r: reload   Tab: overview   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == SQL_VIEW {
-        "Enter/i: edit  e: run  w/W: save/as  o: open  [ ]: tabs  x: close  Esc: back  q: quit"
+        if app.result_focus {
+            "↑↓ PgUp PgDn: rows  ←→: columns  Tab: editor  e: run  Esc: back  q: quit"
+        } else {
+            "Enter/i: edit  e: run  Tab: result  w/W: save  o: open  [ ]: tabs  x: close  Esc: back"
+        }
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
         "↑/↓: navigate   Enter: schemas   s: new SQL tab   r: reload   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
@@ -1904,9 +1998,24 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         tab.connection_name,
         tab.database
     );
+    let editor_area = match &tab.result {
+        Some(result) => {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(panes[1]);
+            let duration = match tab.execution {
+                TabExecution::Succeeded { duration_ms, .. } => duration_text(" ·", duration_ms),
+                _ => String::new(),
+            };
+            render_result(frame, split[1], result, app.result_focus, &duration);
+            split[0]
+        }
+        None => panes[1],
+    };
     let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(panes[1]);
-    frame.render_widget(block, panes[1]);
+    let inner = block.inner(editor_area);
+    frame.render_widget(block, editor_area);
 
     let editor = &tab.editor;
     if !app.sql_editing && editor.text().is_empty() {
@@ -1947,24 +2056,122 @@ fn execution_line(execution: &TabExecution) -> Line<'static> {
     match execution {
         TabExecution::Idle => Line::default(),
         TabExecution::Running => Line::styled("Running…", Style::default().fg(Color::Cyan)),
-        TabExecution::Succeeded(result) => Line::styled(
+        TabExecution::Succeeded {
+            counts,
+            duration_ms,
+        } => Line::styled(
             format!(
-                "Succeeded: {} statement(s); last returned {} row(s), affected {}.",
-                result.statement_count, result.rows_returned, result.rows_affected
+                "Succeeded{}: {} statement(s); last returned {} row(s), affected {}.",
+                duration_text(" in", *duration_ms),
+                counts.statement_count,
+                counts.rows_returned,
+                counts.rows_affected
             ),
             Style::default().fg(Color::Green),
         ),
-        TabExecution::Failed { code, message } => {
+        TabExecution::Failed {
+            code,
+            message,
+            duration_ms,
+        } => {
             let code = code
                 .as_deref()
                 .map(|code| format!(" [{code}]"))
                 .unwrap_or_default();
             Line::styled(
-                format!("Failed{code}: {message}"),
+                format!(
+                    "Failed{}{code}: {message}",
+                    duration_text(" after", *duration_ms)
+                ),
                 Style::default().fg(Color::Red),
             )
         }
     }
+}
+
+fn duration_text(prefix: &str, duration_ms: Option<u64>) -> String {
+    duration_ms
+        .map(|duration| format!("{prefix} {duration} ms"))
+        .unwrap_or_default()
+}
+
+/// Renders the result table, showing the columns from `first_column` that fit.
+fn render_result(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    result: &TabResult,
+    focused: bool,
+    duration: &str,
+) {
+    let rows = &result.rows;
+    let truncated = if rows.truncated { ", truncated" } else { "" };
+    let title = format!(
+        " Result — {} of {} row(s){truncated}{duration} ",
+        rows.stored_rows, rows.total_rows
+    );
+    let border = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if rows.columns.is_empty() {
+        frame.render_widget(
+            Paragraph::new("The last statement returned no rows.")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    let available = usize::from(inner.width);
+    let mut widths = Vec::new();
+    let mut used = 0;
+    for (index, column) in rows.columns.iter().enumerate().skip(result.first_column) {
+        let content = rows
+            .rows
+            .iter()
+            .filter_map(|row| row.get(index))
+            .map(|value| value.as_deref().map_or(4, |text| text.chars().count()))
+            .max()
+            .unwrap_or(0);
+        let width = content
+            .max(column.chars().count())
+            .clamp(4, MAX_RESULT_COLUMN_WIDTH);
+        if !widths.is_empty() && used + width > available {
+            break;
+        }
+        used += width + 1;
+        widths.push(width);
+    }
+    let visible = result.first_column..result.first_column + widths.len();
+    let header = Row::new(
+        rows.columns[visible.clone()]
+            .iter()
+            .map(|column| Cell::from(column.as_str())),
+    )
+    .style(Style::default().add_modifier(Modifier::BOLD));
+    let body = rows.rows.iter().skip(result.first_row).map(|row| {
+        Row::new(
+            row.get(visible.clone())
+                .unwrap_or_default()
+                .iter()
+                .map(|value| match value {
+                    Some(text) => Cell::from(text.as_str()),
+                    None => Cell::from("NULL").style(Style::default().fg(Color::DarkGray)),
+                }),
+        )
+    });
+    let constraints: Vec<Constraint> = widths
+        .iter()
+        .map(|width| Constraint::Length(u16::try_from(*width).unwrap_or(u16::MAX)))
+        .collect();
+    frame.render_widget(Table::new(body, constraints).header(header), inner);
 }
 
 /// Draws the save-as prompt or the file picker over `area`.
@@ -2296,15 +2503,15 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pgrustadmin_api_client::{
         ApiClient, ApiError, AuthSession, Column, Connection, Database, Execution, ExecutionError,
-        ExecutionResult, ExecutionStatus, Index, Relation, RelationKind, Schema, SqlFile,
-        SqlFileContent,
+        ExecutionResult, ExecutionRows, ExecutionStatus, Index, Relation, RelationKind, Schema,
+        SqlFile, SqlFileContent,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
     use super::{
-        App, ConnectionForm, LoginField, MAX_SQL_TABS, OperationResult, SQL_VIEW, ScreenState,
-        TabExecution, UiAction, render,
+        App, ConnectionForm, FinishedExecution, LoginField, MAX_SQL_TABS, OperationResult,
+        SQL_VIEW, ScreenState, TabExecution, TabResult, UiAction, render,
     };
 
     fn client() -> ApiClient {
@@ -3013,6 +3220,7 @@ mod tests {
             connection_id: Uuid::new_v4(),
             database: "app".to_owned(),
             status,
+            duration_ms: None,
             result: None,
             error: None,
         }
@@ -3051,45 +3259,76 @@ mod tests {
         let tab_id = app.sql_tabs.active().expect("active tab").id;
         app.finish_execution(
             tab_id,
-            Ok(Execution {
-                result: Some(ExecutionResult {
-                    statement_count: 3,
-                    rows_returned: 2,
-                    rows_affected: 2,
-                }),
-                ..execution(ExecutionStatus::Succeeded)
+            Ok(FinishedExecution {
+                execution: Execution {
+                    duration_ms: Some(12),
+                    result: Some(ExecutionResult {
+                        statement_count: 3,
+                        rows_returned: 2,
+                        rows_affected: 2,
+                    }),
+                    ..execution(ExecutionStatus::Succeeded)
+                },
+                rows: Some(Ok(ExecutionRows {
+                    columns: vec!["id".to_owned(), "label".to_owned()],
+                    rows: vec![
+                        vec![Some("1".to_owned()), None],
+                        vec![Some("2".to_owned()), Some("ção".to_owned())],
+                    ],
+                    stored_rows: 2,
+                    total_rows: 5,
+                    truncated: true,
+                })),
             }),
         );
-        let render_text = |app: &App| {
-            let mut terminal =
-                Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
-            terminal
-                .draw(|frame| render(frame, app))
-                .expect("render execution state");
-            terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        };
+        let rendered = render_text(&app);
         assert!(
-            render_text(&app)
-                .contains("Succeeded: 3 statement(s); last returned 2 row(s), affected 2.")
+            rendered.contains(
+                "Succeeded in 12 ms: 3 statement(s); last returned 2 row(s), affected 2."
+            )
         );
+        assert!(rendered.contains("Result — 2 of 5 row(s), truncated · 12 ms"));
+        assert!(rendered.contains("label"));
+        assert!(rendered.contains("NULL"));
+        assert!(rendered.contains("ção"));
 
         app.finish_execution(
             tab_id,
-            Ok(Execution {
-                error: Some(ExecutionError {
-                    code: Some("42601".to_owned()),
-                    message: "syntax error at or near \"SELEC\"".to_owned(),
-                }),
-                ..execution(ExecutionStatus::Failed)
+            Ok(FinishedExecution {
+                execution: Execution {
+                    duration_ms: Some(3),
+                    error: Some(ExecutionError {
+                        code: Some("42601".to_owned()),
+                        message: "syntax error at or near \"SELEC\"".to_owned(),
+                    }),
+                    ..execution(ExecutionStatus::Failed)
+                },
+                rows: None,
             }),
         );
-        assert!(render_text(&app).contains("Failed [42601]: syntax error at or near \"SELEC\""));
+        let rendered = render_text(&app);
+        assert!(rendered.contains("Failed after 3 ms [42601]: syntax error at or near \"SELEC\""));
+        assert!(!rendered.contains("Result —"), "failed runs show no result");
+
+        app.finish_execution(
+            tab_id,
+            Ok(FinishedExecution {
+                execution: Execution {
+                    result: Some(ExecutionResult {
+                        statement_count: 1,
+                        rows_returned: 1,
+                        rows_affected: 1,
+                    }),
+                    ..execution(ExecutionStatus::Succeeded)
+                },
+                rows: Some(Err(ApiError::Http {
+                    status: 410,
+                    code: Some("result_expired"),
+                })),
+            }),
+        );
+        assert!(app.sql_tabs.active().expect("tab").result.is_none());
+        assert!(app.message.contains("Result rows are unavailable"));
 
         app.finish_execution(
             tab_id,
@@ -3111,6 +3350,95 @@ mod tests {
             1,
             "results for closed tabs are dropped"
         );
+    }
+
+    fn render_text(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("render app");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    fn rows_result(columns: usize, rows: usize) -> ExecutionRows {
+        ExecutionRows {
+            columns: (0..columns)
+                .map(|index| format!("column_{index}"))
+                .collect(),
+            rows: (0..rows)
+                .map(|row| {
+                    (0..columns)
+                        .map(|column| Some(format!("r{row}c{column}")))
+                        .collect()
+                })
+                .collect(),
+            stored_rows: rows as u64,
+            total_rows: rows as u64,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn tab_focuses_the_result_whose_arrows_scroll_rows_and_columns() {
+        let mut app = app_with_sql_tab();
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.result_focus);
+        assert!(app.message.contains("no result"));
+        assert_eq!(app.view, SQL_VIEW, "Tab no longer leaves the SQL section");
+
+        app.sql_tabs.active_mut().expect("tab").result = Some(TabResult::new(rows_result(12, 30)));
+        press(&mut app, KeyCode::Tab);
+        assert!(app.result_focus);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::Right);
+        let result = app
+            .sql_tabs
+            .active()
+            .expect("tab")
+            .result
+            .as_ref()
+            .expect("result");
+        assert_eq!((result.first_row, result.first_column), (11, 1));
+        assert_eq!(app.view, SQL_VIEW, "arrows scroll instead of leaving");
+        let rendered = render_text(&app);
+        assert!(rendered.contains("column_1"));
+        assert!(!rendered.contains("column_0"));
+        assert!(rendered.contains("r11c1"));
+        assert!(!rendered.contains("r10c1"));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.result_focus);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.sql_editing);
+        assert!(!app.result_focus, "editing takes the focus");
+    }
+
+    #[tokio::test]
+    async fn new_execution_removes_the_previous_result() {
+        let mut app = app_with_sql_tab();
+        app.execution_client = Some(client());
+        let tab_id = app.sql_tabs.active().expect("tab").id;
+        let tab = app.sql_tabs.active_mut().expect("tab");
+        tab.editor.insert_str("SELECT 1");
+        tab.result = Some(TabResult::new(rows_result(1, 1)));
+        app.result_focus = true;
+        app.start_execution(tab_id);
+        let tab = app.sql_tabs.active().expect("tab");
+        assert!(tab.result.is_none());
+        assert_eq!(tab.execution, TabExecution::Running);
+        assert!(!app.result_focus);
+        assert_eq!(app.executions.len(), 1);
+        for (_, handle) in app.executions.drain(..) {
+            handle.abort();
+        }
     }
 
     #[tokio::test]
