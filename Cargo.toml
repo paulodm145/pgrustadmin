@@ -21,6 +21,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 pgrustadmin-postgres-driver = { path = "crates/postgres-driver" }
 pgrustadmin-app-core = { path = "crates/app-core" }
+pgrustadmin-api-client = { path = "crates/api-client" }
 argon2 = "0.6"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
