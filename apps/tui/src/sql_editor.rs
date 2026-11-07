@@ -30,6 +30,15 @@ impl Default for SqlEditor {
 }
 
 impl SqlEditor {
+    /// Creates an editor holding `text` with the cursor at the start.
+    pub fn from_text(text: &str) -> Self {
+        let mut editor = Self::default();
+        editor.insert_str(text);
+        editor.row = 0;
+        editor.col = 0;
+        editor
+    }
+
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
@@ -210,6 +219,13 @@ mod tests {
         editor.insert_str("FROM t");
         assert_eq!(editor.text(), "SELECT çxão\n    FROM t");
         assert_eq!(editor.cursor(), (1, 10));
+    }
+
+    #[test]
+    fn from_text_keeps_content_and_starts_at_origin() {
+        let editor = SqlEditor::from_text("SELECT 1;\r\nSELECT 2;");
+        assert_eq!(editor.text(), "SELECT 1;\nSELECT 2;");
+        assert_eq!(editor.cursor(), (0, 0));
     }
 
     #[test]

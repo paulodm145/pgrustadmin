@@ -16,19 +16,20 @@ impl TabId {
     }
 }
 
+/// Server file associated with a tab and the version last saved or opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabFile {
+    pub id: Uuid,
+    pub name: String,
+    pub sha256: String,
+}
+
 pub struct SqlTab {
     pub id: TabId,
     pub editor: SqlEditor,
-    /// Content of the last saved state; empty until files exist (SQL-003).
+    /// Content of the last saved or opened state.
     pub saved_sql: String,
-    pub file: Option<String>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "identifies the bound connection for SQL execution (SQL-004)"
-        )
-    )]
+    pub file: Option<TabFile>,
     pub connection_id: Uuid,
     pub connection_name: String,
     pub database: String,
@@ -38,6 +39,12 @@ impl SqlTab {
     /// A tab is dirty while its SQL differs from the last saved content.
     pub fn is_dirty(&self) -> bool {
         self.editor.text() != self.saved_sql
+    }
+
+    /// Records that `content` is now stored as `file`.
+    pub fn mark_saved(&mut self, file: TabFile, content: String) {
+        self.file = Some(file);
+        self.saved_sql = content;
     }
 }
 
@@ -59,16 +66,54 @@ impl SqlTabs {
         connection_name: &str,
         database: &str,
     ) -> Result<TabId, TabLimitReached> {
+        self.open_with(
+            connection_id,
+            connection_name,
+            database,
+            None,
+            String::new(),
+        )
+    }
+
+    /// Opens a clean tab holding a saved file's content and activates it.
+    pub fn open_file(
+        &mut self,
+        connection_id: Uuid,
+        connection_name: &str,
+        database: &str,
+        file: TabFile,
+        content: String,
+    ) -> Result<TabId, TabLimitReached> {
+        self.open_with(
+            connection_id,
+            connection_name,
+            database,
+            Some(file),
+            content,
+        )
+    }
+
+    fn open_with(
+        &mut self,
+        connection_id: Uuid,
+        connection_name: &str,
+        database: &str,
+        file: Option<TabFile>,
+        content: String,
+    ) -> Result<TabId, TabLimitReached> {
         if self.tabs.len() >= MAX_SQL_TABS {
             return Err(TabLimitReached);
         }
         self.last_id += 1;
         let id = TabId(self.last_id);
+        let editor = SqlEditor::from_text(&content);
+        // Store the editor's normalized text so line endings never count as edits.
+        let saved_sql = editor.text();
         self.tabs.push(SqlTab {
             id,
-            editor: SqlEditor::default(),
-            saved_sql: String::new(),
-            file: None,
+            editor,
+            saved_sql,
+            file,
             connection_id,
             connection_name: connection_name.to_owned(),
             database: database.to_owned(),
@@ -104,6 +149,10 @@ impl SqlTabs {
         self.tabs.get(self.active)
     }
 
+    pub fn get_mut(&mut self, id: TabId) -> Option<&mut SqlTab> {
+        self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
     pub fn active_mut(&mut self) -> Option<&mut SqlTab> {
         self.tabs.get_mut(self.active)
     }
@@ -129,7 +178,7 @@ impl SqlTabs {
 mod tests {
     use uuid::Uuid;
 
-    use super::{MAX_SQL_TABS, SqlTabs, TabLimitReached};
+    use super::{MAX_SQL_TABS, SqlTabs, TabFile, TabLimitReached};
 
     #[test]
     fn opening_creates_empty_bound_tab_and_activates_it() {
@@ -233,5 +282,39 @@ mod tests {
         tab.editor.backspace();
         assert!(!tab.is_dirty());
         assert_eq!(tabs.dirty_count(), 0);
+    }
+
+    #[test]
+    fn opened_files_are_clean_and_saving_resets_the_baseline() {
+        let mut tabs = SqlTabs::default();
+        let connection_id = Uuid::new_v4();
+        let file = TabFile {
+            id: Uuid::new_v4(),
+            name: "report.sql".to_owned(),
+            sha256: "aa".to_owned(),
+        };
+        let id = tabs
+            .open_file(
+                connection_id,
+                "local",
+                "app",
+                file.clone(),
+                "SELECT 1;\r\n".to_owned(),
+            )
+            .expect("open file tab");
+        let tab = tabs.get_mut(id).expect("tab by id");
+        assert_eq!(tab.file.as_ref(), Some(&file));
+        assert_eq!(tab.editor.text(), "SELECT 1;\n");
+        assert!(!tab.is_dirty());
+
+        tab.editor.insert_str("SELECT 2;");
+        assert!(tab.is_dirty());
+        let saved = TabFile {
+            sha256: "bb".to_owned(),
+            ..file
+        };
+        tab.mark_saved(saved.clone(), tab.editor.text());
+        assert!(!tab.is_dirty());
+        assert_eq!(tab.file, Some(saved));
     }
 }

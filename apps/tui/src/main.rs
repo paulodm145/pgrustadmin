@@ -14,20 +14,22 @@ use futures_util::StreamExt;
 use pgrustadmin_api_client::{
     ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
     ConnectionInput, ConnectionTest, Database, Index, Relation, RelationKind, RelationRef, Schema,
+    SqlFile, SqlFileContent,
 };
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
-use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs};
+use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabFile, TabId};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const RELATION_PAGE_SIZE: usize = 100;
+const FILE_LIST_SIZE: u64 = 100;
 /// View index of the SQL tabs section; catalog views use 2..=5.
 const SQL_VIEW: usize = 6;
 const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
@@ -81,6 +83,11 @@ enum Operation {
     SaveConnection { id: Option<Uuid> },
     TestConnection { id: Uuid },
     DeleteConnection { id: Uuid },
+    ListFiles,
+    OpenFile { id: Uuid },
+    SaveFile { tab: TabId },
+    CreateFile { tab: TabId },
+    OverwriteFile { tab: TabId },
 }
 
 enum OperationResult {
@@ -93,6 +100,13 @@ enum OperationResult {
     Saved(Result<Connection, ApiError>),
     Tested(Result<ConnectionTest, ApiError>),
     Deleted(Result<(), ApiError>),
+    Files(Result<Vec<SqlFile>, ApiError>),
+    OpenedFile(Result<SqlFileContent, ApiError>),
+    SavedFile {
+        tab: TabId,
+        content: String,
+        result: Result<SqlFile, ApiError>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +121,31 @@ enum UiAction {
     SaveConnection,
     TestConnection(Uuid),
     DeleteConnection(Uuid),
+    ListFiles,
+    OpenFile(Uuid),
+    SaveFile(TabId),
+    CreateFile(TabId),
+    OverwriteFile(TabId),
+}
+
+/// Name typed for "save as" on one SQL tab.
+struct FilePrompt {
+    tab: TabId,
+    name: String,
+}
+
+struct FilePicker {
+    files: Vec<SqlFile>,
+    selected: usize,
+}
+
+/// Data a file operation sends, captured when the operation starts.
+#[derive(Default)]
+struct FileRequest {
+    file_id: Option<Uuid>,
+    name: String,
+    content: String,
+    expected_sha256: String,
 }
 
 struct ConnectionForm {
@@ -258,6 +297,11 @@ struct App {
     sql_editing: bool,
     confirm_close_tab: bool,
     confirm_quit: bool,
+    file_prompt: Option<FilePrompt>,
+    /// Name submitted from the prompt for the pending create operation.
+    file_name: String,
+    save_conflict: Option<TabId>,
+    file_picker: Option<FilePicker>,
     selected_relation: usize,
     relation_page: u64,
     form: Option<ConnectionForm>,
@@ -308,6 +352,10 @@ impl App {
             sql_editing: false,
             confirm_close_tab: false,
             confirm_quit: false,
+            file_prompt: None,
+            file_name: String::new(),
+            save_conflict: None,
+            file_picker: None,
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -347,6 +395,49 @@ impl App {
                     self.confirm_close_tab = false;
                     self.message = "Tab kept open.".to_owned();
                 }
+                _ => {}
+            }
+            return UiAction::None;
+        }
+        if self.file_prompt.is_some() {
+            return self.handle_file_prompt_key(key);
+        }
+        if let Some(tab) = self.save_conflict {
+            match key.code {
+                KeyCode::Char('o') => {
+                    self.save_conflict = None;
+                    return UiAction::OverwriteFile(tab);
+                }
+                KeyCode::Char('a') => {
+                    self.save_conflict = None;
+                    self.file_prompt = Some(FilePrompt {
+                        tab,
+                        name: String::new(),
+                    });
+                }
+                KeyCode::Esc => {
+                    self.save_conflict = None;
+                    self.message = "Save cancelled.".to_owned();
+                }
+                _ => {}
+            }
+            return UiAction::None;
+        }
+        if let Some(picker) = &mut self.file_picker {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected =
+                        (picker.selected + picker.files.len() - 1) % picker.files.len();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.selected = (picker.selected + 1) % picker.files.len();
+                }
+                KeyCode::Enter if self.pending.is_none() => {
+                    let id = picker.files[picker.selected].id;
+                    self.file_picker = None;
+                    return UiAction::OpenFile(id);
+                }
+                KeyCode::Esc => self.file_picker = None,
                 _ => {}
             }
             return UiAction::None;
@@ -446,6 +537,26 @@ impl App {
                         KeyCode::Enter | KeyCode::Char('i') if self.sql_tabs.active().is_some() => {
                             self.sql_editing = true;
                         }
+                        KeyCode::Char('w') => {
+                            if let Some(tab) = self.sql_tabs.active() {
+                                if tab.file.is_some() {
+                                    return UiAction::SaveFile(tab.id);
+                                }
+                                self.file_prompt = Some(FilePrompt {
+                                    tab: tab.id,
+                                    name: String::new(),
+                                });
+                            }
+                        }
+                        KeyCode::Char('W') => {
+                            if let Some(tab) = self.sql_tabs.active() {
+                                self.file_prompt = Some(FilePrompt {
+                                    tab: tab.id,
+                                    name: String::new(),
+                                });
+                            }
+                        }
+                        KeyCode::Char('o') => return UiAction::ListFiles,
                         KeyCode::Char('x') => {
                             if self.sql_tabs.active().is_some_and(SqlTab::is_dirty) {
                                 self.confirm_close_tab = true;
@@ -657,6 +768,62 @@ impl App {
         UiAction::None
     }
 
+    fn handle_file_prompt_key(&mut self, key: KeyEvent) -> UiAction {
+        let Some(prompt) = &mut self.file_prompt else {
+            return UiAction::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.file_prompt = None;
+                self.message = "Save cancelled.".to_owned();
+            }
+            KeyCode::Backspace => {
+                prompt.name.pop();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                prompt.name.push(character);
+            }
+            KeyCode::Enter if self.pending.is_none() && !prompt.name.trim().is_empty() => {
+                let mut name = prompt.name.clone();
+                if !name.ends_with(".sql") {
+                    name.push_str(".sql");
+                }
+                let tab = prompt.tab;
+                self.file_prompt = None;
+                self.file_name = name;
+                return UiAction::CreateFile(tab);
+            }
+            _ => {}
+        }
+        UiAction::None
+    }
+
+    fn file_request(&self, operation: Operation) -> FileRequest {
+        let tab = match operation {
+            Operation::SaveFile { tab }
+            | Operation::CreateFile { tab }
+            | Operation::OverwriteFile { tab } => tab,
+            _ => return FileRequest::default(),
+        };
+        let Some(tab) = self.sql_tabs.tabs().iter().find(|item| item.id == tab) else {
+            return FileRequest::default();
+        };
+        FileRequest {
+            file_id: tab.file.as_ref().map(|file| file.id),
+            name: self.file_name.clone(),
+            content: tab.editor.text(),
+            expected_sha256: tab
+                .file
+                .as_ref()
+                .map(|file| file.sha256.clone())
+                .unwrap_or_default(),
+        }
+    }
+
     fn request_quit(&mut self) {
         let dirty = self.sql_tabs.dirty_count();
         if dirty == 0 {
@@ -772,6 +939,18 @@ impl App {
             UiAction::SaveConnection => self.message = "Saving connection…".to_owned(),
             UiAction::TestConnection(_) => self.message = "Testing connection…".to_owned(),
             UiAction::DeleteConnection(_) => self.message = "Deleting connection…".to_owned(),
+            UiAction::ListFiles => {
+                if self.sql_tabs.active().is_none() {
+                    self.client = Some(client);
+                    self.message = "Open a SQL tab before opening a file.".to_owned();
+                    return;
+                }
+                self.message = "Loading SQL files…".to_owned();
+            }
+            UiAction::OpenFile(_) => self.message = "Opening SQL file…".to_owned(),
+            UiAction::SaveFile(_) | UiAction::CreateFile(_) | UiAction::OverwriteFile(_) => {
+                self.message = "Saving SQL file…".to_owned();
+            }
             UiAction::None => return,
         }
 
@@ -793,6 +972,7 @@ impl App {
             relation: self.catalog_relation.clone(),
         })
         .unwrap_or_default();
+        let file_request = self.file_request(operation);
         let input = if let Operation::SaveConnection { .. } = operation {
             match self.form.as_ref().map(ConnectionForm::input) {
                 Some(Ok(input)) => Some(input),
@@ -823,10 +1003,218 @@ impl App {
                 &password,
                 &catalog,
                 input.as_ref(),
+                file_request,
             )
             .await;
             (client, result)
         }));
+    }
+
+    fn apply_result(&mut self, result: OperationResult) {
+        match result {
+            OperationResult::Login(Ok(session)) => {
+                self.state = ScreenState::Authenticated(session);
+                self.start_operation(
+                    Operation::LoadConnections {
+                        page: self.connection_page,
+                    },
+                    UiAction::LoadConnections(self.connection_page),
+                );
+            }
+            OperationResult::Login(Err(error)) => {
+                self.state = ScreenState::EditingLogin {
+                    focus: LoginField::Password,
+                    error: Some(api_error_message(error).to_owned()),
+                };
+            }
+            OperationResult::Connections(Ok(connections)) => {
+                self.connections = connections;
+                self.selected_connection = self
+                    .selected_connection
+                    .min(self.connections.len().saturating_sub(1));
+                self.message = if self.connections.is_empty() {
+                    "No connections yet. Press n to add one.".to_owned()
+                } else {
+                    format!("Loaded {} connection(s).", self.connections.len())
+                };
+            }
+            OperationResult::Connections(Err(error)) => {
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Databases(Ok(databases)) => {
+                self.databases = databases;
+                self.selected_database = self
+                    .selected_database
+                    .min(self.databases.len().saturating_sub(1));
+                self.message = format!("Loaded {} database(s).", self.databases.len());
+            }
+            OperationResult::Schemas(Ok(schemas)) => {
+                self.schemas = schemas;
+                self.selected_schema = self
+                    .selected_schema
+                    .min(self.schemas.len().saturating_sub(1));
+                self.message = format!("Loaded {} schema(s).", self.schemas.len());
+            }
+            OperationResult::Relations(Ok(relations)) => {
+                self.relations = relations;
+                self.selected_relation = self
+                    .selected_relation
+                    .min(self.relations.len().saturating_sub(1));
+                self.message = format!("Loaded {} relation(s).", self.relations.len());
+            }
+            OperationResult::RelationDetail(Ok((columns, indexes))) => {
+                self.columns = columns;
+                self.indexes = indexes;
+                self.selected_column = self
+                    .selected_column
+                    .min(self.columns.len().saturating_sub(1));
+                self.message = format!(
+                    "Loaded {} column(s) and {} index(es).",
+                    self.columns.len(),
+                    self.indexes.len()
+                );
+            }
+            OperationResult::RelationDetail(Err(error)) => {
+                self.columns.clear();
+                self.indexes.clear();
+                self.selected_column = 0;
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Relations(Err(error)) => {
+                self.relations.clear();
+                self.selected_relation = 0;
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Schemas(Err(error)) => {
+                self.schemas.clear();
+                self.selected_schema = 0;
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Databases(Err(error)) => {
+                self.databases.clear();
+                self.selected_database = 0;
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Saved(Ok(_)) => {
+                self.form = None;
+                self.connection_page = 1;
+                self.message = "Connection saved.".to_owned();
+                self.start_operation(
+                    Operation::LoadConnections { page: 1 },
+                    UiAction::LoadConnections(1),
+                );
+            }
+            OperationResult::Saved(Err(error)) => {
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Tested(Ok(result)) => {
+                self.message = if result.success {
+                    "Connection test succeeded.".to_owned()
+                } else {
+                    "Connection test failed.".to_owned()
+                };
+            }
+            OperationResult::Tested(Err(error)) => {
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Deleted(Ok(())) => {
+                self.connection_page = 1;
+                self.message = "Connection deleted.".to_owned();
+                self.start_operation(
+                    Operation::LoadConnections { page: 1 },
+                    UiAction::LoadConnections(1),
+                );
+            }
+            OperationResult::Deleted(Err(error)) => {
+                self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::Files(Ok(files)) => {
+                if files.is_empty() {
+                    self.message = "No saved SQL files.".to_owned();
+                } else {
+                    self.message.clear();
+                    self.file_picker = Some(FilePicker { files, selected: 0 });
+                }
+            }
+            OperationResult::Files(Err(error)) => {
+                self.message = file_error_message(error).to_owned();
+            }
+            OperationResult::OpenedFile(Ok(opened)) => self.open_file_tab(opened),
+            OperationResult::OpenedFile(Err(error)) => {
+                self.message = file_error_message(error).to_owned();
+            }
+            OperationResult::SavedFile {
+                tab,
+                content,
+                result: Ok(file),
+            } => {
+                self.message = format!("Saved {}.", file.name);
+                if let Some(tab) = self.sql_tabs.get_mut(tab) {
+                    tab.mark_saved(
+                        TabFile {
+                            id: file.id,
+                            name: file.name,
+                            sha256: file.sha256,
+                        },
+                        content,
+                    );
+                }
+            }
+            OperationResult::SavedFile {
+                tab,
+                result:
+                    Err(ApiError::Http {
+                        code: Some("file_conflict"),
+                        ..
+                    }),
+                ..
+            } => {
+                self.save_conflict = Some(tab);
+                self.message = "The file changed on the server since it was opened.".to_owned();
+            }
+            OperationResult::SavedFile {
+                result: Err(error), ..
+            } => {
+                self.message = file_error_message(error).to_owned();
+            }
+        }
+    }
+
+    /// Opens a downloaded file in a new tab bound to the active tab's
+    /// connection and database.
+    fn open_file_tab(&mut self, opened: SqlFileContent) {
+        let Some((connection_id, connection_name, database)) = self.sql_tabs.active().map(|tab| {
+            (
+                tab.connection_id,
+                tab.connection_name.clone(),
+                tab.database.clone(),
+            )
+        }) else {
+            self.message = "Open a SQL tab before opening a file.".to_owned();
+            return;
+        };
+        let name = opened.file.name.clone();
+        let file = TabFile {
+            id: opened.file.id,
+            name: opened.file.name,
+            sha256: opened.file.sha256,
+        };
+        match self.sql_tabs.open_file(
+            connection_id,
+            &connection_name,
+            &database,
+            file,
+            opened.content,
+        ) {
+            Ok(_) => {
+                self.view = SQL_VIEW;
+                self.message = format!("Opened {name}.");
+            }
+            Err(_) => {
+                self.message =
+                    format!("Close a SQL tab before opening another (limit {MAX_SQL_TABS}).");
+            }
+        }
     }
 
     async fn complete_operation_if_ready(&mut self) {
@@ -839,130 +1227,39 @@ impl App {
         match task.await {
             Ok((client, result)) => {
                 self.client = Some(client);
-                match result {
-                    OperationResult::Login(Ok(session)) => {
-                        self.state = ScreenState::Authenticated(session);
-                        self.start_operation(
-                            Operation::LoadConnections {
-                                page: self.connection_page,
-                            },
-                            UiAction::LoadConnections(self.connection_page),
-                        );
-                    }
-                    OperationResult::Login(Err(error)) => {
-                        self.state = ScreenState::EditingLogin {
-                            focus: LoginField::Password,
-                            error: Some(api_error_message(error).to_owned()),
-                        };
-                    }
-                    OperationResult::Connections(Ok(connections)) => {
-                        self.connections = connections;
-                        self.selected_connection = self
-                            .selected_connection
-                            .min(self.connections.len().saturating_sub(1));
-                        self.message = if self.connections.is_empty() {
-                            "No connections yet. Press n to add one.".to_owned()
-                        } else {
-                            format!("Loaded {} connection(s).", self.connections.len())
-                        };
-                    }
-                    OperationResult::Connections(Err(error)) => {
-                        self.message = api_error_message(error).to_owned();
-                    }
-                    OperationResult::Databases(Ok(databases)) => {
-                        self.databases = databases;
-                        self.selected_database = self
-                            .selected_database
-                            .min(self.databases.len().saturating_sub(1));
-                        self.message = format!("Loaded {} database(s).", self.databases.len());
-                    }
-                    OperationResult::Schemas(Ok(schemas)) => {
-                        self.schemas = schemas;
-                        self.selected_schema = self
-                            .selected_schema
-                            .min(self.schemas.len().saturating_sub(1));
-                        self.message = format!("Loaded {} schema(s).", self.schemas.len());
-                    }
-                    OperationResult::Relations(Ok(relations)) => {
-                        self.relations = relations;
-                        self.selected_relation = self
-                            .selected_relation
-                            .min(self.relations.len().saturating_sub(1));
-                        self.message = format!("Loaded {} relation(s).", self.relations.len());
-                    }
-                    OperationResult::RelationDetail(Ok((columns, indexes))) => {
-                        self.columns = columns;
-                        self.indexes = indexes;
-                        self.selected_column = self
-                            .selected_column
-                            .min(self.columns.len().saturating_sub(1));
-                        self.message = format!(
-                            "Loaded {} column(s) and {} index(es).",
-                            self.columns.len(),
-                            self.indexes.len()
-                        );
-                    }
-                    OperationResult::RelationDetail(Err(error)) => {
-                        self.columns.clear();
-                        self.indexes.clear();
-                        self.selected_column = 0;
-                        self.message = api_error_message(error).to_owned();
-                    }
-                    OperationResult::Relations(Err(error)) => {
-                        self.relations.clear();
-                        self.selected_relation = 0;
-                        self.message = api_error_message(error).to_owned();
-                    }
-                    OperationResult::Schemas(Err(error)) => {
-                        self.schemas.clear();
-                        self.selected_schema = 0;
-                        self.message = api_error_message(error).to_owned();
-                    }
-                    OperationResult::Databases(Err(error)) => {
-                        self.databases.clear();
-                        self.selected_database = 0;
-                        self.message = api_error_message(error).to_owned();
-                    }
-                    OperationResult::Saved(Ok(_)) => {
-                        self.form = None;
-                        self.connection_page = 1;
-                        self.message = "Connection saved.".to_owned();
-                        self.start_operation(
-                            Operation::LoadConnections { page: 1 },
-                            UiAction::LoadConnections(1),
-                        );
-                    }
-                    OperationResult::Saved(Err(error)) => {
-                        self.message = api_error_message(error).to_owned();
-                    }
-                    OperationResult::Tested(Ok(result)) => {
-                        self.message = if result.success {
-                            "Connection test succeeded.".to_owned()
-                        } else {
-                            "Connection test failed.".to_owned()
-                        };
-                    }
-                    OperationResult::Tested(Err(error)) => {
-                        self.message = api_error_message(error).to_owned();
-                    }
-                    OperationResult::Deleted(Ok(())) => {
-                        self.connection_page = 1;
-                        self.message = "Connection deleted.".to_owned();
-                        self.start_operation(
-                            Operation::LoadConnections { page: 1 },
-                            UiAction::LoadConnections(1),
-                        );
-                    }
-                    OperationResult::Deleted(Err(error)) => {
-                        self.message = api_error_message(error).to_owned();
-                    }
-                }
+                self.apply_result(result);
             }
             Err(_) => {
                 self.client = ApiClient::from_env().ok();
                 self.message = "The API operation did not complete.".to_owned();
             }
         }
+    }
+}
+
+fn file_error_message(error: ApiError) -> &'static str {
+    match error {
+        ApiError::Http {
+            code: Some("not_found"),
+            ..
+        } => "The SQL file is no longer available.",
+        ApiError::Http {
+            code: Some("file_name_conflict"),
+            ..
+        } => "A SQL file with this name already exists.",
+        ApiError::Http {
+            code: Some("file_too_large"),
+            ..
+        } => "SQL files are limited to 1 MiB.",
+        ApiError::Http {
+            code: Some("invalid_request"),
+            ..
+        } => "Invalid file name. Use a plain name ending in .sql.",
+        ApiError::Http {
+            code: Some("file_storage_unavailable"),
+            ..
+        } => "SQL file storage is not configured on the server.",
+        error => api_error_message(error),
     }
 }
 
@@ -1041,6 +1338,11 @@ fn start_action(app: &mut App, action: UiAction) {
         },
         UiAction::TestConnection(id) => Operation::TestConnection { id },
         UiAction::DeleteConnection(id) => Operation::DeleteConnection { id },
+        UiAction::ListFiles => Operation::ListFiles,
+        UiAction::OpenFile(id) => Operation::OpenFile { id },
+        UiAction::SaveFile(tab) => Operation::SaveFile { tab },
+        UiAction::CreateFile(tab) => Operation::CreateFile { tab },
+        UiAction::OverwriteFile(tab) => Operation::OverwriteFile { tab },
     };
     app.start_operation(operation, action);
 }
@@ -1147,6 +1449,12 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "Unsaved SQL changes will be lost. Quit anyway? y: quit   n/Esc: cancel"
     } else if app.confirm_close_tab {
         "Close tab with unsaved changes? y: close   n/Esc: cancel"
+    } else if app.file_prompt.is_some() {
+        "Type a file name   Enter: save   Esc: cancel"
+    } else if app.save_conflict.is_some() {
+        "File changed on the server. o: overwrite   a: save as   Esc: cancel"
+    } else if app.file_picker.is_some() {
+        "↑/↓: select   Enter: open in new tab   Esc: close"
     } else if app.sql_editing {
         "EDIT   Esc: commands   ←↑↓→ Home End PgUp PgDn: move   Ctrl+C: quit"
     } else if app.pending.is_some() {
@@ -1158,7 +1466,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
         "n: new   e: edit   t: test   c: databases   d: delete   s: SQL   [ / ]: pages   r: reload   Tab: overview   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == SQL_VIEW {
-        "Enter/i: edit   [ / ]: switch tab   x: close tab   Tab/Esc: connections   q: quit"
+        "Enter/i: edit   w: save   W: save as   o: open   [ / ]: tabs   x: close   Tab/Esc: back   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
         "↑/↓: navigate   Enter: schemas   s: new SQL tab   r: reload   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
@@ -1419,8 +1727,17 @@ fn index_line(index: &Index) -> Line<'_> {
 fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let panes = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(area);
+    frame.render_widget(
+        Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Yellow)),
+        panes[2],
+    );
+    render_file_overlays(frame, panes[1], app);
     let titles = app.sql_tabs.tabs().iter().map(|tab| {
         let marker = if tab.is_dirty() { " *" } else { "" };
         Line::from(format!(
@@ -1447,7 +1764,9 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mode = if app.sql_editing { " [EDIT]" } else { "" };
     let title = format!(
         " {} — {} / {}{mode} ",
-        tab.file.as_deref().unwrap_or("untitled"),
+        tab.file
+            .as_ref()
+            .map_or("untitled", |file| file.name.as_str()),
         tab.connection_name,
         tab.database
     );
@@ -1487,6 +1806,68 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let x = u16::try_from(col - scroll_col).unwrap_or(inner.width);
         let y = u16::try_from(row - scroll_row).unwrap_or(inner.height);
         frame.set_cursor_position((inner.x.saturating_add(x), inner.y.saturating_add(y)));
+    }
+}
+
+/// Draws the save-as prompt or the file picker over `area`.
+fn render_file_overlays(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if let Some(prompt) = &app.file_prompt {
+        let popup = centered(area, 60, 3);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(format!("{}▏", prompt.name)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Save SQL file as "),
+            ),
+            popup,
+        );
+    } else if let Some(picker) = &app.file_picker {
+        let height = u16::try_from(picker.files.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2);
+        let popup = centered(area, 60, height);
+        let items: Vec<_> = picker
+            .files
+            .iter()
+            .map(|file| {
+                ListItem::new(Line::from(vec![
+                    Span::raw(file.name.as_str()),
+                    Span::styled(
+                        format!("  {} bytes", file.size_bytes),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Open SQL file "),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            )
+            .highlight_symbol("› ");
+        let mut state = ListState::default().with_selected(Some(picker.selected));
+        frame.render_widget(Clear, popup);
+        frame.render_stateful_widget(list, popup, &mut state);
+    }
+}
+
+/// A rectangle `width_percent` wide and `height` rows tall, centered in `area`
+/// and clamped to it.
+fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
+    let width = area.width.saturating_mul(width_percent) / 100;
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
     }
 }
 
@@ -1619,6 +2000,7 @@ async fn run_operation(
     password: &str,
     catalog: &CatalogPath,
     input: Option<&ConnectionInput>,
+    file: FileRequest,
 ) -> OperationResult {
     match operation {
         Operation::Login => {
@@ -1699,6 +2081,55 @@ async fn run_operation(
         Operation::DeleteConnection { id } => {
             OperationResult::Deleted(client.delete_connection(id).await)
         }
+        Operation::ListFiles => OperationResult::Files(
+            client
+                .list_sql_files(1, FILE_LIST_SIZE)
+                .await
+                .map(|files| files.items),
+        ),
+        Operation::OpenFile { id } => OperationResult::OpenedFile(client.read_sql_file(id).await),
+        Operation::SaveFile { tab } => {
+            let result = match file.file_id {
+                Some(id) => {
+                    client
+                        .update_sql_file(id, &file.content, &file.expected_sha256)
+                        .await
+                }
+                None => Err(ApiError::InvalidResponse),
+            };
+            OperationResult::SavedFile {
+                tab,
+                content: file.content,
+                result,
+            }
+        }
+        Operation::CreateFile { tab } => {
+            let result = client.create_sql_file(&file.name, &file.content).await;
+            OperationResult::SavedFile {
+                tab,
+                content: file.content,
+                result,
+            }
+        }
+        Operation::OverwriteFile { tab } => {
+            let result = match file.file_id {
+                Some(id) => {
+                    async {
+                        let current = client.read_sql_file(id).await?;
+                        client
+                            .update_sql_file(id, &file.content, &current.file.sha256)
+                            .await
+                    }
+                    .await
+                }
+                None => Err(ApiError::InvalidResponse),
+            };
+            OperationResult::SavedFile {
+                tab,
+                content: file.content,
+                result,
+            }
+        }
     }
 }
 
@@ -1706,13 +2137,15 @@ async fn run_operation(
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pgrustadmin_api_client::{
-        ApiClient, AuthSession, Column, Connection, Database, Index, Relation, RelationKind, Schema,
+        ApiClient, ApiError, AuthSession, Column, Connection, Database, Index, Relation,
+        RelationKind, Schema, SqlFile, SqlFileContent,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
     use super::{
-        App, ConnectionForm, LoginField, MAX_SQL_TABS, SQL_VIEW, ScreenState, UiAction, render,
+        App, ConnectionForm, LoginField, MAX_SQL_TABS, OperationResult, SQL_VIEW, ScreenState,
+        UiAction, render,
     };
 
     fn client() -> ApiClient {
@@ -2267,6 +2700,152 @@ mod tests {
         let mut app = App::new(client());
         app.handle_paste("user@example.test\n");
         assert_eq!(app.login_email, "user@example.test");
+    }
+
+    fn sql_file(name: &str, sha256: &str) -> SqlFile {
+        SqlFile {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            size_bytes: 8,
+            sha256: sha256.to_owned(),
+        }
+    }
+
+    #[test]
+    fn saving_untitled_tab_asks_for_name_and_records_the_file() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        app.sql_tabs
+            .active_mut()
+            .expect("active tab")
+            .editor
+            .insert_str("SELECT 1;");
+
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('w')),
+            UiAction::None
+        ));
+        assert!(app.file_prompt.is_some());
+        for character in "report".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Char('t'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            UiAction::CreateFile(id) if id == tab_id
+        ));
+        assert!(app.file_prompt.is_none());
+        assert_eq!(app.file_name, "report.sql");
+
+        let file = sql_file("report.sql", "aa");
+        app.apply_result(OperationResult::SavedFile {
+            tab: tab_id,
+            content: "SELECT 1;".to_owned(),
+            result: Ok(file.clone()),
+        });
+        let tab = app.sql_tabs.active().expect("active tab");
+        assert!(!tab.is_dirty());
+        assert_eq!(tab.file.as_ref().map(|file| file.id), Some(file.id));
+        assert!(app.message.contains("report.sql"));
+
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('w')),
+            UiAction::SaveFile(id) if id == tab_id
+        ));
+        press(&mut app, KeyCode::Char('W'));
+        assert!(app.file_prompt.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.file_prompt.is_none());
+        assert_eq!(app.view, SQL_VIEW);
+    }
+
+    #[test]
+    fn save_conflict_offers_overwrite_or_save_as() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        app.apply_result(OperationResult::SavedFile {
+            tab: tab_id,
+            content: "SELECT 1;".to_owned(),
+            result: Err(ApiError::Http {
+                status: 409,
+                code: Some("file_conflict"),
+            }),
+        });
+        assert_eq!(app.save_conflict, Some(tab_id));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.should_quit, "conflict prompt captures keys");
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('o')),
+            UiAction::OverwriteFile(id) if id == tab_id
+        ));
+        assert!(app.save_conflict.is_none());
+
+        app.save_conflict = Some(tab_id);
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.save_conflict.is_none());
+        assert!(app.file_prompt.is_some());
+        press(&mut app, KeyCode::Esc);
+
+        app.save_conflict = Some(tab_id);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.save_conflict.is_none());
+        assert!(app.file_prompt.is_none());
+    }
+
+    #[test]
+    fn opening_a_file_lists_files_and_opens_a_clean_tab_on_the_same_connection() {
+        let mut app = authenticated_app();
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('o')),
+            UiAction::None
+        ));
+        let mut app = app_with_sql_tab();
+        let connection_id = app.sql_tabs.active().expect("active tab").connection_id;
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('o')),
+            UiAction::ListFiles
+        ));
+        let first = sql_file("a.sql", "aa");
+        let second = sql_file("b.sql", "bb");
+        app.apply_result(OperationResult::Files(Ok(vec![first, second.clone()])));
+        assert!(app.file_picker.is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render file picker");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Open SQL file"));
+        assert!(rendered.contains("b.sql"));
+
+        press(&mut app, KeyCode::Down);
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            UiAction::OpenFile(id) if id == second.id
+        ));
+        assert!(app.file_picker.is_none());
+
+        app.apply_result(OperationResult::OpenedFile(Ok(SqlFileContent {
+            file: second.clone(),
+            content: "SELECT 2;".to_owned(),
+        })));
+        assert_eq!(app.sql_tabs.tabs().len(), 2);
+        let tab = app.sql_tabs.active().expect("opened tab");
+        assert_eq!(tab.editor.text(), "SELECT 2;");
+        assert_eq!(tab.connection_id, connection_id);
+        assert_eq!(tab.file.as_ref().map(|file| file.id), Some(second.id));
+        assert!(!tab.is_dirty());
+
+        app.apply_result(OperationResult::Files(Ok(Vec::new())));
+        assert!(app.file_picker.is_none());
+        assert!(app.message.contains("No saved SQL files"));
     }
 
     fn column(name: &str) -> Column {

@@ -564,3 +564,127 @@ mod connection_options_tests {
         assert!(matches!(local.get_ssl_mode(), PgSslMode::Disable));
     }
 }
+
+#[derive(sqlx::FromRow)]
+pub struct SqlFileRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub storage_key: Uuid,
+    pub size_bytes: i32,
+    pub content_sha256: Vec<u8>,
+}
+
+pub struct NewSqlFile<'a> {
+    pub id: Uuid,
+    pub owner_id: Uuid,
+    pub name: &'a str,
+    pub storage_key: Uuid,
+    pub size_bytes: i32,
+    pub content_sha256: &'a [u8],
+}
+
+/// A successful conditional content update and the storage key it replaced.
+#[derive(sqlx::FromRow)]
+pub struct UpdatedSqlFile {
+    #[sqlx(flatten)]
+    pub file: SqlFileRecord,
+    pub previous_storage_key: Uuid,
+}
+
+pub async fn list_sql_files_for_owner(
+    pool: &PgPool,
+    owner_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SqlFileRecord>, PostgresError> {
+    sqlx::query_as(
+        "SELECT id, name, storage_key, size_bytes, content_sha256 \
+         FROM sql_files WHERE owner_id = $1 \
+         ORDER BY name, id LIMIT $2 OFFSET $3",
+    )
+    .bind(owner_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn find_sql_file_for_owner(
+    pool: &PgPool,
+    owner_id: Uuid,
+    file_id: Uuid,
+) -> Result<Option<SqlFileRecord>, PostgresError> {
+    sqlx::query_as(
+        "SELECT id, name, storage_key, size_bytes, content_sha256 \
+         FROM sql_files WHERE owner_id = $1 AND id = $2",
+    )
+    .bind(owner_id)
+    .bind(file_id)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn create_sql_file(
+    pool: &PgPool,
+    file: &NewSqlFile<'_>,
+) -> Result<SqlFileRecord, PostgresError> {
+    sqlx::query_as(
+        "INSERT INTO sql_files (id, owner_id, name, storage_key, size_bytes, content_sha256) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, name, storage_key, size_bytes, content_sha256",
+    )
+    .bind(file.id)
+    .bind(file.owner_id)
+    .bind(file.name)
+    .bind(file.storage_key)
+    .bind(file.size_bytes)
+    .bind(file.content_sha256)
+    .fetch_one(pool)
+    .await
+}
+
+/// Points the file at new content only while its current hash equals
+/// `expected_sha256`. Returns `None` when the file is missing, owned by
+/// someone else or its content changed.
+pub async fn update_sql_file_content_for_owner(
+    pool: &PgPool,
+    owner_id: Uuid,
+    file_id: Uuid,
+    expected_sha256: &[u8],
+    storage_key: Uuid,
+    size_bytes: i32,
+    content_sha256: &[u8],
+) -> Result<Option<UpdatedSqlFile>, PostgresError> {
+    sqlx::query_as(
+        "UPDATE sql_files AS file \
+         SET storage_key = $4, size_bytes = $5, content_sha256 = $6, updated_at = now() \
+         FROM sql_files AS previous \
+         WHERE previous.id = file.id \
+           AND file.owner_id = $1 AND file.id = $2 AND file.content_sha256 = $3 \
+         RETURNING file.id, file.name, file.storage_key, file.size_bytes, \
+                   file.content_sha256, previous.storage_key AS previous_storage_key",
+    )
+    .bind(owner_id)
+    .bind(file_id)
+    .bind(expected_sha256)
+    .bind(storage_key)
+    .bind(size_bytes)
+    .bind(content_sha256)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Deletes the file record and returns the storage key of its content.
+pub async fn delete_sql_file_for_owner(
+    pool: &PgPool,
+    owner_id: Uuid,
+    file_id: Uuid,
+) -> Result<Option<Uuid>, PostgresError> {
+    sqlx::query_scalar(
+        "DELETE FROM sql_files WHERE owner_id = $1 AND id = $2 RETURNING storage_key",
+    )
+    .bind(owner_id)
+    .bind(file_id)
+    .fetch_optional(pool)
+    .await
+}

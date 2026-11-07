@@ -30,6 +30,15 @@ O endpoint de login autentica usuários ativos já cadastrados em `users`; cria�
 
 Antes de cadastrar conexões após a implementação de CON-001, gere uma chave de 32 bytes com `openssl rand -base64 32` e forneça-a em `PGRUSTADMIN_CREDENTIAL_KEY`. Guarde a mesma chave fora do PostgreSQL e junto ao plano de backup: trocar ou perder a chave torna credenciais já cifradas irrecuperáveis. Não gere uma chave nova em cada inicialização.
 
+Arquivos `.sql` salvos pela API ficam fora do PostgreSQL, num diretório controlado pelo servidor. Crie-o e informe-o antes de iniciar o servidor; sem a variável, só as rotas de arquivos respondem `503`:
+
+```bash
+mkdir -p ~/.local/share/pgrustadmin/sql-files
+export PGRUSTADMIN_SQL_FILES_DIR=~/.local/share/pgrustadmin/sql-files
+```
+
+Inclua esse diretório no backup junto com o banco de metadados: os metadados referenciam o conteúdo por storage key, e um sem o outro não restaura os arquivos. O teste de integração usa um diretório temporário próprio e não precisa da variável.
+
 O teste de autorização precisa de um banco descartável. Crie-o uma vez:
 
 ```bash

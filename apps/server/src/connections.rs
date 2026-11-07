@@ -67,21 +67,21 @@ struct ConnectionRequest {
 }
 
 #[derive(Deserialize)]
-struct PaginationQuery {
+pub(crate) struct PaginationQuery {
     page: Option<u64>,
     per_page: Option<u64>,
 }
 
 /// Validated `page`/`per_page` with the SQL limit and offset they select.
-struct Page {
-    page: u64,
-    per_page: u64,
-    limit: i64,
-    offset: i64,
+pub(crate) struct Page {
+    pub(crate) page: u64,
+    pub(crate) per_page: u64,
+    pub(crate) limit: i64,
+    pub(crate) offset: i64,
 }
 
 impl PaginationQuery {
-    fn validate(self) -> Option<Page> {
+    pub(crate) fn validate(self) -> Option<Page> {
         let page = self.page.unwrap_or(1);
         let per_page = self.per_page.unwrap_or(25);
         if page == 0 || per_page == 0 || per_page > 100 {
@@ -108,7 +108,7 @@ struct ValidatedConnection {
 }
 
 #[derive(Clone, Copy)]
-enum AuthenticationError {
+pub(crate) enum AuthenticationError {
     Unauthorized,
     Internal,
 }
@@ -731,7 +731,7 @@ async fn remove(
     }
 }
 
-async fn authenticated_owner(
+pub(crate) async fn authenticated_owner(
     pool: &PgPool,
     headers: &HeaderMap,
 ) -> Result<Uuid, AuthenticationError> {
@@ -742,7 +742,7 @@ async fn authenticated_owner(
     }
 }
 
-fn authentication_error_response(error: AuthenticationError) -> Response {
+pub(crate) fn authentication_error_response(error: AuthenticationError) -> Response {
     match error {
         AuthenticationError::Unauthorized => unauthorized(),
         AuthenticationError::Internal => internal_error(),
@@ -796,7 +796,7 @@ fn connection_data(connection: &ValidatedConnection) -> ConnectionData<'_> {
     }
 }
 
-fn is_unique_violation(error: &PostgresError) -> bool {
+pub(crate) fn is_unique_violation(error: &PostgresError) -> bool {
     error
         .as_database_error()
         .and_then(|database_error| database_error.code())

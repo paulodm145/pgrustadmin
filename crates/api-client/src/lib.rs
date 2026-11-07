@@ -213,6 +213,40 @@ pub struct IndexList {
     pub items: Vec<Index>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SqlFile {
+    pub id: Uuid,
+    pub name: String,
+    pub size_bytes: u32,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SqlFileContent {
+    #[serde(flatten)]
+    pub file: SqlFile,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SqlFileList {
+    pub items: Vec<SqlFile>,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+#[derive(Serialize)]
+struct CreateSqlFileRequest<'a> {
+    name: &'a str,
+    content: &'a str,
+}
+
+#[derive(Serialize)]
+struct UpdateSqlFileRequest<'a> {
+    content: &'a str,
+    expected_sha256: &'a str,
+}
+
 /// Identifies one relation in the catalog of a saved connection.
 #[derive(Clone, Copy, Debug)]
 pub struct RelationRef<'a> {
@@ -339,6 +373,55 @@ impl ApiClient {
     pub async fn delete_connection(&self, id: Uuid) -> Result<(), ApiError> {
         let response = self
             .request(Method::DELETE, &format!("api/v1/connections/{id}"), true)?
+            .send()
+            .await
+            .map_err(|_| ApiError::Transport)?;
+        expect_no_content(response).await
+    }
+
+    pub async fn list_sql_files(&self, page: u64, per_page: u64) -> Result<SqlFileList, ApiError> {
+        let mut url = self.url("api/v1/sql-files")?;
+        url.query_pairs_mut()
+            .append_pair("page", &page.to_string())
+            .append_pair("per_page", &per_page.to_string());
+        let request = self.authenticated_request(self.http.get(url))?;
+        decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
+    }
+
+    pub async fn create_sql_file(&self, name: &str, content: &str) -> Result<SqlFile, ApiError> {
+        self.send_json(
+            Method::POST,
+            "api/v1/sql-files",
+            &CreateSqlFileRequest { name, content },
+        )
+        .await
+    }
+
+    pub async fn read_sql_file(&self, id: Uuid) -> Result<SqlFileContent, ApiError> {
+        self.get_json(&format!("api/v1/sql-files/{id}"), true).await
+    }
+
+    /// Replaces the content only if the server still holds `expected_sha256`.
+    pub async fn update_sql_file(
+        &self,
+        id: Uuid,
+        content: &str,
+        expected_sha256: &str,
+    ) -> Result<SqlFile, ApiError> {
+        self.send_json(
+            Method::PUT,
+            &format!("api/v1/sql-files/{id}"),
+            &UpdateSqlFileRequest {
+                content,
+                expected_sha256,
+            },
+        )
+        .await
+    }
+
+    pub async fn delete_sql_file(&self, id: Uuid) -> Result<(), ApiError> {
+        let response = self
+            .request(Method::DELETE, &format!("api/v1/sql-files/{id}"), true)?
             .send()
             .await
             .map_err(|_| ApiError::Transport)?;
@@ -483,6 +566,10 @@ async fn http_error(response: reqwest::Response) -> ApiError {
             "internal_error" => Some("internal_error"),
             "method_not_allowed" => Some("method_not_allowed"),
             "catalog_unavailable" => Some("catalog_unavailable"),
+            "file_name_conflict" => Some("file_name_conflict"),
+            "file_conflict" => Some("file_conflict"),
+            "file_too_large" => Some("file_too_large"),
+            "file_storage_unavailable" => Some("file_storage_unavailable"),
             _ => None,
         });
     ApiError::Http { status, code }
@@ -497,6 +584,8 @@ mod tests {
         routing::{get, post},
     };
     use serde::{Deserialize, Serialize};
+
+    const SQL_FILE_ID: &str = "7c0f9a6e-2a43-4b8e-9d1f-3f1c2b5a6d7e";
 
     #[derive(Deserialize)]
     struct RelationPageQuery {
@@ -624,6 +713,49 @@ mod tests {
                     }]}))
                 }),
             )
+            .route(
+                "/api/v1/sql-files",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "items": [{"id": SQL_FILE_ID, "name": "a.sql", "size_bytes": 8, "sha256": "aa"}],
+                        "page": 1,
+                        "per_page": 100,
+                    }))
+                })
+                .post(|Json(body): Json<serde_json::Value>| async move {
+                    (
+                        axum::http::StatusCode::CREATED,
+                        Json(serde_json::json!({
+                            "id": SQL_FILE_ID, "name": body["name"], "size_bytes": 8, "sha256": "bb",
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/api/v1/sql-files/{id}",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "id": SQL_FILE_ID, "name": "a.sql", "size_bytes": 8, "sha256": "aa",
+                        "content": "SELECT 1",
+                    }))
+                })
+                .put(|Json(body): Json<serde_json::Value>| async move {
+                    if body["expected_sha256"] == "stale" {
+                        (
+                            axum::http::StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "file_conflict"})),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({
+                                "id": SQL_FILE_ID, "name": "a.sql", "size_bytes": 8, "sha256": "cc",
+                            })),
+                        )
+                    }
+                })
+                .delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -738,6 +870,36 @@ mod tests {
                 columns: vec!["id".to_owned()],
             }]
         );
+        let file_id = Uuid::parse_str(SQL_FILE_ID).expect("valid file id");
+        let listed = client.list_sql_files(1, 100).await.expect("list files");
+        assert_eq!(listed.items[0].name, "a.sql");
+        assert_eq!(
+            client
+                .create_sql_file("new.sql", "SELECT 1")
+                .await
+                .expect("create file")
+                .name,
+            "new.sql"
+        );
+        let read = client.read_sql_file(file_id).await.expect("read file");
+        assert_eq!(read.content, "SELECT 1");
+        assert_eq!(read.file.sha256, "aa");
+        assert_eq!(
+            client
+                .update_sql_file(file_id, "SELECT 2", "aa")
+                .await
+                .expect("update file")
+                .sha256,
+            "cc"
+        );
+        assert_eq!(
+            client.update_sql_file(file_id, "SELECT 2", "stale").await,
+            Err(ApiError::Http {
+                status: 409,
+                code: Some("file_conflict"),
+            })
+        );
+        client.delete_sql_file(file_id).await.expect("delete file");
         client.logout().await.expect("logout succeeds");
         assert_eq!(
             client.current_session().await,

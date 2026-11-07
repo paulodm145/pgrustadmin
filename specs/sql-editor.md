@@ -27,3 +27,20 @@ O editor é próprio e mínimo, sem nova dependência: texto multilinha com curs
 Cada aba guarda o conteúdo base do último estado salvo (vazio ao abrir; arquivos chegam em SQL-003). A aba está dirty quando o SQL atual difere do conteúdo base; desfazer as alterações manualmente limpa o estado.
 
 Fechar (`x`) uma aba dirty pede confirmação (`y` fecha, `n`/Esc cancela). Sair da TUI (`q`, Esc ou Ctrl+C) com abas dirty pede confirmação informando quantas abas têm alterações não salvas; `y` sai, `n`/Esc cancela e Ctrl+C durante a confirmação sai imediatamente. Sem abas dirty, a saída continua imediata.
+
+## SQL-003 — Arquivos SQL
+
+Arquivos pertencem ao usuário autenticado; identificador inexistente ou de outro usuário responde `404`. Metadados ficam na tabela `sql_files` do banco de metadados (ID UUID, proprietário, nome, storage key UUID, tamanho em bytes, SHA-256 do conteúdo, timestamps); o conteúdo UTF-8 fica em `PGRUSTADMIN_SQL_FILES_DIR/<owner_id>/<storage_key>.sql`. O caminho em disco é derivado só de UUIDs gerados pelo servidor, nunca do nome, o que impede traversal. O diretório é obrigatório e deve existir; sem ele, apenas as rotas de arquivos respondem `503` (`file_storage_unavailable`).
+
+Nome: 5 a 255 bytes, termina em `.sql`, sem `/`, `\`, caracteres de controle, espaço nas extremidades ou ponto inicial; único por usuário (`409` `file_name_conflict`). Conteúdo: até 1 MiB (1 048 576 bytes) em UTF-8; acima disso `413` (`file_too_large`). Entrada inválida responde `400` (`invalid_request`).
+
+Endpoints sob `/api/v1/sql-files`, com `sha256` em hexadecimal minúsculo como versão do conteúdo:
+- `GET /api/v1/sql-files?page&per_page`: lista por nome com a paginação de conexões; `{ "items": [{ "id", "name", "size_bytes", "sha256" }], "page", "per_page" }`.
+- `POST /api/v1/sql-files` com `{ "name", "content" }`: cria; `201` com os metadados.
+- `GET /api/v1/sql-files/{id}`: metadados e `content`. Conteúdo ausente ou com hash divergente do registrado responde `500`.
+- `PUT /api/v1/sql-files/{id}` com `{ "content", "expected_sha256" }`: grava somente se o hash atual for `expected_sha256`; caso contrário `409` (`file_conflict`) sem alterar nada. `200` com os novos metadados.
+- `DELETE /api/v1/sql-files/{id}`: remove metadados e conteúdo; `204`.
+
+Cada gravação escreve o conteúdo em nova storage key e só então atualiza o registro condicionado ao hash esperado; se a atualização falhar, o novo conteúdo é removido; se tiver sucesso, o conteúdo anterior é removido. Gravações concorrentes não sobrescrevem silenciosamente.
+
+Na TUI (seção SQL, modo de comandos), cada aba guarda o arquivo associado (ID, nome e hash salvo). `w` salva: aba com arquivo faz `PUT` com o hash salvo; aba sem arquivo pede um nome (salvar como). `W` sempre pede um nome e cria um arquivo novo, que passa a ser o arquivo da aba. Nome digitado sem `.sql` recebe o sufixo. Quebras de linha `\r\n`/`\r` do arquivo aberto são normalizadas para `\n` pelo editor e gravadas assim no próximo salvamento. Depois de salvar, o conteúdo base da aba passa a ser o conteúdo salvo (dirty limpo). Em `409` de conflito, a TUI oferece `o` sobrescrever (lê o hash atual do servidor e grava com ele, ainda sujeito a conflito), `a` salvar como outro nome ou Esc cancelar. `o` lista os arquivos (até 100, por nome); Enter abre o selecionado em nova aba ligada à conexão/database da aba ativa, com o arquivo associado e dirty limpo; Esc fecha a lista. Abrir exige uma aba ativa. Excluir arquivos pela TUI não faz parte de SQL-003.
