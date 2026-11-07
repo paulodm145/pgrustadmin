@@ -8,3 +8,6 @@ ratatui.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
+pgrustadmin-api-client.workspace = true
+zeroize.workspace = true
+uuid.workspace = true
