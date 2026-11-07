@@ -306,6 +306,26 @@ struct ExecutionRequest<'a> {
     sql: &'a str,
 }
 
+/// One page of a relation's rows as PostgreSQL text values.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RelationRowsPage {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub total_rows: u64,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+/// Page, order and search of a relation rows request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelationRowsRequest<'a> {
+    pub page: u64,
+    pub per_page: u64,
+    /// Column name and whether the order is descending.
+    pub sort: Option<(&'a str, bool)>,
+    pub search: &'a str,
+}
+
 /// Identifies one relation in the catalog of a saved connection.
 #[derive(Clone, Copy, Debug)]
 pub struct RelationRef<'a> {
@@ -576,6 +596,30 @@ impl ApiClient {
         self.get_json(&relation.path("columns"), true).await
     }
 
+    pub async fn list_relation_rows(
+        &self,
+        relation: RelationRef<'_>,
+        request: RelationRowsRequest<'_>,
+    ) -> Result<RelationRowsPage, ApiError> {
+        let mut url = self.url(&relation.path("rows"))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("page", &request.page.to_string())
+                .append_pair("per_page", &request.per_page.to_string());
+            if let Some((column, descending)) = request.sort {
+                query
+                    .append_pair("sort", column)
+                    .append_pair("direction", if descending { "desc" } else { "asc" });
+            }
+            if !request.search.is_empty() {
+                query.append_pair("search", request.search);
+            }
+        }
+        let request = self.authenticated_request(self.http.get(url))?;
+        decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
+    }
+
     pub async fn list_indexes(&self, relation: RelationRef<'_>) -> Result<IndexList, ApiError> {
         self.get_json(&relation.path("indexes"), true).await
     }
@@ -672,6 +716,7 @@ async fn http_error(response: reqwest::Response) -> ApiError {
             "result_unavailable" => Some("result_unavailable"),
             "result_expired" => Some("result_expired"),
             "execution_not_running" => Some("execution_not_running"),
+            "relation_not_readable" => Some("relation_not_readable"),
             _ => None,
         });
     ApiError::Http { status, code }
@@ -899,6 +944,25 @@ mod tests {
                 "/api/v1/executions/{id}/cancel",
                 post(|| async { axum::http::StatusCode::NO_CONTENT }),
             )
+            .route(
+                "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/rows",
+                get(|Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                    Json(serde_json::json!({
+                        "columns": ["query"],
+                        "rows": [[format!(
+                            "{}|{}|{}|{}|{}",
+                            query["page"],
+                            query["per_page"],
+                            query.get("sort").map_or("-", String::as_str),
+                            query.get("direction").map_or("-", String::as_str),
+                            query.get("search").map_or("-", String::as_str),
+                        )], [null]],
+                        "total_rows": 2,
+                        "page": 1,
+                        "per_page": 25,
+                    }))
+                }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -982,6 +1046,38 @@ mod tests {
             schema: "public",
             relation: "odd/table name",
         };
+        let rows = client
+            .list_relation_rows(
+                relation,
+                super::RelationRowsRequest {
+                    page: 3,
+                    per_page: 50,
+                    sort: Some(("Mixed Col", true)),
+                    search: "50% off&x=1",
+                },
+            )
+            .await
+            .expect("relation rows");
+        assert_eq!(
+            rows.rows,
+            vec![
+                vec![Some("3|50|Mixed Col|desc|50% off&x=1".to_owned())],
+                vec![None]
+            ]
+        );
+        let unsorted = client
+            .list_relation_rows(
+                relation,
+                super::RelationRowsRequest {
+                    page: 1,
+                    per_page: 25,
+                    sort: None,
+                    search: "",
+                },
+            )
+            .await
+            .expect("relation rows");
+        assert_eq!(unsorted.rows[0], vec![Some("1|25|-|-|-".to_owned())]);
         assert_eq!(
             client
                 .list_columns(relation)

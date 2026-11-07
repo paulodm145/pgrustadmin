@@ -1,9 +1,9 @@
 //! In-memory SQL tab state for the TUI session.
 
-use pgrustadmin_api_client::{ExecutionResult, ExecutionRows};
+use pgrustadmin_api_client::ExecutionResult;
 use uuid::Uuid;
 
-use crate::sql_editor::SqlEditor;
+use crate::{grid::Grid, sql_editor::SqlEditor};
 
 pub const MAX_SQL_TABS: usize = 20;
 
@@ -48,34 +48,6 @@ pub enum TabExecution {
     },
 }
 
-/// Rows of the tab's latest successful execution and the scroll position.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TabResult {
-    pub rows: ExecutionRows,
-    pub first_row: usize,
-    pub first_column: usize,
-}
-
-impl TabResult {
-    pub fn new(rows: ExecutionRows) -> Self {
-        Self {
-            rows,
-            first_row: 0,
-            first_column: 0,
-        }
-    }
-
-    pub fn scroll_rows(&mut self, delta: isize) {
-        let last = self.rows.rows.len().saturating_sub(1);
-        self.first_row = self.first_row.saturating_add_signed(delta).min(last);
-    }
-
-    pub fn scroll_columns(&mut self, delta: isize) {
-        let last = self.rows.columns.len().saturating_sub(1);
-        self.first_column = self.first_column.saturating_add_signed(delta).min(last);
-    }
-}
-
 pub struct SqlTab {
     pub id: TabId,
     pub editor: SqlEditor,
@@ -86,7 +58,8 @@ pub struct SqlTab {
     pub connection_name: String,
     pub database: String,
     pub execution: TabExecution,
-    pub result: Option<TabResult>,
+    /// Grid over the rows of the latest successful execution.
+    pub result: Option<Grid>,
 }
 
 impl SqlTab {
@@ -372,26 +345,5 @@ mod tests {
         tab.mark_saved(saved.clone(), tab.editor.text());
         assert!(!tab.is_dirty());
         assert_eq!(tab.file, Some(saved));
-    }
-
-    #[test]
-    fn result_scrolling_stays_within_rows_and_columns() {
-        let mut result = super::TabResult::new(pgrustadmin_api_client::ExecutionRows {
-            columns: vec!["a".to_owned(), "b".to_owned()],
-            rows: vec![vec![None, None]; 3],
-            stored_rows: 3,
-            total_rows: 3,
-            truncated: false,
-        });
-        result.scroll_rows(10);
-        assert_eq!(result.first_row, 2);
-        result.scroll_rows(-1);
-        assert_eq!(result.first_row, 1);
-        result.scroll_rows(-10);
-        assert_eq!(result.first_row, 0);
-        result.scroll_columns(5);
-        assert_eq!(result.first_column, 1);
-        result.scroll_columns(-5);
-        assert_eq!(result.first_column, 0);
     }
 }

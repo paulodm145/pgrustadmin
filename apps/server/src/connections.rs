@@ -10,9 +10,10 @@ use axum::{
 };
 use pgrustadmin_postgres_driver::{
     Column, ColumnGenerated, ColumnIdentity, ConnectionData, ConnectionSummary, PgPool,
-    PostgresError, RelationKind, StoredConnectionCredentials, create_connection,
-    delete_connection_for_owner, find_connection_credentials_for_owner, find_connection_for_owner,
-    list_columns, list_connections_for_owner, list_databases, list_indexes, list_relations,
+    PostgresError, RelationKind, RelationRowsError, RelationRowsQuery, SortDirection,
+    StoredConnectionCredentials, create_connection, delete_connection_for_owner,
+    find_connection_credentials_for_owner, find_connection_for_owner, list_columns,
+    list_connections_for_owner, list_databases, list_indexes, list_relation_rows, list_relations,
     list_schemas, test_database_connection, update_connection_for_owner,
 };
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,10 @@ pub fn router(pool: PgPool) -> Router {
             "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/indexes",
             get(list_remote_indexes),
         )
+        .route(
+            "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/rows",
+            get(list_remote_rows),
+        )
         .with_state(pool)
 }
 
@@ -68,8 +73,8 @@ struct ConnectionRequest {
 
 #[derive(Deserialize)]
 pub(crate) struct PaginationQuery {
-    page: Option<u64>,
-    per_page: Option<u64>,
+    pub(crate) page: Option<u64>,
+    pub(crate) per_page: Option<u64>,
 }
 
 /// Validated `page`/`per_page` with the SQL limit and offset they select.
@@ -499,6 +504,98 @@ async fn list_remote_columns(
         )
             .into_response(),
         Err(_) => catalog_unavailable(),
+    }
+}
+
+const MAX_ROW_SEARCH_CHARS: usize = 200;
+
+#[derive(Deserialize)]
+struct RowsQuery {
+    page: Option<u64>,
+    per_page: Option<u64>,
+    sort: Option<String>,
+    direction: Option<String>,
+    search: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RowsResponse {
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    total_rows: i64,
+    page: u64,
+    per_page: u64,
+}
+
+async fn list_remote_rows(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    path: Result<RelationDetailPath, PathRejection>,
+    query: Result<Query<RowsQuery>, QueryRejection>,
+) -> Response {
+    let target = match relation_detail_target(&pool, &headers, path).await {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
+    let Ok(Query(query)) = query else {
+        return bad_request();
+    };
+    let Some(Page {
+        page,
+        per_page,
+        limit,
+        offset,
+    }) = (PaginationQuery {
+        page: query.page,
+        per_page: query.per_page,
+    })
+    .validate()
+    else {
+        return bad_request();
+    };
+    let direction = match query.direction.as_deref() {
+        None | Some("asc") => SortDirection::Ascending,
+        Some("desc") => SortDirection::Descending,
+        Some(_) => return bad_request(),
+    };
+    let search = query.search.unwrap_or_default();
+    if search.chars().count() > MAX_ROW_SEARCH_CHARS || search.contains('\0') {
+        return bad_request();
+    }
+    let rows_query = RelationRowsQuery {
+        sort: query.sort.as_deref().map(|column| (column, direction)),
+        search: &search,
+        limit,
+        offset,
+    };
+    match list_relation_rows(
+        &target.connection,
+        &target.database,
+        &target.schema,
+        &target.relation,
+        &target.password,
+        rows_query,
+    )
+    .await
+    {
+        Ok(rows) => Json(RowsResponse {
+            columns: rows.columns,
+            rows: rows.rows,
+            total_rows: rows.total_rows,
+            page,
+            per_page,
+        })
+        .into_response(),
+        Err(RelationRowsError::NotFound) => not_found(),
+        Err(RelationRowsError::InvalidSort) => bad_request(),
+        Err(RelationRowsError::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "relation_not_readable",
+            }),
+        )
+            .into_response(),
+        Err(RelationRowsError::Database(_)) => catalog_unavailable(),
     }
 }
 
@@ -1207,6 +1304,12 @@ mod tests {
             format!("CREATE VIEW {catalog_schema}.c_view AS SELECT 1 AS id"),
             format!("CREATE MATERIALIZED VIEW {catalog_schema}.d_matview AS SELECT 1 AS id"),
             format!("CREATE SEQUENCE {catalog_schema}.e_sequence"),
+            format!(
+                "INSERT INTO {catalog_schema}.a_table (email, created_at) VALUES \
+                 ('b@x.io', '2026-01-02'), ('a@x.io', NULL), ('c%_@x.io', '2026-01-01')"
+            ),
+            format!(r#"CREATE TABLE {catalog_schema}."we""ird table" ("Mixed Col" text)"#),
+            format!(r#"INSERT INTO {catalog_schema}."we""ird table" VALUES (NULL), ('x')"#),
         ] {
             // Fixture names are generated from a UUID in this test.
             sqlx::query(sqlx::AssertSqlSafe(statement))
@@ -1238,6 +1341,7 @@ mod tests {
                     {"name": "b_partitioned", "kind": "partitioned_table"},
                     {"name": "c_view", "kind": "view"},
                     {"name": "d_matview", "kind": "materialized_view"},
+                    {"name": "we\"ird table", "kind": "table"},
                 ],
                 "page": 1,
                 "per_page": 100,
@@ -1365,6 +1469,122 @@ mod tests {
                  "columns": ["id"]},
             ]})
         );
+
+        let rows_path = format!("{a_table_path}/rows");
+        let rows_request = |query: &str| {
+            let uri = format!("{rows_path}?{query}");
+            let app = app.clone();
+            let token = owner_token.as_str().to_owned();
+            async move { send_request(app, Method::GET, &uri, Some(&token), None).await }
+        };
+        let read_json = |response: Response| async move {
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 65536)
+                .await
+                .expect("read rows response");
+            let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+            (status, json)
+        };
+        let emails = |json: &serde_json::Value| {
+            json["rows"]
+                .as_array()
+                .expect("rows array")
+                .iter()
+                .map(|row| row[1].as_str().unwrap_or("NULL").to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let (status, page) =
+            read_json(rows_request("per_page=2&sort=email&direction=desc").await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            page["columns"],
+            serde_json::json!(["id", "email", "created_at", "email_lower"])
+        );
+        assert_eq!(page["total_rows"], 3);
+        assert_eq!(
+            (page["page"].clone(), page["per_page"].clone()),
+            (1.into(), 2.into())
+        );
+        assert_eq!(emails(&page), ["c%_@x.io", "b@x.io"]);
+        assert_eq!(page["rows"][0][0], "3", "values come as PostgreSQL text");
+
+        let (_, page) = read_json(rows_request("sort=created_at").await).await;
+        assert_eq!(
+            emails(&page),
+            ["c%_@x.io", "b@x.io", "a@x.io"],
+            "typed sort, nulls last"
+        );
+        assert_eq!(page["rows"][2][2], serde_json::Value::Null);
+        let (_, page) = read_json(rows_request("sort=created_at&direction=desc").await).await;
+        assert_eq!(
+            emails(&page),
+            ["b@x.io", "c%_@x.io", "a@x.io"],
+            "nulls last when descending"
+        );
+
+        let (_, page) = read_json(rows_request("search=X.IO&sort=email").await).await;
+        assert_eq!(page["total_rows"], 3, "search ignores case");
+        let (_, page) = read_json(rows_request("search=%25_").await).await;
+        assert_eq!(page["total_rows"], 1, "% and _ are matched literally");
+        assert_eq!(emails(&page), ["c%_@x.io"]);
+        let (_, page) = read_json(rows_request("page=2&per_page=2&sort=email").await).await;
+        assert_eq!(emails(&page), ["c%_@x.io"]);
+        assert_eq!(page["total_rows"], 3);
+
+        let long_search = "x".repeat(201);
+        for query in [
+            "sort=missing_column".to_owned(),
+            "direction=up".to_owned(),
+            "per_page=101".to_owned(),
+            format!("search={long_search}"),
+        ] {
+            let (status, _) = read_json(rows_request(&query).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
+        let (status, _) = read_json(
+            send_request(
+                app.clone(),
+                Method::GET,
+                &format!(
+                    "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations/missing/rows"
+                ),
+                Some(owner_token.as_str()),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = read_json(
+            send_request(
+                app.clone(),
+                Method::GET,
+                &rows_path,
+                Some(other_owner_token.as_str()),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, weird) = read_json(
+            send_request(
+                app.clone(),
+                Method::GET,
+                &format!(
+                    "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations/we%22ird%20table/rows?sort=Mixed%20Col"
+                ),
+                Some(owner_token.as_str()),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "quoted identifiers");
+        assert_eq!(weird["columns"], serde_json::json!(["Mixed Col"]));
+        assert_eq!(weird["rows"], serde_json::json!([["x"], [null]]));
 
         for detail in ["columns", "indexes"] {
             let missing_relation = send_request(

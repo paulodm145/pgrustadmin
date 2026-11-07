@@ -351,6 +351,202 @@ pub async fn list_indexes(
     .map_err(|_| sqlx::Error::PoolTimedOut)?
 }
 
+const RELATION_ROWS_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// One page of a relation's rows, requested by the data grid.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RelationRowsQuery<'a> {
+    pub sort: Option<(&'a str, SortDirection)>,
+    /// Case-insensitive text matched anywhere in the row; empty means none.
+    pub search: &'a str,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RelationRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub total_rows: i64,
+}
+
+#[derive(Debug)]
+pub enum RelationRowsError {
+    /// Missing relation, kind outside the catalog list or schema without `USAGE`.
+    NotFound,
+    /// The sort column is not a column of the relation.
+    InvalidSort,
+    /// The saved credential cannot read the relation.
+    Forbidden,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for RelationRowsError {
+    fn from(error: sqlx::Error) -> Self {
+        let denied = error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .is_some_and(|code| code == "42501");
+        if denied {
+            Self::Forbidden
+        } else {
+            Self::Database(error)
+        }
+    }
+}
+
+/// Quotes an identifier taken from the catalog for use in SQL text.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// `ILIKE` pattern matching `search` literally anywhere, escaped with `\\`.
+fn contains_pattern(search: &str) -> String {
+    let escaped = search
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// Reads one page of a catalog relation as text values, sorted and searched
+/// in PostgreSQL. Identifiers come from the catalog and are always quoted;
+/// search and paging values are bound parameters.
+pub async fn list_relation_rows(
+    connection: &StoredConnectionCredentials,
+    database: &str,
+    schema: &str,
+    relation: &str,
+    password: &str,
+    query: RelationRowsQuery<'_>,
+) -> Result<RelationRows, RelationRowsError> {
+    let options = connection_options(connection, password)?.database(database);
+    tokio::time::timeout(RELATION_ROWS_TIMEOUT, async {
+        let mut connection = sqlx::PgConnection::connect_with(&options).await?;
+        let relation_oid: Option<sqlx::postgres::types::Oid> = sqlx::query_scalar(
+            "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND has_schema_privilege(n.oid, 'USAGE') \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition",
+        )
+        .bind(schema)
+        .bind(relation)
+        .fetch_optional(&mut connection)
+        .await?;
+        let Some(relation_oid) = relation_oid else {
+            return Err(RelationRowsError::NotFound);
+        };
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT attname::text FROM pg_attribute \
+             WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+        )
+        .bind(relation_oid)
+        .fetch_all(&mut connection)
+        .await?;
+        if let Some((column, _)) = query.sort
+            && !columns.iter().any(|name| name == column)
+        {
+            return Err(RelationRowsError::InvalidSort);
+        }
+
+        let source = format!(
+            "{}.{} AS t",
+            quote_identifier(schema),
+            quote_identifier(relation)
+        );
+        let filter = if query.search.is_empty() {
+            ""
+        } else {
+            " WHERE t::text ILIKE $1 ESCAPE '\\'"
+        };
+        let pattern = contains_pattern(query.search);
+
+        let count_sql = format!("SELECT count(*) FROM {source}{filter}");
+        let mut count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+        if !query.search.is_empty() {
+            count = count.bind(&pattern);
+        }
+        let total_rows = count.fetch_one(&mut connection).await?;
+
+        let select_list = columns
+            .iter()
+            .map(|column| format!("{}::text", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order = query
+            .sort
+            .map(|(column, direction)| {
+                let direction = match direction {
+                    SortDirection::Ascending => "ASC",
+                    SortDirection::Descending => "DESC",
+                };
+                format!(
+                    " ORDER BY {} {direction} NULLS LAST",
+                    quote_identifier(column)
+                )
+            })
+            .unwrap_or_default();
+        let (limit_parameter, offset_parameter) = if query.search.is_empty() {
+            ("$1", "$2")
+        } else {
+            ("$2", "$3")
+        };
+        let rows_sql = format!(
+            "SELECT {select_list} FROM {source}{filter}{order} \
+             LIMIT {limit_parameter} OFFSET {offset_parameter}"
+        );
+        // Identifiers are quoted catalog names; every value is a parameter.
+        let mut rows_query = sqlx::query(sqlx::AssertSqlSafe(rows_sql));
+        if !query.search.is_empty() {
+            rows_query = rows_query.bind(&pattern);
+        }
+        let fetched = rows_query
+            .bind(query.limit)
+            .bind(query.offset)
+            .fetch_all(&mut connection)
+            .await?;
+        let rows = fetched
+            .iter()
+            .map(|row| {
+                use sqlx::Row as _;
+                (0..columns.len())
+                    .map(|index| row.try_get::<Option<String>, _>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        connection.close().await?;
+        Ok(RelationRows {
+            columns,
+            rows,
+            total_rows,
+        })
+    })
+    .await
+    .map_err(|_| RelationRowsError::Database(sqlx::Error::PoolTimedOut))?
+}
+
+#[cfg(test)]
+mod relation_rows_tests {
+    use super::{contains_pattern, quote_identifier};
+
+    #[test]
+    fn identifiers_are_quoted_and_search_wildcards_escaped() {
+        assert_eq!(quote_identifier("users"), "\"users\"");
+        assert_eq!(
+            quote_identifier("we\"ird \"\" name"),
+            "\"we\"\"ird \"\"\"\" name\""
+        );
+        assert_eq!(contains_pattern("ana"), "%ana%");
+        assert_eq!(contains_pattern("50%_off\\"), "%50\\%\\_off\\\\%");
+    }
+}
+
 /// Rows kept per result; further rows are counted but not stored.
 pub const MAX_RESULT_ROWS: usize = 1000;
 /// UTF-8 bytes of values kept per result.
