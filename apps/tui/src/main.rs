@@ -3,8 +3,8 @@ use std::{io, time::Duration};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use pgrustadmin_api_client::{
-    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest, Database,
-    Relation, RelationKind, Schema,
+    ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
+    ConnectionInput, ConnectionTest, Database, Index, Relation, RelationKind, RelationRef, Schema,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -61,6 +61,7 @@ enum Operation {
     LoadDatabases { connection_id: Uuid },
     LoadSchemas { connection_id: Uuid },
     LoadRelations { connection_id: Uuid, page: u64 },
+    LoadRelationDetail { connection_id: Uuid },
     SaveConnection { id: Option<Uuid> },
     TestConnection { id: Uuid },
     DeleteConnection { id: Uuid },
@@ -72,6 +73,7 @@ enum OperationResult {
     Databases(Result<Vec<Database>, ApiError>),
     Schemas(Result<Vec<Schema>, ApiError>),
     Relations(Result<Vec<Relation>, ApiError>),
+    RelationDetail(Result<(Vec<Column>, Vec<Index>), ApiError>),
     Saved(Result<Connection, ApiError>),
     Tested(Result<ConnectionTest, ApiError>),
     Deleted(Result<(), ApiError>),
@@ -85,6 +87,7 @@ enum UiAction {
     LoadDatabases(Uuid),
     LoadSchemas(Uuid),
     LoadRelations(Uuid, u64),
+    LoadRelationDetail(Uuid),
     SaveConnection,
     TestConnection(Uuid),
     DeleteConnection(Uuid),
@@ -231,6 +234,10 @@ struct App {
     selected_schema: usize,
     catalog_schema: String,
     relations: Vec<Relation>,
+    catalog_relation: String,
+    columns: Vec<Column>,
+    indexes: Vec<Index>,
+    selected_column: usize,
     selected_relation: usize,
     relation_page: u64,
     form: Option<ConnectionForm>,
@@ -273,6 +280,10 @@ impl App {
             relations: Vec::new(),
             selected_relation: 0,
             relation_page: 1,
+            catalog_relation: String::new(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            selected_column: 0,
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -289,7 +300,7 @@ impl App {
             return UiAction::None;
         }
         if key.code == KeyCode::Esc
-            && matches!(self.view, 2..=4)
+            && matches!(self.view, 2..=5)
             && self.form.is_none()
             && matches!(self.state, ScreenState::Authenticated(_))
         {
@@ -364,7 +375,24 @@ impl App {
             },
             ScreenState::Authenticating => {}
             ScreenState::Authenticated(_) => {
-                if self.view == 4 {
+                if self.view == 5 {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') if !self.columns.is_empty() => {
+                            self.selected_column = (self.selected_column + self.columns.len() - 1)
+                                % self.columns.len();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !self.columns.is_empty() => {
+                            self.selected_column = (self.selected_column + 1) % self.columns.len();
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(connection_id) = self.catalog_connection {
+                                return UiAction::LoadRelationDetail(connection_id);
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 4,
+                        _ => {}
+                    }
+                } else if self.view == 4 {
                     let Some(connection_id) = self.catalog_connection else {
                         return UiAction::None;
                     };
@@ -390,6 +418,16 @@ impl App {
                             self.relation_page += 1;
                             self.selected_relation = 0;
                             return UiAction::LoadRelations(connection_id, self.relation_page);
+                        }
+                        KeyCode::Enter => {
+                            if let Some(relation) = self.relations.get(self.selected_relation) {
+                                self.catalog_relation = relation.name.clone();
+                                self.columns.clear();
+                                self.indexes.clear();
+                                self.selected_column = 0;
+                                self.view = 5;
+                                return UiAction::LoadRelationDetail(connection_id);
+                            }
                         }
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 3,
                         _ => {}
@@ -546,6 +584,9 @@ impl App {
             UiAction::LoadDatabases(_) => self.message = "Loading databases…".to_owned(),
             UiAction::LoadSchemas(_) => self.message = "Loading schemas…".to_owned(),
             UiAction::LoadRelations(..) => self.message = "Loading relations…".to_owned(),
+            UiAction::LoadRelationDetail(_) => {
+                self.message = "Loading columns and indexes…".to_owned();
+            }
             UiAction::SaveConnection => self.message = "Saving connection…".to_owned(),
             UiAction::TestConnection(_) => self.message = "Testing connection…".to_owned(),
             UiAction::DeleteConnection(_) => self.message = "Deleting connection…".to_owned(),
@@ -558,13 +599,18 @@ impl App {
         } else {
             Zeroizing::new(String::new())
         };
-        let database = matches!(
+        let catalog = matches!(
             operation,
-            Operation::LoadSchemas { .. } | Operation::LoadRelations { .. }
+            Operation::LoadSchemas { .. }
+                | Operation::LoadRelations { .. }
+                | Operation::LoadRelationDetail { .. }
         )
-        .then(|| self.catalog_database.clone());
-        let schema = matches!(operation, Operation::LoadRelations { .. })
-            .then(|| self.catalog_schema.clone());
+        .then(|| CatalogPath {
+            database: self.catalog_database.clone(),
+            schema: self.catalog_schema.clone(),
+            relation: self.catalog_relation.clone(),
+        })
+        .unwrap_or_default();
         let input = if let Operation::SaveConnection { .. } = operation {
             match self.form.as_ref().map(ConnectionForm::input) {
                 Some(Ok(input)) => Some(input),
@@ -593,8 +639,7 @@ impl App {
                 operation,
                 email.as_deref().unwrap_or_default(),
                 &password,
-                database.as_deref().unwrap_or_default(),
-                schema.as_deref().unwrap_or_default(),
+                &catalog,
                 input.as_ref(),
             )
             .await;
@@ -662,6 +707,24 @@ impl App {
                             .selected_relation
                             .min(self.relations.len().saturating_sub(1));
                         self.message = format!("Loaded {} relation(s).", self.relations.len());
+                    }
+                    OperationResult::RelationDetail(Ok((columns, indexes))) => {
+                        self.columns = columns;
+                        self.indexes = indexes;
+                        self.selected_column = self
+                            .selected_column
+                            .min(self.columns.len().saturating_sub(1));
+                        self.message = format!(
+                            "Loaded {} column(s) and {} index(es).",
+                            self.columns.len(),
+                            self.indexes.len()
+                        );
+                    }
+                    OperationResult::RelationDetail(Err(error)) => {
+                        self.columns.clear();
+                        self.indexes.clear();
+                        self.selected_column = 0;
+                        self.message = api_error_message(error).to_owned();
                     }
                     OperationResult::Relations(Err(error)) => {
                         self.relations.clear();
@@ -783,6 +846,9 @@ fn start_action(app: &mut App, action: UiAction) {
         UiAction::LoadConnections(page) => Operation::LoadConnections { page },
         UiAction::LoadDatabases(connection_id) => Operation::LoadDatabases { connection_id },
         UiAction::LoadSchemas(connection_id) => Operation::LoadSchemas { connection_id },
+        UiAction::LoadRelationDetail(connection_id) => {
+            Operation::LoadRelationDetail { connection_id }
+        }
         UiAction::LoadRelations(connection_id, page) => Operation::LoadRelations {
             connection_id,
             page,
@@ -854,6 +920,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                     app.selected_schema,
                     &app.message,
                 );
+            } else if app.view == 5 {
+                render_relation_detail(frame, sections[1], app);
             } else if app.view == 4 {
                 let items = app
                     .relations
@@ -903,7 +971,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
         "↑/↓: navigate   Enter: relations   r: reload   Tab/Esc: databases   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 4 {
-        "↑/↓: navigate   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
+        "↑/↓: navigate   Enter: details   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
+    } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
+        "↑/↓: navigate columns   r: reload   Tab/Esc: relations   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
         "Tab/Enter: open Connections   ↑/↓: select   q/Esc: quit"
     } else {
@@ -1097,6 +1167,101 @@ fn relation_kind_label(kind: RelationKind) -> &'static str {
     }
 }
 
+fn column_line(column: &Column) -> Line<'_> {
+    let mut details = Vec::new();
+    if !column.nullable {
+        details.push("not null".to_owned());
+    }
+    if column.primary_key {
+        details.push("primary key".to_owned());
+    }
+    match column.identity {
+        Some(ColumnIdentity::Always) => details.push("identity always".to_owned()),
+        Some(ColumnIdentity::ByDefault) => details.push("identity by default".to_owned()),
+        None => {}
+    }
+    match column.generated {
+        Some(ColumnGenerated::Stored) => details.push("generated stored".to_owned()),
+        Some(ColumnGenerated::Virtual) => details.push("generated virtual".to_owned()),
+        None => {}
+    }
+    if let Some(default) = &column.default {
+        details.push(format!("default {default}"));
+    }
+    Line::from(vec![
+        Span::raw(column.name.as_str()),
+        Span::styled(
+            format!("  {}", column.data_type),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("  {}", details.join(", ")),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn index_line(index: &Index) -> Line<'_> {
+    let mut flags = Vec::new();
+    if index.primary {
+        flags.push("primary");
+    }
+    if index.unique {
+        flags.push("unique");
+    }
+    Line::from(vec![
+        Span::raw(index.name.as_str()),
+        Span::styled(
+            format!("  {} ({})", index.method, index.columns.join(", ")),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("  {}", flags.join(", ")),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(area);
+    let title = format!(
+        " Columns — {} / {} / {}.{} ",
+        app.catalog_connection_name, app.catalog_database, app.catalog_schema, app.catalog_relation
+    );
+    let items = app
+        .columns
+        .iter()
+        .map(|column| ListItem::new(column_line(column)))
+        .collect();
+    render_catalog_list(
+        frame,
+        panes[0],
+        &title,
+        items,
+        app.selected_column,
+        &app.message,
+    );
+    let block = Block::default().borders(Borders::ALL).title(" Indexes ");
+    if app.indexes.is_empty() {
+        let text = if app.columns.is_empty() {
+            ""
+        } else {
+            "No indexes."
+        };
+        frame.render_widget(Paragraph::new(text).block(block), panes[1]);
+    } else {
+        let items: Vec<_> = app
+            .indexes
+            .iter()
+            .map(|index| ListItem::new(index_line(index)))
+            .collect();
+        frame.render_widget(List::new(items).block(block), panes[1]);
+    }
+}
+
 fn render_catalog_list(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1171,13 +1336,20 @@ fn render_connection_form(frame: &mut Frame<'_>, area: Rect, form: &ConnectionFo
     frame.render_widget(Paragraph::new(message), panel[1]);
 }
 
+/// Catalog names selected in the TUI, sent with catalog operations.
+#[derive(Default)]
+struct CatalogPath {
+    database: String,
+    schema: String,
+    relation: String,
+}
+
 async fn run_operation(
     client: &mut ApiClient,
     operation: Operation,
     email: &str,
     password: &str,
-    database: &str,
-    schema: &str,
+    catalog: &CatalogPath,
     input: Option<&ConnectionInput>,
 ) -> OperationResult {
     match operation {
@@ -1212,17 +1384,32 @@ async fn run_operation(
             client
                 .list_relations(
                     connection_id,
-                    database,
-                    schema,
+                    &catalog.database,
+                    &catalog.schema,
                     page,
                     RELATION_PAGE_SIZE as u64,
                 )
                 .await
                 .map(|relations| relations.items),
         ),
+        Operation::LoadRelationDetail { connection_id } => {
+            let relation = RelationRef {
+                connection_id,
+                database: &catalog.database,
+                schema: &catalog.schema,
+                relation: &catalog.relation,
+            };
+            let result = async {
+                let columns = client.list_columns(relation).await?.items;
+                let indexes = client.list_indexes(relation).await?.items;
+                Ok((columns, indexes))
+            }
+            .await;
+            OperationResult::RelationDetail(result)
+        }
         Operation::LoadSchemas { connection_id } => OperationResult::Schemas(
             client
-                .list_schemas(connection_id, database)
+                .list_schemas(connection_id, &catalog.database)
                 .await
                 .map(|schemas| schemas.items),
         ),
@@ -1251,7 +1438,7 @@ async fn run_operation(
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pgrustadmin_api_client::{
-        ApiClient, AuthSession, Connection, Database, Relation, RelationKind, Schema,
+        ApiClient, AuthSession, Column, Connection, Database, Index, Relation, RelationKind, Schema,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
@@ -1513,6 +1700,93 @@ mod tests {
         ));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.view, 3);
+    }
+
+    #[test]
+    fn selected_relation_opens_details_and_escape_returns() {
+        let mut app = authenticated_app();
+        let connection_id = Uuid::new_v4();
+        app.view = 4;
+        app.catalog_connection = Some(connection_id);
+        app.relations = vec![
+            Relation {
+                name: "accounts".to_owned(),
+                kind: RelationKind::Table,
+            },
+            Relation {
+                name: "users".to_owned(),
+                kind: RelationKind::Table,
+            },
+        ];
+        app.selected_relation = 1;
+        app.columns = vec![column("stale")];
+        app.selected_column = 3;
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiAction::LoadRelationDetail(id) if id == connection_id
+        ));
+        assert_eq!(app.view, 5);
+        assert_eq!(app.catalog_relation, "users");
+        assert!(app.columns.is_empty());
+        assert!(app.indexes.is_empty());
+        assert_eq!(app.selected_column, 0);
+
+        app.columns = vec![column("id"), column("email")];
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected_column, 1);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            UiAction::LoadRelationDetail(id) if id == connection_id
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, 4);
+        assert_eq!(app.selected_relation, 1);
+    }
+
+    #[test]
+    fn relation_detail_renders_columns_and_indexes() {
+        let mut app = authenticated_app();
+        app.view = 5;
+        app.catalog_relation = "users".to_owned();
+        app.columns = vec![Column {
+            primary_key: true,
+            nullable: false,
+            ..column("id")
+        }];
+        app.indexes = vec![Index {
+            name: "users_pkey".to_owned(),
+            method: "btree".to_owned(),
+            unique: true,
+            primary: true,
+            columns: vec!["id".to_owned()],
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render relation detail");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Columns"));
+        assert!(rendered.contains("integer  not null, primary key"));
+        assert!(rendered.contains("users_pkey  btree (id)  primary, unique"));
+    }
+
+    fn column(name: &str) -> Column {
+        Column {
+            name: name.to_owned(),
+            position: 1,
+            data_type: "integer".to_owned(),
+            nullable: true,
+            default: None,
+            primary_key: false,
+            identity: None,
+            generated: None,
+        }
     }
 
     #[test]

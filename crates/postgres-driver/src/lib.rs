@@ -186,6 +186,170 @@ pub async fn list_relations(
     .map_err(|_| sqlx::Error::PoolTimedOut)?
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnIdentity {
+    Always,
+    ByDefault,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnGenerated {
+    Stored,
+    Virtual,
+}
+
+pub struct Column {
+    pub name: String,
+    pub position: i16,
+    pub data_type: String,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub primary_key: bool,
+    pub identity: Option<ColumnIdentity>,
+    pub generated: Option<ColumnGenerated>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ColumnRow {
+    name: String,
+    position: i16,
+    data_type: String,
+    nullable: bool,
+    default_expression: Option<String>,
+    primary_key: bool,
+    identity: String,
+    generated: String,
+}
+
+impl TryFrom<ColumnRow> for Column {
+    type Error = sqlx::Error;
+
+    fn try_from(row: ColumnRow) -> Result<Self, Self::Error> {
+        let identity = match row.identity.as_str() {
+            "" => None,
+            "a" => Some(ColumnIdentity::Always),
+            "d" => Some(ColumnIdentity::ByDefault),
+            _ => return Err(sqlx::Error::Protocol("unexpected column identity".into())),
+        };
+        let generated = match row.generated.as_str() {
+            "" => None,
+            "s" => Some(ColumnGenerated::Stored),
+            "v" => Some(ColumnGenerated::Virtual),
+            _ => return Err(sqlx::Error::Protocol("unexpected generated column".into())),
+        };
+        Ok(Self {
+            name: row.name,
+            position: row.position,
+            data_type: row.data_type,
+            nullable: row.nullable,
+            default: row.default_expression,
+            primary_key: row.primary_key,
+            identity,
+            generated,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub struct Index {
+    pub name: String,
+    pub method: String,
+    pub unique: bool,
+    pub primary: bool,
+    pub columns: Vec<String>,
+}
+
+/// Lists the live columns of a relation listed by [`list_relations`], in
+/// position order. A missing relation or schema without `USAGE` yields no rows.
+pub async fn list_columns(
+    connection: &StoredConnectionCredentials,
+    database: &str,
+    schema: &str,
+    relation: &str,
+    password: &str,
+) -> Result<Vec<Column>, sqlx::Error> {
+    let options = connection_options(connection, password)?.database(database);
+    tokio::time::timeout(CONNECTION_TEST_TIMEOUT, async {
+        let mut connection = sqlx::PgConnection::connect_with(&options).await?;
+        let rows = sqlx::query_as::<_, ColumnRow>(
+            "SELECT a.attname::text AS name, \
+                    a.attnum AS position, \
+                    format_type(a.atttypid, a.atttypmod) AS data_type, \
+                    NOT a.attnotnull AS nullable, \
+                    CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END \
+                        AS default_expression, \
+                    EXISTS (SELECT 1 FROM pg_index i \
+                            WHERE i.indrelid = c.oid AND i.indisprimary \
+                              AND a.attnum = ANY (i.indkey)) AS primary_key, \
+                    a.attidentity::text AS identity, \
+                    a.attgenerated::text AS generated \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND has_schema_privilege(n.oid, 'USAGE') \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+        )
+        .bind(schema)
+        .bind(relation)
+        .fetch_all(&mut connection)
+        .await?;
+        connection.close().await?;
+        rows.into_iter().map(Column::try_from).collect()
+    })
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
+/// Lists indexes of a relation listed by [`list_relations`], ordered by name,
+/// with key columns or expressions in index order (no `INCLUDE` columns).
+pub async fn list_indexes(
+    connection: &StoredConnectionCredentials,
+    database: &str,
+    schema: &str,
+    relation: &str,
+    password: &str,
+) -> Result<Vec<Index>, sqlx::Error> {
+    let options = connection_options(connection, password)?.database(database);
+    tokio::time::timeout(CONNECTION_TEST_TIMEOUT, async {
+        let mut connection = sqlx::PgConnection::connect_with(&options).await?;
+        let indexes = sqlx::query_as::<_, Index>(
+            "SELECT ic.relname::text AS name, \
+                    am.amname::text AS method, \
+                    i.indisunique AS unique, \
+                    i.indisprimary AS primary, \
+                    ARRAY(SELECT pg_get_indexdef(i.indexrelid, k, true) \
+                                 || CASE WHEN i.indoption[k - 1] & 1 <> 0 \
+                                         THEN ' DESC' ELSE '' END \
+                                 || CASE i.indoption[k - 1] & 3 \
+                                         WHEN 1 THEN ' NULLS LAST' \
+                                         WHEN 2 THEN ' NULLS FIRST' ELSE '' END \
+                          FROM generate_series(1, i.indnkeyatts::int) AS k \
+                          ORDER BY k) AS columns \
+             FROM pg_index i \
+             JOIN pg_class ic ON ic.oid = i.indexrelid \
+             JOIN pg_am am ON am.oid = ic.relam \
+             JOIN pg_class c ON c.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND has_schema_privilege(n.oid, 'USAGE') \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+             ORDER BY ic.relname",
+        )
+        .bind(schema)
+        .bind(relation)
+        .fetch_all(&mut connection)
+        .await?;
+        connection.close().await?;
+        Ok(indexes)
+    })
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
 fn connection_options(
     connection: &StoredConnectionCredentials,
     password: &str,
