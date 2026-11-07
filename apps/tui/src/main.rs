@@ -1,3 +1,4 @@
+mod grid;
 mod sql_editor;
 mod sql_tabs;
 mod theme;
@@ -12,21 +13,21 @@ use crossterm::{
     execute,
 };
 use futures_util::StreamExt;
+use grid::{Grid, GridKey, GridRequest};
 use pgrustadmin_api_client::{
     ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
     ConnectionInput, ConnectionTest, Database, Execution, ExecutionRows, ExecutionStatus, Index,
-    Relation, RelationKind, RelationRef, Schema, SqlFile, SqlFileContent,
+    Relation, RelationKind, RelationRef, RelationRowsPage, RelationRowsRequest, Schema, SqlFile,
+    SqlFileContent,
 };
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span, Text},
-    widgets::{
-        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs,
-    },
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
-use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId, TabResult};
+use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId};
 use theme::{THEME_ENV, Theme, detect_color_mode, parse_theme_name};
 use tokio::{sync::oneshot, task::JoinHandle};
 use uuid::Uuid;
@@ -35,8 +36,6 @@ use zeroize::Zeroizing;
 const RELATION_PAGE_SIZE: usize = 100;
 const FILE_LIST_SIZE: u64 = 100;
 const EXECUTION_POLL_INTERVAL: Duration = Duration::from_millis(300);
-const RESULT_PAGE_ROWS: isize = 10;
-const MAX_RESULT_COLUMN_WIDTH: usize = 40;
 /// View index of the SQL tabs section; catalog views use 2..=5.
 const SQL_VIEW: usize = 6;
 const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
@@ -87,6 +86,7 @@ enum Operation {
     LoadSchemas { connection_id: Uuid },
     LoadRelations { connection_id: Uuid, page: u64 },
     LoadRelationDetail { connection_id: Uuid },
+    LoadRelationRows { connection_id: Uuid },
     SaveConnection { id: Option<Uuid> },
     TestConnection { id: Uuid },
     DeleteConnection { id: Uuid },
@@ -105,6 +105,7 @@ enum OperationResult {
     Schemas(Result<Vec<Schema>, ApiError>),
     Relations(Result<Vec<Relation>, ApiError>),
     RelationDetail(Result<(Vec<Column>, Vec<Index>), ApiError>),
+    RelationRows(Result<RelationRowsPage, ApiError>),
     Saved(Result<Connection, ApiError>),
     Tested(Result<ConnectionTest, ApiError>),
     Deleted(Result<(), ApiError>),
@@ -127,6 +128,7 @@ enum UiAction {
     LoadSchemas(Uuid),
     LoadRelations(Uuid, u64),
     LoadRelationDetail(Uuid),
+    LoadRelationRows(Uuid),
     SaveConnection,
     TestConnection(Uuid),
     DeleteConnection(Uuid),
@@ -345,6 +347,11 @@ struct App {
     confirm_explain: Option<TabId>,
     /// Whether the SQL section's arrow keys scroll the active tab's result.
     result_focus: bool,
+    /// Data preview of the relation shown in the detail view.
+    relation_rows: Option<Grid>,
+    relation_grid_focus: bool,
+    /// A rows reload was requested while another API call was running.
+    relation_rows_stale: bool,
     theme: Theme,
     selected_relation: usize,
     relation_page: u64,
@@ -404,6 +411,9 @@ impl App {
             executions: Vec::new(),
             confirm_explain: None,
             result_focus: false,
+            relation_rows: None,
+            relation_grid_focus: false,
+            relation_rows_stale: false,
             theme: Theme::default(),
             form: None,
             confirm_delete: None,
@@ -514,6 +524,9 @@ impl App {
             self.handle_editor_key(key);
             return UiAction::None;
         }
+        if let Some(action) = self.route_grid_key(key) {
+            return action;
+        }
         if key.code == KeyCode::Esc
             && self.view == SQL_VIEW
             && self.form.is_none()
@@ -599,9 +612,6 @@ impl App {
             ScreenState::Authenticating => {}
             ScreenState::Authenticated(_) => {
                 if self.view == SQL_VIEW {
-                    if self.handle_result_key(key.code) {
-                        return UiAction::None;
-                    }
                     match key.code {
                         KeyCode::Char(']') => self.sql_tabs.select_next(),
                         KeyCode::Char('[') => self.sql_tabs.select_previous(),
@@ -668,6 +678,9 @@ impl App {
                                 return UiAction::LoadRelationDetail(connection_id);
                             }
                         }
+                        KeyCode::Tab if self.relation_rows.is_some() => {
+                            self.relation_grid_focus = true;
+                        }
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 4,
                         _ => {}
                     }
@@ -701,6 +714,8 @@ impl App {
                         KeyCode::Enter => {
                             if let Some(relation) = self.relations.get(self.selected_relation) {
                                 self.catalog_relation = relation.name.clone();
+                                self.relation_rows = None;
+                                self.relation_grid_focus = false;
                                 self.columns.clear();
                                 self.indexes.clear();
                                 self.selected_column = 0;
@@ -1018,7 +1033,9 @@ impl App {
             },
         };
         match rows {
-            Some(Ok(rows)) => tab.result = Some(TabResult::new(rows)),
+            Some(Ok(rows)) => {
+                tab.result = Some(Grid::local(rows.columns, rows.rows, rows.total_rows));
+            }
             Some(Err(error)) => {
                 tab.result = None;
                 self.message = format!(
@@ -1051,29 +1068,41 @@ impl App {
         }
     }
 
-    /// Scrolls the focused result; returns whether the key was consumed.
-    fn handle_result_key(&mut self, code: KeyCode) -> bool {
-        if !self.result_focus {
-            return false;
+    /// Sends the key to the focused grid. `None` means the screen handles it.
+    fn route_grid_key(&mut self, key: KeyEvent) -> Option<UiAction> {
+        if !matches!(self.state, ScreenState::Authenticated(_)) {
+            return None;
         }
-        let Some(result) = self
-            .sql_tabs
-            .active_mut()
-            .and_then(|tab| tab.result.as_mut())
-        else {
-            self.result_focus = false;
-            return false;
-        };
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => result.scroll_rows(-1),
-            KeyCode::Down | KeyCode::Char('j') => result.scroll_rows(1),
-            KeyCode::PageUp => result.scroll_rows(-RESULT_PAGE_ROWS),
-            KeyCode::PageDown => result.scroll_rows(RESULT_PAGE_ROWS),
-            KeyCode::Left | KeyCode::Char('h') => result.scroll_columns(-1),
-            KeyCode::Right | KeyCode::Char('l') => result.scroll_columns(1),
-            _ => return false,
+        if self.view == SQL_VIEW && self.result_focus {
+            let grid = self
+                .sql_tabs
+                .active_mut()
+                .and_then(|tab| tab.result.as_mut())?;
+            if key.code == KeyCode::Tab {
+                self.result_focus = false;
+                return Some(UiAction::None);
+            }
+            return match grid.handle_key(key) {
+                GridKey::Ignored => None,
+                GridKey::Handled | GridKey::Reload => Some(UiAction::None),
+            };
         }
-        true
+        if self.view == 5 && self.relation_grid_focus {
+            let grid = self.relation_rows.as_mut()?;
+            if key.code == KeyCode::Tab {
+                self.relation_grid_focus = false;
+                return Some(UiAction::None);
+            }
+            return match grid.handle_key(key) {
+                GridKey::Ignored => None,
+                GridKey::Handled => Some(UiAction::None),
+                GridKey::Reload => Some(
+                    self.catalog_connection
+                        .map_or(UiAction::None, UiAction::LoadRelationRows),
+                ),
+            };
+        }
+        None
     }
 
     fn toggle_result_focus(&mut self) {
@@ -1206,6 +1235,7 @@ impl App {
             UiAction::LoadDatabases(_) => self.message = "Loading databases…".to_owned(),
             UiAction::LoadSchemas(_) => self.message = "Loading schemas…".to_owned(),
             UiAction::LoadRelations(..) => self.message = "Loading relations…".to_owned(),
+            UiAction::LoadRelationRows(_) => {}
             UiAction::LoadRelationDetail(_) => {
                 self.message = "Loading columns and indexes…".to_owned();
             }
@@ -1243,11 +1273,17 @@ impl App {
             Operation::LoadSchemas { .. }
                 | Operation::LoadRelations { .. }
                 | Operation::LoadRelationDetail { .. }
+                | Operation::LoadRelationRows { .. }
         )
         .then(|| CatalogPath {
             database: self.catalog_database.clone(),
             schema: self.catalog_schema.clone(),
             relation: self.catalog_relation.clone(),
+            rows: self
+                .relation_rows
+                .as_ref()
+                .map(Grid::request)
+                .unwrap_or_default(),
         })
         .unwrap_or_default();
         let file_request = self.file_request(operation);
@@ -1352,6 +1388,33 @@ impl App {
                     self.columns.len(),
                     self.indexes.len()
                 );
+                match &mut self.relation_rows {
+                    Some(grid) => grid.mark_loading(),
+                    None => self.relation_rows = Some(Grid::remote()),
+                }
+                if let Some(connection_id) = self.catalog_connection {
+                    self.start_operation(
+                        Operation::LoadRelationRows { connection_id },
+                        UiAction::LoadRelationRows(connection_id),
+                    );
+                }
+            }
+            OperationResult::RelationRows(Ok(page)) => {
+                if let Some(grid) = &mut self.relation_rows {
+                    grid.set_remote_page(page.columns, page.rows, page.total_rows);
+                }
+            }
+            OperationResult::RelationRows(Err(error)) => {
+                if let Some(grid) = &mut self.relation_rows {
+                    let message = match error {
+                        ApiError::Http {
+                            code: Some("relation_not_readable"),
+                            ..
+                        } => "The saved credential cannot read this relation.",
+                        error => api_error_message(error),
+                    };
+                    grid.set_remote_error(message.to_owned());
+                }
             }
             OperationResult::RelationDetail(Err(error)) => {
                 self.columns.clear();
@@ -1508,6 +1571,24 @@ impl App {
         }
     }
 
+    /// Reloads the relation data grid when its Auto page no longer fits.
+    fn refit_relation_rows(&mut self) {
+        if self.view != 5 || self.pending.is_some() {
+            return;
+        }
+        let (Some(grid), Some(connection_id)) = (&mut self.relation_rows, self.catalog_connection)
+        else {
+            return;
+        };
+        if grid.needs_refit() {
+            grid.refit();
+            self.start_operation(
+                Operation::LoadRelationRows { connection_id },
+                UiAction::LoadRelationRows(connection_id),
+            );
+        }
+    }
+
     async fn complete_operation_if_ready(&mut self) {
         if !self.pending.as_ref().is_some_and(JoinHandle::is_finished) {
             return;
@@ -1519,6 +1600,16 @@ impl App {
             Ok((client, result)) => {
                 self.client = Some(client);
                 self.apply_result(result);
+                if std::mem::take(&mut self.relation_rows_stale)
+                    && self.view == 5
+                    && self.pending.is_none()
+                    && let Some(connection_id) = self.catalog_connection
+                {
+                    self.start_operation(
+                        Operation::LoadRelationRows { connection_id },
+                        UiAction::LoadRelationRows(connection_id),
+                    );
+                }
             }
             Err(_) => {
                 self.client = ApiClient::from_env().ok();
@@ -1634,6 +1725,7 @@ async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Resul
             _ = redraw.tick() => {
                 app.complete_operation_if_ready().await;
                 app.complete_executions().await;
+                app.refit_relation_rows();
                 terminal.draw(|frame| render(frame, &app))?;
             }
         }
@@ -1644,6 +1736,11 @@ async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Resul
 fn start_action(app: &mut App, action: UiAction) {
     let operation = match action {
         UiAction::None => return,
+        UiAction::LoadRelationRows(_) if app.pending.is_some() => {
+            app.relation_rows_stale = true;
+            return;
+        }
+        UiAction::LoadRelationRows(connection_id) => Operation::LoadRelationRows { connection_id },
         UiAction::ExecuteSql(tab) => {
             app.start_execution(tab);
             return;
@@ -1802,7 +1899,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "n: new   e: edit   t: test   c: databases   d: delete   s: SQL   [ / ]: pages   r: reload   Tab: overview   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == SQL_VIEW {
         if app.result_focus {
-            "↑↓ PgUp PgDn: rows  ←→: columns  Tab: editor  e: run  Esc: back  q: quit"
+            "↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  Tab: editor"
         } else {
             "Enter/i: edit  e: run  c: cancel  Tab: result  w/W: save  o: open  [ ]: tabs  x: close"
         }
@@ -1813,7 +1910,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 4 {
         "↑/↓: navigate   Enter: details   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
-        "↑/↓: navigate columns   r: reload   Tab/Esc: relations   q: quit"
+        if app.relation_grid_focus {
+            "↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  Tab: columns"
+        } else {
+            "↑/↓: columns   Tab: data grid   r: reload   Esc: relations   q: quit"
+        }
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
         "Tab/Enter: open Connections   s: SQL tabs   F2: theme   q/Esc: quit"
     } else {
@@ -2111,7 +2212,13 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 TabExecution::Succeeded { duration_ms, .. } => duration_text(" ·", duration_ms),
                 _ => String::new(),
             };
-            render_result(frame, theme, split[1], result, app.result_focus, &duration);
+            result.render(
+                frame,
+                split[1],
+                theme,
+                &format!(" Result{duration} "),
+                app.result_focus,
+            );
             split[0]
         }
         None => panes[1],
@@ -2261,85 +2368,6 @@ fn duration_text(prefix: &str, duration_ms: Option<u64>) -> String {
         .unwrap_or_default()
 }
 
-/// Renders the result table, showing the columns from `first_column` that fit.
-fn render_result(
-    frame: &mut Frame<'_>,
-    theme: &Theme,
-    area: Rect,
-    result: &TabResult,
-    focused: bool,
-    duration: &str,
-) {
-    let rows = &result.rows;
-    let truncated = if rows.truncated { ", truncated" } else { "" };
-    let title = format!(
-        " Result — {} of {} row(s){truncated}{duration} ",
-        rows.stored_rows, rows.total_rows
-    );
-    let border = if focused {
-        theme.focus_border()
-    } else {
-        Style::default()
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border)
-        .title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if rows.columns.is_empty() {
-        frame.render_widget(
-            Paragraph::new("The last statement returned no rows.").style(theme.muted()),
-            inner,
-        );
-        return;
-    }
-
-    let available = usize::from(inner.width);
-    let mut widths = Vec::new();
-    let mut used = 0;
-    for (index, column) in rows.columns.iter().enumerate().skip(result.first_column) {
-        let content = rows
-            .rows
-            .iter()
-            .filter_map(|row| row.get(index))
-            .map(|value| value.as_deref().map_or(4, |text| text.chars().count()))
-            .max()
-            .unwrap_or(0);
-        let width = content
-            .max(column.chars().count())
-            .clamp(4, MAX_RESULT_COLUMN_WIDTH);
-        if !widths.is_empty() && used + width > available {
-            break;
-        }
-        used += width + 1;
-        widths.push(width);
-    }
-    let visible = result.first_column..result.first_column + widths.len();
-    let header = Row::new(
-        rows.columns[visible.clone()]
-            .iter()
-            .map(|column| Cell::from(column.as_str())),
-    )
-    .style(Style::default().add_modifier(Modifier::BOLD));
-    let body = rows.rows.iter().skip(result.first_row).map(|row| {
-        Row::new(
-            row.get(visible.clone())
-                .unwrap_or_default()
-                .iter()
-                .map(|value| match value {
-                    Some(text) => Cell::from(text.as_str()),
-                    None => Cell::from("NULL").style(theme.muted()),
-                }),
-        )
-    });
-    let constraints: Vec<Constraint> = widths
-        .iter()
-        .map(|width| Constraint::Length(u16::try_from(*width).unwrap_or(u16::MAX)))
-        .collect();
-    frame.render_widget(Table::new(body, constraints).header(header), inner);
-}
-
 /// Draws the save-as prompt or the file picker over `area`.
 fn render_file_overlays(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
@@ -2400,10 +2428,14 @@ fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
 
 fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
-    let panes = Layout::default()
+    let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
+    let structure = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
     let title = format!(
         " Columns — {} / {} / {}.{} ",
         app.catalog_connection_name, app.catalog_database, app.catalog_schema, app.catalog_relation
@@ -2416,7 +2448,7 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_catalog_list(
         frame,
         theme,
-        panes[0],
+        structure[0],
         &title,
         items,
         app.selected_column,
@@ -2429,14 +2461,23 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             "No indexes."
         };
-        frame.render_widget(Paragraph::new(text).block(block), panes[1]);
+        frame.render_widget(Paragraph::new(text).block(block), structure[1]);
     } else {
         let items: Vec<_> = app
             .indexes
             .iter()
             .map(|index| ListItem::new(index_line(theme, index)))
             .collect();
-        frame.render_widget(List::new(items).block(block), panes[1]);
+        frame.render_widget(List::new(items).block(block), structure[1]);
+    }
+    if let Some(grid) = &app.relation_rows {
+        grid.render(
+            frame,
+            rows[1],
+            theme,
+            &format!(" Data — {}.{} ", app.catalog_schema, app.catalog_relation),
+            app.relation_grid_focus,
+        );
     }
 }
 
@@ -2518,6 +2559,7 @@ struct CatalogPath {
     database: String,
     schema: String,
     relation: String,
+    rows: GridRequest,
 }
 
 async fn run_operation(
@@ -2569,6 +2611,25 @@ async fn run_operation(
                 .await
                 .map(|relations| relations.items),
         ),
+        Operation::LoadRelationRows { connection_id } => {
+            let relation = RelationRef {
+                connection_id,
+                database: &catalog.database,
+                schema: &catalog.schema,
+                relation: &catalog.relation,
+            };
+            let request = RelationRowsRequest {
+                page: catalog.rows.page,
+                per_page: catalog.rows.per_page,
+                sort: catalog
+                    .rows
+                    .sort
+                    .as_ref()
+                    .map(|(column, descending)| (column.as_str(), *descending)),
+                search: &catalog.rows.search,
+            };
+            OperationResult::RelationRows(client.list_relation_rows(relation, request).await)
+        }
         Operation::LoadRelationDetail { connection_id } => {
             let relation = RelationRef {
                 connection_id,
@@ -2668,15 +2729,17 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pgrustadmin_api_client::{
         ApiClient, ApiError, AuthSession, Column, Connection, Database, Execution, ExecutionError,
-        ExecutionResult, ExecutionRows, ExecutionStatus, Index, Relation, RelationKind, Schema,
-        SqlFile, SqlFileContent,
+        ExecutionResult, ExecutionRows, ExecutionStatus, Index, Relation, RelationKind,
+        RelationRowsPage, Schema, SqlFile, SqlFileContent,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
+    use crate::grid::Grid;
+
     use super::{
         App, ConnectionForm, FinishedExecution, LoginField, MAX_SQL_TABS, OperationResult,
-        SQL_VIEW, ScreenState, TabExecution, TabId, TabResult, TrackedExecution, UiAction,
+        SQL_VIEW, ScreenState, TabExecution, TabId, TrackedExecution, UiAction,
         mentions_explain_analyze, render,
     };
 
@@ -3453,7 +3516,8 @@ mod tests {
                 "Succeeded in 12 ms: 3 statement(s); last returned 2 row(s), affected 2."
             )
         );
-        assert!(rendered.contains("Result — 2 of 5 row(s), truncated · 12 ms"));
+        assert!(rendered.contains("Result · 12 ms"));
+        assert!(rendered.contains("rows 1–2 of 2 · first 2 of 5 stored"));
         assert!(rendered.contains("label"));
         assert!(rendered.contains("NULL"));
         assert!(rendered.contains("ção"));
@@ -3551,40 +3615,122 @@ mod tests {
     }
 
     #[test]
-    fn tab_focuses_the_result_whose_arrows_scroll_rows_and_columns() {
+    fn tab_focuses_the_result_grid_which_handles_its_own_keys() {
         let mut app = app_with_sql_tab();
         press(&mut app, KeyCode::Tab);
         assert!(!app.result_focus);
         assert!(app.message.contains("no result"));
         assert_eq!(app.view, SQL_VIEW, "Tab no longer leaves the SQL section");
 
-        app.sql_tabs.active_mut().expect("tab").result = Some(TabResult::new(rows_result(12, 30)));
+        app.sql_tabs.active_mut().expect("tab").result = Some(grid_from(rows_result(3, 30)));
         press(&mut app, KeyCode::Tab);
         assert!(app.result_focus);
         press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::PageDown);
         press(&mut app, KeyCode::Right);
-        let result = app
-            .sql_tabs
-            .active()
-            .expect("tab")
-            .result
-            .as_ref()
-            .expect("result");
-        assert_eq!((result.first_row, result.first_column), (11, 1));
-        assert_eq!(app.view, SQL_VIEW, "arrows scroll instead of leaving");
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('s'));
         let rendered = render_text(&app);
-        assert!(rendered.contains("column_1"));
-        assert!(!rendered.contains("column_0"));
-        assert!(rendered.contains("r11c1"));
-        assert!(!rendered.contains("r10c1"));
+        assert!(
+            rendered.contains("column_1 ▼"),
+            "sorted by the active column"
+        );
+        assert!(rendered.contains("sort: column_1 ▼"));
+        assert!(rendered.contains("« ‹"));
+        assert_eq!(
+            app.view, SQL_VIEW,
+            "arrows move the cursor instead of leaving"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert!(render_text(&app).contains("column_1 — Esc to close"));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, SQL_VIEW, "Esc closes the value popup first");
+        assert!(!render_text(&app).contains("Esc to close"));
 
         press(&mut app, KeyCode::Tab);
         assert!(!app.result_focus);
-        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Enter);
-        assert!(app.sql_editing);
-        assert!(!app.result_focus, "editing takes the focus");
+        assert!(app.sql_editing, "Enter edits once the editor has the focus");
+    }
+
+    fn grid_from(rows: ExecutionRows) -> Grid {
+        Grid::local(rows.columns, rows.rows, rows.total_rows)
+    }
+
+    fn rows_page(count: usize) -> RelationRowsPage {
+        RelationRowsPage {
+            columns: vec!["id".to_owned(), "email".to_owned()],
+            rows: (0..count)
+                .map(|index| vec![Some(index.to_string()), Some(format!("user{index}@x.io"))])
+                .collect(),
+            total_rows: 120,
+            page: 1,
+            per_page: 25,
+        }
+    }
+
+    #[tokio::test]
+    async fn relation_detail_loads_a_data_grid_that_pages_on_the_server() {
+        let mut app = authenticated_app();
+        let connection_id = Uuid::new_v4();
+        app.view = 4;
+        app.catalog_connection = Some(connection_id);
+        app.relations = vec![Relation {
+            name: "users".to_owned(),
+            kind: RelationKind::Table,
+        }];
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter),
+            UiAction::LoadRelationDetail(id) if id == connection_id
+        ));
+        app.apply_result(OperationResult::RelationDetail(Ok((
+            vec![column("id")],
+            Vec::new(),
+        ))));
+        assert!(
+            app.relation_rows.is_some(),
+            "the data grid opens with the detail"
+        );
+        assert!(app.pending.is_some(), "rows are requested right away");
+        if let Some(task) = app.pending.take() {
+            task.abort();
+        }
+        app.client = Some(client());
+        assert!(render_text(&app).contains("Loading rows…"));
+
+        app.apply_result(OperationResult::RelationRows(Ok(rows_page(25))));
+        let rendered = render_text(&app);
+        assert!(rendered.contains("Data — .users"));
+        assert!(rendered.contains("user0@x.io"));
+        assert!(rendered.contains("of 120"));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(app.relation_grid_focus);
+        assert!(render_text(&app).contains("+/-: size"));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char(']')),
+            UiAction::LoadRelationRows(id) if id == connection_id
+        ));
+        let grid = app.relation_rows.as_ref().expect("grid");
+        assert_eq!(grid.request().page, 2);
+
+        app.pending = Some(tokio::spawn(std::future::pending()));
+        super::start_action(&mut app, UiAction::LoadRelationRows(connection_id));
+        assert!(app.relation_rows_stale, "reload waits for the running call");
+        if let Some(task) = app.pending.take() {
+            task.abort();
+        }
+
+        app.apply_result(OperationResult::RelationRows(Err(ApiError::Http {
+            status: 403,
+            code: Some("relation_not_readable"),
+        })));
+        assert!(render_text(&app).contains("cannot read this relation"));
+
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.relation_grid_focus);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, 4, "Esc returns to the relations");
     }
 
     #[tokio::test]
@@ -3594,7 +3740,7 @@ mod tests {
         let tab_id = app.sql_tabs.active().expect("tab").id;
         let tab = app.sql_tabs.active_mut().expect("tab");
         tab.editor.insert_str("SELECT 1");
-        tab.result = Some(TabResult::new(rows_result(1, 1)));
+        tab.result = Some(grid_from(rows_result(1, 1)));
         app.result_focus = true;
         app.start_execution(tab_id);
         let tab = app.sql_tabs.active().expect("tab");

@@ -189,6 +189,20 @@ impl Theme {
         }
     }
 
+    /// Active cell inside the selected row: the selection colors swapped.
+    pub fn active_cell(self) -> Style {
+        let palette = self.palette();
+        match self.mode {
+            ColorMode::Monochrome => Style::default()
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                .remove_modifier(Modifier::REVERSED),
+            _ => Style::default()
+                .fg(self.color(palette.selection))
+                .bg(self.color(palette.selection_text))
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
     /// Focused input field or heading.
     pub fn focus(self) -> Style {
         self.foreground(self.palette().accent)
