@@ -9,10 +9,10 @@ use axum::{
     routing::get,
 };
 use pgrustadmin_postgres_driver::{
-    ConnectionData, ConnectionSummary, PgPool, PostgresError, create_connection,
-    delete_connection_for_owner, find_connection_credentials_for_owner, find_connection_for_owner,
-    list_connections_for_owner, list_databases, test_database_connection,
-    update_connection_for_owner,
+    ConnectionData, ConnectionSummary, PgPool, PostgresError, StoredConnectionCredentials,
+    create_connection, delete_connection_for_owner, find_connection_credentials_for_owner,
+    find_connection_for_owner, list_connections_for_owner, list_databases, list_schemas,
+    test_database_connection, update_connection_for_owner,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -32,6 +32,10 @@ pub fn router(pool: PgPool) -> Router {
         .route(
             "/api/v1/connections/{id}/databases",
             get(list_remote_databases),
+        )
+        .route(
+            "/api/v1/connections/{id}/databases/{database}/schemas",
+            get(list_remote_schemas),
         )
         .with_state(pool)
 }
@@ -109,6 +113,54 @@ struct DatabaseResponse {
     name: String,
 }
 
+#[derive(Serialize)]
+struct SchemaListResponse {
+    items: Vec<SchemaResponse>,
+}
+
+#[derive(Serialize)]
+struct SchemaResponse {
+    name: String,
+}
+
+/// PostgreSQL identifiers are truncated beyond NAMEDATALEN - 1 bytes.
+const MAX_DATABASE_NAME_BYTES: usize = 63;
+
+enum SavedConnectionError {
+    NotFound,
+    CredentialKeyUnavailable,
+    Internal,
+}
+
+impl IntoResponse for SavedConnectionError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::NotFound => not_found(),
+            Self::CredentialKeyUnavailable => credential_configuration_error(),
+            Self::Internal => internal_error(),
+        }
+    }
+}
+
+/// Loads an owner's saved connection and decrypts its password in memory.
+async fn load_saved_connection(
+    pool: &PgPool,
+    owner_id: Uuid,
+    connection_id: Uuid,
+) -> Result<(StoredConnectionCredentials, Zeroizing<String>), SavedConnectionError> {
+    let connection = find_connection_credentials_for_owner(pool, owner_id, connection_id)
+        .await
+        .map_err(|_| SavedConnectionError::Internal)?
+        .ok_or(SavedConnectionError::NotFound)?;
+    let cipher =
+        CredentialCipher::from_env().map_err(|_| SavedConnectionError::CredentialKeyUnavailable)?;
+    let password = cipher
+        .decrypt(&connection.credential_envelope, owner_id, connection_id)
+        .map_err(|_| SavedConnectionError::Internal)?;
+    let password = std::str::from_utf8(&password).map_err(|_| SavedConnectionError::Internal)?;
+    Ok((connection, Zeroizing::new(password.to_owned())))
+}
+
 async fn test(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -121,24 +173,11 @@ async fn test(
     let Ok(Path(connection_id)) = connection_path else {
         return bad_request();
     };
-    let connection =
-        match find_connection_credentials_for_owner(&pool, owner_id, connection_id).await {
-            Ok(Some(connection)) => connection,
-            Ok(None) => return not_found(),
-            Err(_) => return internal_error(),
-        };
-    let cipher = match CredentialCipher::from_env() {
-        Ok(cipher) => cipher,
-        Err(_) => return credential_configuration_error(),
+    let (connection, password) = match load_saved_connection(&pool, owner_id, connection_id).await {
+        Ok(saved) => saved,
+        Err(error) => return error.into_response(),
     };
-    let password = match cipher.decrypt(&connection.credential_envelope, owner_id, connection_id) {
-        Ok(password) => password,
-        Err(_) => return internal_error(),
-    };
-    let Ok(password) = std::str::from_utf8(&password) else {
-        return internal_error();
-    };
-    let success = test_database_connection(&connection, password)
+    let success = test_database_connection(&connection, &password)
         .await
         .is_ok();
     (StatusCode::OK, Json(ConnectionTestResponse { success })).into_response()
@@ -156,31 +195,53 @@ async fn list_remote_databases(
     let Ok(Path(connection_id)) = connection_path else {
         return bad_request();
     };
-    let connection =
-        match find_connection_credentials_for_owner(&pool, owner_id, connection_id).await {
-            Ok(Some(connection)) => connection,
-            Ok(None) => return not_found(),
-            Err(_) => return internal_error(),
-        };
-    let cipher = match CredentialCipher::from_env() {
-        Ok(cipher) => cipher,
-        Err(_) => return credential_configuration_error(),
-    };
-    let password = match cipher.decrypt(&connection.credential_envelope, owner_id, connection_id) {
-        Ok(password) => password,
-        Err(_) => return internal_error(),
-    };
-    let Ok(password) = std::str::from_utf8(&password) else {
-        return internal_error();
+    let (connection, password) = match load_saved_connection(&pool, owner_id, connection_id).await {
+        Ok(saved) => saved,
+        Err(error) => return error.into_response(),
     };
 
-    match list_databases(&connection, password).await {
+    match list_databases(&connection, &password).await {
         Ok(items) => (
             StatusCode::OK,
             Json(DatabaseListResponse {
                 items: items
                     .into_iter()
                     .map(|name| DatabaseResponse { name })
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(_) => catalog_unavailable(),
+    }
+}
+
+async fn list_remote_schemas(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    schema_path: Result<Path<(Uuid, String)>, PathRejection>,
+) -> Response {
+    let owner_id = match authenticated_owner(&pool, &headers).await {
+        Ok(owner_id) => owner_id,
+        Err(error) => return authentication_error_response(error),
+    };
+    let Ok(Path((connection_id, database))) = schema_path else {
+        return bad_request();
+    };
+    if database.is_empty() || database.len() > MAX_DATABASE_NAME_BYTES || database.contains('\0') {
+        return bad_request();
+    }
+    let (connection, password) = match load_saved_connection(&pool, owner_id, connection_id).await {
+        Ok(saved) => saved,
+        Err(error) => return error.into_response(),
+    };
+
+    match list_schemas(&connection, &database, &password).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(SchemaListResponse {
+                items: items
+                    .into_iter()
+                    .map(|name| SchemaResponse { name })
                     .collect(),
             }),
         )
@@ -760,6 +821,72 @@ mod tests {
         )
         .await;
         assert_eq!(other_owner_databases.status(), StatusCode::NOT_FOUND);
+
+        let schemas_path =
+            format!("/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas");
+        let schemas = send_request(
+            app.clone(),
+            Method::GET,
+            &schemas_path,
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(schemas.status(), StatusCode::OK);
+        let schemas_body = to_bytes(schemas.into_body(), 4096)
+            .await
+            .expect("read schema catalog response");
+        let schemas_json: serde_json::Value =
+            serde_json::from_slice(&schemas_body).expect("decode schema catalog response");
+        let schema_names = schemas_json["items"]
+            .as_array()
+            .expect("schema response has items")
+            .iter()
+            .filter_map(|schema| schema["name"].as_str())
+            .collect::<Vec<_>>();
+        for expected in ["information_schema", "pg_catalog", "public"] {
+            assert!(
+                schema_names.contains(&expected),
+                "missing schema {expected}"
+            );
+        }
+        assert!(
+            schema_names
+                .iter()
+                .all(|name| !name.starts_with("pg_toast") && !name.starts_with("pg_temp_"))
+        );
+        assert!(schema_names.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let other_owner_schemas = send_request(
+            app.clone(),
+            Method::GET,
+            &schemas_path,
+            Some(other_owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(other_owner_schemas.status(), StatusCode::NOT_FOUND);
+
+        let overlong_database = "a".repeat(64);
+        let invalid_database_schemas = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("/api/v1/connections/{connection_id}/databases/{overlong_database}/schemas"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(invalid_database_schemas.status(), StatusCode::BAD_REQUEST);
+
+        let missing_database_schemas = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("/api/v1/connections/{connection_id}/databases/pgrustadmin_missing/schemas"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(missing_database_schemas.status(), StatusCode::BAD_GATEWAY);
 
         let mut invalid_credentials = payload.clone();
         invalid_credentials["password"] = serde_json::json!("incorrect-test-password");

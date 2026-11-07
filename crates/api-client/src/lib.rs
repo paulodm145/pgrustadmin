@@ -1,5 +1,6 @@
 //! Cliente HTTP assíncrono e tipado da API PGRustAdmin.
 
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::{Client, Method, RequestBuilder, StatusCode, Url, header::AUTHORIZATION};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{env, error::Error, fmt, time::Duration};
@@ -134,6 +135,16 @@ pub struct DatabaseList {
     pub items: Vec<Database>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Schema {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SchemaList {
+    pub items: Vec<Schema>,
+}
+
 impl ApiClient {
     pub fn new(base_url: &str) -> Result<Self, ApiError> {
         let mut base_url = Url::parse(base_url).map_err(|_| ApiError::InvalidBaseUrl)?;
@@ -258,6 +269,19 @@ impl ApiClient {
         .await
     }
 
+    pub async fn list_schemas(
+        &self,
+        connection_id: Uuid,
+        database: &str,
+    ) -> Result<SchemaList, ApiError> {
+        let database = utf8_percent_encode(database, NON_ALPHANUMERIC);
+        self.get_json(
+            &format!("api/v1/connections/{connection_id}/databases/{database}/schemas"),
+            true,
+        )
+        .await
+    }
+
     async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -351,7 +375,7 @@ async fn http_error(response: reqwest::Response) -> ApiError {
 mod tests {
     use axum::{
         Json, Router,
-        extract::State,
+        extract::{Path, State},
         http::{HeaderMap, StatusCode, header::AUTHORIZATION},
         routing::{get, post},
     };
@@ -437,6 +461,12 @@ mod tests {
                 "/api/v1/connections/{id}/databases",
                 get(|| async { Json(serde_json::json!({"items":[{"name":"app_db"}]})) }),
             )
+            .route(
+                "/api/v1/connections/{id}/databases/{database}/schemas",
+                get(|Path((_, database)): Path<(Uuid, String)>| async move {
+                    Json(serde_json::json!({"items":[{"name": database}]}))
+                }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -488,6 +518,16 @@ mod tests {
                 .items,
             vec![super::Database {
                 name: "app_db".to_owned()
+            }]
+        );
+        assert_eq!(
+            client
+                .list_schemas(Uuid::new_v4(), "odd/db name?%")
+                .await
+                .expect("schema catalog succeeds")
+                .items,
+            vec![super::Schema {
+                name: "odd/db name?%".to_owned()
             }]
         );
         client.logout().await.expect("logout succeeds");

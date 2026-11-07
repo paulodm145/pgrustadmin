@@ -8,7 +8,7 @@ API-001 define `GET /api/v1/health` como liveness (`200`, `{ "status": "ok" }`) 
 
 API-002 disponibiliza cliente assíncrono reutilizável com base URL de `PGRUSTADMIN_API_BASE_URL` (padrão `http://127.0.0.1:3000`), timeout HTTP de 30 segundos e TLS Rustls para URLs HTTPS. Cliente tipado cobre health/version, login/logout/session e CRUD/lista/teste de conexões. O token Bearer fica encapsulado e zerado ao descarte; erros expõem status/código estável ou categoria de transporte/decodificação, nunca corpo arbitrário da resposta, URL com credenciais ou token.
 
-CAT-001 adiciona ao cliente tipado a leitura de databases da conexão autenticada conforme `specs/catalog.md`.
+CAT-001 e CAT-002 adicionam ao cliente tipado a leitura de databases da conexão autenticada e de schemas de um database conforme `specs/catalog.md`.
 
 TUI-001 inicializa e restaura o terminal mesmo quando o loop termina com erro, processa eventos sem bloquear o runtime assíncrono, redesenha em resize e oferece navegação por teclado com foco visível em layout que se adapta a terminais estreitos. Nenhuma seção ainda executa operações da API nesta tarefa.
 

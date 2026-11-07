@@ -93,6 +93,32 @@ pub async fn list_databases(
     .map_err(|_| sqlx::Error::PoolTimedOut)?
 }
 
+/// Lists schemas of `database` visible to the saved credential, excluding
+/// internal TOAST and temporary schemas.
+pub async fn list_schemas(
+    connection: &StoredConnectionCredentials,
+    database: &str,
+    password: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let options = connection_options(connection, password)?.database(database);
+    tokio::time::timeout(CONNECTION_TEST_TIMEOUT, async {
+        let mut connection = sqlx::PgConnection::connect_with(&options).await?;
+        let schemas = sqlx::query_scalar::<_, String>(
+            "SELECT nspname::text FROM pg_namespace \
+             WHERE has_schema_privilege(oid, 'USAGE') \
+               AND nspname NOT LIKE 'pg\\_toast%' \
+               AND nspname NOT LIKE 'pg\\_temp\\_%' \
+             ORDER BY nspname",
+        )
+        .fetch_all(&mut connection)
+        .await?;
+        connection.close().await?;
+        Ok(schemas)
+    })
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
 fn connection_options(
     connection: &StoredConnectionCredentials,
     password: &str,

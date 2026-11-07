@@ -25,7 +25,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | TUI-002 | Login TUI | API-002/AUTH-003 | Concluída — formulário com senha mascarada, navegação por teclado, login e verificação de sessão em tarefa assíncrona; erros seguros, senha zeroizada e cancelamento ao sair; 3 testes TUI passaram. |
 | TUI-003 | Conexões TUI | TUI-002/CON-001 | Concluída — listagem paginada, criação/edição (senha vazia preserva credencial), teste e exclusão confirmada; chamadas assíncronas, mensagens sem segredo; 5 testes TUI passaram. |
 | CAT-001 | Databases | TUI-003 | Concluída — `specs/catalog.md`; `GET /api/v1/connections/{id}/databases` owner-scoped (404 para outro usuário, 502 `catalog_unavailable` sem mensagem do driver), filtra templates/sem `CONNECT`, ordenado por nome; cliente tipado e lista navegável na TUI com retorno às conexões; teste de integração do servidor e 6 testes TUI passaram. |
-| CAT-002 | Schemas | CAT-001 | Pendente |
+| CAT-002 | Schemas | CAT-001 | Concluída — `specs/catalog.md`; `GET /api/v1/connections/{id}/databases/{database}/schemas` owner-scoped conecta ao database escolhido com a credencial salva, lista schemas com `USAGE` (inclui `pg_catalog`/`information_schema`, exclui `pg_toast*`/`pg_temp_*`), `400` para nome inválido e `502` para database indisponível; cliente tipado com nome codificado no caminho; TUI abre schemas com Enter e volta com Esc; integração do servidor, 3 testes de cliente e 7 testes TUI passaram. |
 | CAT-003 | Tabelas/views | CAT-002 | Pendente |
 | CAT-004 | Colunas/índices | CAT-003 | Pendente |
 | SQL-001 | Estado das abas | TUI-001 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-TUI-003 está concluída com CRUD/teste de conexões assíncrono e paginação. Próxima tarefa: CAT-001, listar databases PostgreSQL pela API e TUI.
+CAT-002 está concluída com a listagem de schemas por database pela API e TUI. Próxima tarefa: CAT-003, listar tabelas/views de um schema.

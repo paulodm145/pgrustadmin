@@ -1458,6 +1458,7 @@ name = "pgrustadmin-api-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
