@@ -9,10 +9,11 @@ use axum::{
     routing::get,
 };
 use pgrustadmin_postgres_driver::{
-    ConnectionData, ConnectionSummary, PgPool, PostgresError, StoredConnectionCredentials,
-    create_connection, delete_connection_for_owner, find_connection_credentials_for_owner,
-    find_connection_for_owner, list_connections_for_owner, list_databases, list_schemas,
-    test_database_connection, update_connection_for_owner,
+    ConnectionData, ConnectionSummary, PgPool, PostgresError, RelationKind,
+    StoredConnectionCredentials, create_connection, delete_connection_for_owner,
+    find_connection_credentials_for_owner, find_connection_for_owner, list_connections_for_owner,
+    list_databases, list_relations, list_schemas, test_database_connection,
+    update_connection_for_owner,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -37,6 +38,10 @@ pub fn router(pool: PgPool) -> Router {
             "/api/v1/connections/{id}/databases/{database}/schemas",
             get(list_remote_schemas),
         )
+        .route(
+            "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations",
+            get(list_remote_relations),
+        )
         .with_state(pool)
 }
 
@@ -57,6 +62,31 @@ struct ConnectionRequest {
 struct PaginationQuery {
     page: Option<u64>,
     per_page: Option<u64>,
+}
+
+/// Validated `page`/`per_page` with the SQL limit and offset they select.
+struct Page {
+    page: u64,
+    per_page: u64,
+    limit: i64,
+    offset: i64,
+}
+
+impl PaginationQuery {
+    fn validate(self) -> Option<Page> {
+        let page = self.page.unwrap_or(1);
+        let per_page = self.per_page.unwrap_or(25);
+        if page == 0 || per_page == 0 || per_page > 100 {
+            return None;
+        }
+        let offset = page.checked_sub(1)?.checked_mul(per_page)?;
+        Some(Page {
+            page,
+            per_page,
+            limit: i64::try_from(per_page).ok()?,
+            offset: i64::try_from(offset).ok()?,
+        })
+    }
 }
 
 struct ValidatedConnection {
@@ -123,8 +153,35 @@ struct SchemaResponse {
     name: String,
 }
 
+#[derive(Serialize)]
+struct RelationListResponse {
+    items: Vec<RelationResponse>,
+    page: u64,
+    per_page: u64,
+}
+
+#[derive(Serialize)]
+struct RelationResponse {
+    name: String,
+    kind: &'static str,
+}
+
+fn relation_kind_name(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Table => "table",
+        RelationKind::PartitionedTable => "partitioned_table",
+        RelationKind::View => "view",
+        RelationKind::MaterializedView => "materialized_view",
+        RelationKind::ForeignTable => "foreign_table",
+    }
+}
+
 /// PostgreSQL identifiers are truncated beyond NAMEDATALEN - 1 bytes.
-const MAX_DATABASE_NAME_BYTES: usize = 63;
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+fn is_valid_identifier(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_IDENTIFIER_BYTES && !name.contains('\0')
+}
 
 enum SavedConnectionError {
     NotFound,
@@ -227,7 +284,7 @@ async fn list_remote_schemas(
     let Ok(Path((connection_id, database))) = schema_path else {
         return bad_request();
     };
-    if database.is_empty() || database.len() > MAX_DATABASE_NAME_BYTES || database.contains('\0') {
+    if !is_valid_identifier(&database) {
         return bad_request();
     }
     let (connection, password) = match load_saved_connection(&pool, owner_id, connection_id).await {
@@ -250,6 +307,56 @@ async fn list_remote_schemas(
     }
 }
 
+async fn list_remote_relations(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    relation_path: Result<Path<(Uuid, String, String)>, PathRejection>,
+    query: Result<Query<PaginationQuery>, QueryRejection>,
+) -> Response {
+    let owner_id = match authenticated_owner(&pool, &headers).await {
+        Ok(owner_id) => owner_id,
+        Err(error) => return authentication_error_response(error),
+    };
+    let Ok(Path((connection_id, database, schema))) = relation_path else {
+        return bad_request();
+    };
+    if !is_valid_identifier(&database) || !is_valid_identifier(&schema) {
+        return bad_request();
+    }
+    let Some(Page {
+        page,
+        per_page,
+        limit,
+        offset,
+    }) = query.ok().and_then(|Query(query)| query.validate())
+    else {
+        return bad_request();
+    };
+    let (connection, password) = match load_saved_connection(&pool, owner_id, connection_id).await {
+        Ok(saved) => saved,
+        Err(error) => return error.into_response(),
+    };
+
+    match list_relations(&connection, &database, &schema, &password, limit, offset).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(RelationListResponse {
+                items: items
+                    .into_iter()
+                    .map(|relation| RelationResponse {
+                        name: relation.name,
+                        kind: relation_kind_name(relation.kind),
+                    })
+                    .collect(),
+                page,
+                per_page,
+            }),
+        )
+            .into_response(),
+        Err(_) => catalog_unavailable(),
+    }
+}
+
 async fn list(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -260,22 +367,13 @@ async fn list(
         Err(error) => return authentication_error_response(error),
     };
 
-    let Ok(Query(query)) = query else {
-        return bad_request();
-    };
-    let page = query.page.unwrap_or(1);
-    let per_page = query.per_page.unwrap_or(25);
-    if page == 0 || per_page == 0 || per_page > 100 {
-        return bad_request();
-    }
-    let Some(offset) = page.checked_sub(1).and_then(|n| n.checked_mul(per_page)) else {
-        return bad_request();
-    };
-
-    let Ok(offset) = i64::try_from(offset) else {
-        return bad_request();
-    };
-    let Ok(limit) = i64::try_from(per_page) else {
+    let Some(Page {
+        page,
+        per_page,
+        limit,
+        offset,
+    }) = query.ok().and_then(|Query(query)| query.validate())
+    else {
         return bad_request();
     };
 
@@ -887,6 +985,137 @@ mod tests {
         )
         .await;
         assert_eq!(missing_database_schemas.status(), StatusCode::BAD_GATEWAY);
+
+        let catalog_schema = format!("cat003_{}", Uuid::new_v4().simple());
+        for statement in [
+            format!("CREATE SCHEMA {catalog_schema}"),
+            format!("CREATE TABLE {catalog_schema}.a_table (id int)"),
+            format!("CREATE TABLE {catalog_schema}.b_partitioned (id int) PARTITION BY RANGE (id)"),
+            format!(
+                "CREATE TABLE {catalog_schema}.b_partition_1 PARTITION OF \
+                 {catalog_schema}.b_partitioned FOR VALUES FROM (0) TO (10)"
+            ),
+            format!("CREATE VIEW {catalog_schema}.c_view AS SELECT 1 AS id"),
+            format!("CREATE MATERIALIZED VIEW {catalog_schema}.d_matview AS SELECT 1 AS id"),
+            format!("CREATE SEQUENCE {catalog_schema}.e_sequence"),
+        ] {
+            // Fixture names are generated from a UUID in this test.
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .expect("create catalog fixture");
+        }
+        let relations_path = format!(
+            "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations"
+        );
+        let relations = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("{relations_path}?per_page=100"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(relations.status(), StatusCode::OK);
+        let relations_body = to_bytes(relations.into_body(), 4096)
+            .await
+            .expect("read relation catalog response");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&relations_body)
+                .expect("decode relation catalog response"),
+            serde_json::json!({
+                "items": [
+                    {"name": "a_table", "kind": "table"},
+                    {"name": "b_partitioned", "kind": "partitioned_table"},
+                    {"name": "c_view", "kind": "view"},
+                    {"name": "d_matview", "kind": "materialized_view"},
+                ],
+                "page": 1,
+                "per_page": 100,
+            })
+        );
+
+        let second_page = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("{relations_path}?page=2&per_page=2"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(second_page.status(), StatusCode::OK);
+        let second_page_body = to_bytes(second_page.into_body(), 4096)
+            .await
+            .expect("read relation page response");
+        let second_page_json: serde_json::Value =
+            serde_json::from_slice(&second_page_body).expect("decode relation page response");
+        assert_eq!(
+            second_page_json["items"],
+            serde_json::json!([
+                {"name": "c_view", "kind": "view"},
+                {"name": "d_matview", "kind": "materialized_view"},
+            ])
+        );
+
+        for (path, expected_status) in [
+            (
+                format!("{relations_path}?per_page=101"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (format!("{relations_path}?page=0"), StatusCode::BAD_REQUEST),
+            (
+                format!(
+                    "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{}/relations",
+                    "s".repeat(64)
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = send_request(
+                app.clone(),
+                Method::GET,
+                &path,
+                Some(owner_token.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), expected_status, "{path}");
+        }
+
+        let missing_schema = send_request(
+            app.clone(),
+            Method::GET,
+            &format!(
+                "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/cat003_missing/relations"
+            ),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(missing_schema.status(), StatusCode::OK);
+        let missing_schema_body = to_bytes(missing_schema.into_body(), 4096)
+            .await
+            .expect("read missing schema response");
+        let missing_schema_json: serde_json::Value =
+            serde_json::from_slice(&missing_schema_body).expect("decode missing schema response");
+        assert_eq!(missing_schema_json["items"], serde_json::json!([]));
+
+        let other_owner_relations = send_request(
+            app.clone(),
+            Method::GET,
+            &relations_path,
+            Some(other_owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(other_owner_relations.status(), StatusCode::NOT_FOUND);
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA {catalog_schema} CASCADE"
+        )))
+        .execute(&pool)
+        .await
+        .expect("drop catalog fixture");
 
         let mut invalid_credentials = payload.clone();
         invalid_credentials["password"] = serde_json::json!("incorrect-test-password");

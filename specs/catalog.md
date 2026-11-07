@@ -17,3 +17,11 @@ A TUI permite abrir a lista de databases da conexão selecionada, navegar e volt
 `{database}` é um segmento de caminho codificado em URL; nome vazio, com byte nulo ou com mais de 63 bytes responde `400` (`bad_request`). Database inexistente, sem `CONNECT` ou que recusa conexão é indistinguível de falha do banco administrado e responde `502` (`catalog_unavailable`), sem mensagem do driver. Autorização, `404`, `503`, timeout e ausência de paginação seguem CAT-001.
 
 A TUI abre a lista de schemas com Enter sobre o database selecionado, permite navegar e recarregar, e volta à lista de databases com Esc. CAT-002 não lista objetos dentro dos schemas.
+
+## CAT-003 — Tabelas e views
+
+`GET /api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations` conecta ao database informado como em CAT-002 e lista relações do schema em ordem crescente por nome. Inclui tabelas (`table`), tabelas particionadas (`partitioned_table`), views (`view`), views materializadas (`materialized_view`) e foreign tables (`foreign_table`); exclui partições filhas, índices, sequências e tipos compostos. Lista todas as relações visíveis no catálogo, sem filtrar por privilégio do objeto; schema inexistente ou sem `USAGE` para a credencial responde lista vazia.
+
+Recebe `page` (começa em 1) e `per_page` (padrão 25, máximo 100), como conexões. Resposta `200`: `{ "items": [{ "name": "...", "kind": "table" }], "page", "per_page" }`. Paginação inválida ou `{schema}` vazio, com byte nulo ou com mais de 63 bytes responde `400`. Validação de `{database}`, autorização e demais erros seguem CAT-002.
+
+A TUI abre a lista com Enter sobre o schema selecionado, mostra nome e tipo, permite navegar, recarregar e trocar de página com `[`/`]` (100 itens por página), e volta à lista de schemas com Esc. CAT-003 não lista colunas nem índices.

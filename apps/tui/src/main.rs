@@ -3,19 +3,21 @@ use std::{io, time::Duration};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use pgrustadmin_api_client::{
-    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest, Database, Schema,
+    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest, Database,
+    Relation, RelationKind, Schema,
 };
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+const RELATION_PAGE_SIZE: usize = 100;
 const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
 const CONNECTION_FIELDS: [&str; 7] = [
     "Name", "Host", "Port", "Database", "Username", "Password", "TLS",
@@ -58,6 +60,7 @@ enum Operation {
     LoadConnections { page: u64 },
     LoadDatabases { connection_id: Uuid },
     LoadSchemas { connection_id: Uuid },
+    LoadRelations { connection_id: Uuid, page: u64 },
     SaveConnection { id: Option<Uuid> },
     TestConnection { id: Uuid },
     DeleteConnection { id: Uuid },
@@ -68,6 +71,7 @@ enum OperationResult {
     Connections(Result<Vec<Connection>, ApiError>),
     Databases(Result<Vec<Database>, ApiError>),
     Schemas(Result<Vec<Schema>, ApiError>),
+    Relations(Result<Vec<Relation>, ApiError>),
     Saved(Result<Connection, ApiError>),
     Tested(Result<ConnectionTest, ApiError>),
     Deleted(Result<(), ApiError>),
@@ -80,6 +84,7 @@ enum UiAction {
     LoadConnections(u64),
     LoadDatabases(Uuid),
     LoadSchemas(Uuid),
+    LoadRelations(Uuid, u64),
     SaveConnection,
     TestConnection(Uuid),
     DeleteConnection(Uuid),
@@ -224,6 +229,10 @@ struct App {
     catalog_database: String,
     schemas: Vec<Schema>,
     selected_schema: usize,
+    catalog_schema: String,
+    relations: Vec<Relation>,
+    selected_relation: usize,
+    relation_page: u64,
     form: Option<ConnectionForm>,
     confirm_delete: Option<Uuid>,
     message: String,
@@ -260,6 +269,10 @@ impl App {
             catalog_database: String::new(),
             schemas: Vec::new(),
             selected_schema: 0,
+            catalog_schema: String::new(),
+            relations: Vec::new(),
+            selected_relation: 0,
+            relation_page: 1,
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -276,7 +289,7 @@ impl App {
             return UiAction::None;
         }
         if key.code == KeyCode::Esc
-            && matches!(self.view, 2 | 3)
+            && matches!(self.view, 2..=4)
             && self.form.is_none()
             && matches!(self.state, ScreenState::Authenticated(_))
         {
@@ -351,7 +364,37 @@ impl App {
             },
             ScreenState::Authenticating => {}
             ScreenState::Authenticated(_) => {
-                if self.view == 3 {
+                if self.view == 4 {
+                    let Some(connection_id) = self.catalog_connection else {
+                        return UiAction::None;
+                    };
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') if !self.relations.is_empty() => {
+                            self.selected_relation =
+                                (self.selected_relation + self.relations.len() - 1)
+                                    % self.relations.len();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !self.relations.is_empty() => {
+                            self.selected_relation =
+                                (self.selected_relation + 1) % self.relations.len();
+                        }
+                        KeyCode::Char('r') => {
+                            return UiAction::LoadRelations(connection_id, self.relation_page);
+                        }
+                        KeyCode::Char('[') if self.relation_page > 1 => {
+                            self.relation_page -= 1;
+                            self.selected_relation = 0;
+                            return UiAction::LoadRelations(connection_id, self.relation_page);
+                        }
+                        KeyCode::Char(']') if self.relations.len() == RELATION_PAGE_SIZE => {
+                            self.relation_page += 1;
+                            self.selected_relation = 0;
+                            return UiAction::LoadRelations(connection_id, self.relation_page);
+                        }
+                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 3,
+                        _ => {}
+                    }
+                } else if self.view == 3 {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') if !self.schemas.is_empty() => {
                             self.selected_schema = (self.selected_schema + self.schemas.len() - 1)
@@ -363,6 +406,19 @@ impl App {
                         KeyCode::Char('r') => {
                             if let Some(connection_id) = self.catalog_connection {
                                 return UiAction::LoadSchemas(connection_id);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let (Some(connection_id), Some(schema)) = (
+                                self.catalog_connection,
+                                self.schemas.get(self.selected_schema),
+                            ) {
+                                self.catalog_schema = schema.name.clone();
+                                self.relations.clear();
+                                self.selected_relation = 0;
+                                self.relation_page = 1;
+                                self.view = 4;
+                                return UiAction::LoadRelations(connection_id, 1);
                             }
                         }
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 2,
@@ -489,6 +545,7 @@ impl App {
             UiAction::LoadConnections(_) => self.message = "Loading connections…".to_owned(),
             UiAction::LoadDatabases(_) => self.message = "Loading databases…".to_owned(),
             UiAction::LoadSchemas(_) => self.message = "Loading schemas…".to_owned(),
+            UiAction::LoadRelations(..) => self.message = "Loading relations…".to_owned(),
             UiAction::SaveConnection => self.message = "Saving connection…".to_owned(),
             UiAction::TestConnection(_) => self.message = "Testing connection…".to_owned(),
             UiAction::DeleteConnection(_) => self.message = "Deleting connection…".to_owned(),
@@ -501,8 +558,13 @@ impl App {
         } else {
             Zeroizing::new(String::new())
         };
-        let database = matches!(operation, Operation::LoadSchemas { .. })
-            .then(|| self.catalog_database.clone());
+        let database = matches!(
+            operation,
+            Operation::LoadSchemas { .. } | Operation::LoadRelations { .. }
+        )
+        .then(|| self.catalog_database.clone());
+        let schema = matches!(operation, Operation::LoadRelations { .. })
+            .then(|| self.catalog_schema.clone());
         let input = if let Operation::SaveConnection { .. } = operation {
             match self.form.as_ref().map(ConnectionForm::input) {
                 Some(Ok(input)) => Some(input),
@@ -532,6 +594,7 @@ impl App {
                 email.as_deref().unwrap_or_default(),
                 &password,
                 database.as_deref().unwrap_or_default(),
+                schema.as_deref().unwrap_or_default(),
                 input.as_ref(),
             )
             .await;
@@ -592,6 +655,18 @@ impl App {
                             .selected_schema
                             .min(self.schemas.len().saturating_sub(1));
                         self.message = format!("Loaded {} schema(s).", self.schemas.len());
+                    }
+                    OperationResult::Relations(Ok(relations)) => {
+                        self.relations = relations;
+                        self.selected_relation = self
+                            .selected_relation
+                            .min(self.relations.len().saturating_sub(1));
+                        self.message = format!("Loaded {} relation(s).", self.relations.len());
+                    }
+                    OperationResult::Relations(Err(error)) => {
+                        self.relations.clear();
+                        self.selected_relation = 0;
+                        self.message = api_error_message(error).to_owned();
                     }
                     OperationResult::Schemas(Err(error)) => {
                         self.schemas.clear();
@@ -708,6 +783,10 @@ fn start_action(app: &mut App, action: UiAction) {
         UiAction::LoadConnections(page) => Operation::LoadConnections { page },
         UiAction::LoadDatabases(connection_id) => Operation::LoadDatabases { connection_id },
         UiAction::LoadSchemas(connection_id) => Operation::LoadSchemas { connection_id },
+        UiAction::LoadRelations(connection_id, page) => Operation::LoadRelations {
+            connection_id,
+            page,
+        },
         UiAction::SaveConnection => Operation::SaveConnection {
             id: app.form.as_ref().and_then(|form| form.id),
         },
@@ -743,18 +822,26 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             } else if app.view == 1 {
                 render_connections(frame, sections[1], app);
             } else if app.view == 2 {
-                let names = app.databases.iter().map(|database| database.name.as_str());
+                let items = app
+                    .databases
+                    .iter()
+                    .map(|database| ListItem::new(database.name.as_str()))
+                    .collect();
                 let title = format!(" Databases — {} ", app.catalog_connection_name);
                 render_catalog_list(
                     frame,
                     sections[1],
                     &title,
-                    names,
+                    items,
                     app.selected_database,
                     &app.message,
                 );
             } else if app.view == 3 {
-                let names = app.schemas.iter().map(|schema| schema.name.as_str());
+                let items = app
+                    .schemas
+                    .iter()
+                    .map(|schema| ListItem::new(schema.name.as_str()))
+                    .collect();
                 let title = format!(
                     " Schemas — {} / {} ",
                     app.catalog_connection_name, app.catalog_database
@@ -763,8 +850,37 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                     frame,
                     sections[1],
                     &title,
-                    names,
+                    items,
                     app.selected_schema,
+                    &app.message,
+                );
+            } else if app.view == 4 {
+                let items = app
+                    .relations
+                    .iter()
+                    .map(|relation| {
+                        ListItem::new(Line::from(vec![
+                            Span::raw(relation.name.as_str()),
+                            Span::styled(
+                                format!("  {}", relation_kind_label(relation.kind)),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]))
+                    })
+                    .collect();
+                let title = format!(
+                    " Relations — {} / {} / {} · page {} ",
+                    app.catalog_connection_name,
+                    app.catalog_database,
+                    app.catalog_schema,
+                    app.relation_page
+                );
+                render_catalog_list(
+                    frame,
+                    sections[1],
+                    &title,
+                    items,
+                    app.selected_relation,
                     &app.message,
                 );
             } else {
@@ -785,7 +901,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
         "↑/↓: navigate   Enter: schemas   r: reload   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
-        "↑/↓: navigate   r: reload   Tab/Esc: databases   q: quit"
+        "↑/↓: navigate   Enter: relations   r: reload   Tab/Esc: databases   q: quit"
+    } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 4 {
+        "↑/↓: navigate   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
         "Tab/Enter: open Connections   ↑/↓: select   q/Esc: quit"
     } else {
@@ -969,16 +1087,26 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(status), panel[1]);
 }
 
-fn render_catalog_list<'a>(
+fn relation_kind_label(kind: RelationKind) -> &'static str {
+    match kind {
+        RelationKind::Table => "table",
+        RelationKind::PartitionedTable => "partitioned table",
+        RelationKind::View => "view",
+        RelationKind::MaterializedView => "materialized view",
+        RelationKind::ForeignTable => "foreign table",
+    }
+}
+
+fn render_catalog_list(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
-    names: impl ExactSizeIterator<Item = &'a str>,
+    items: Vec<ListItem<'_>>,
     selected: usize,
     message: &str,
 ) {
-    let is_empty = names.len() == 0;
-    let list = List::new(names.map(ListItem::new))
+    let is_empty = items.is_empty();
+    let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
@@ -1049,6 +1177,7 @@ async fn run_operation(
     email: &str,
     password: &str,
     database: &str,
+    schema: &str,
     input: Option<&ConnectionInput>,
 ) -> OperationResult {
     match operation {
@@ -1075,6 +1204,21 @@ async fn run_operation(
                 .list_databases(connection_id)
                 .await
                 .map(|databases| databases.items),
+        ),
+        Operation::LoadRelations {
+            connection_id,
+            page,
+        } => OperationResult::Relations(
+            client
+                .list_relations(
+                    connection_id,
+                    database,
+                    schema,
+                    page,
+                    RELATION_PAGE_SIZE as u64,
+                )
+                .await
+                .map(|relations| relations.items),
         ),
         Operation::LoadSchemas { connection_id } => OperationResult::Schemas(
             client
@@ -1106,7 +1250,9 @@ async fn run_operation(
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use pgrustadmin_api_client::{ApiClient, AuthSession, Connection, Database, Schema};
+    use pgrustadmin_api_client::{
+        ApiClient, AuthSession, Connection, Database, Relation, RelationKind, Schema,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
@@ -1323,6 +1469,50 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.view, 2);
         assert_eq!(app.selected_database, 1);
+    }
+
+    #[test]
+    fn selected_schema_opens_paged_relation_list_and_escape_returns() {
+        let mut app = authenticated_app();
+        let connection_id = Uuid::new_v4();
+        app.view = 3;
+        app.catalog_connection = Some(connection_id);
+        app.schemas = vec![Schema {
+            name: "public".to_owned(),
+        }];
+        app.relations = vec![Relation {
+            name: "stale".to_owned(),
+            kind: RelationKind::Table,
+        }];
+        app.relation_page = 4;
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiAction::LoadRelations(id, 1) if id == connection_id
+        ));
+        assert_eq!(app.view, 4);
+        assert_eq!(app.catalog_schema, "public");
+        assert!(app.relations.is_empty());
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+            UiAction::None
+        ));
+        app.relations = (0..100)
+            .map(|index| Relation {
+                name: format!("table_{index:03}"),
+                kind: RelationKind::View,
+            })
+            .collect();
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+            UiAction::LoadRelations(id, 2) if id == connection_id
+        ));
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            UiAction::LoadRelations(id, 1) if id == connection_id
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, 3);
     }
 
     #[test]
