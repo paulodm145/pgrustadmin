@@ -1,5 +1,6 @@
 //! Integração PostgreSQL do PGRustAdmin.
 
+use futures_util::TryStreamExt;
 use sqlx::{
     Connection,
     migrate::MigrateError,
@@ -348,6 +349,55 @@ pub async fn list_indexes(
     })
     .await
     .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
+/// Counts gathered while running a user script.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScriptOutcome {
+    pub statement_count: u64,
+    /// Rows returned by the last completed statement.
+    pub rows_returned: u64,
+    /// Rows affected as reported for the last completed statement.
+    pub rows_affected: u64,
+}
+
+/// Runs arbitrary user SQL on a fresh autocommit connection to `database`
+/// with the simple query protocol. Rows are counted, never stored.
+pub async fn execute_script(
+    connection: &StoredConnectionCredentials,
+    database: &str,
+    password: &str,
+    sql: String,
+) -> Result<ScriptOutcome, sqlx::Error> {
+    let options = connection_options(connection, password)?.database(database);
+    let mut connection = tokio::time::timeout(
+        CONNECTION_TEST_TIMEOUT,
+        sqlx::PgConnection::connect_with(&options),
+    )
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)??;
+    let outcome = {
+        // Arbitrary SQL is the feature: it is deliberately neither parsed nor filtered.
+        let mut results = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_many(&mut connection);
+        let mut outcome = ScriptOutcome::default();
+        let mut current_rows = 0_u64;
+        while let Some(item) = results.try_next().await? {
+            match item {
+                sqlx::Either::Left(result) => {
+                    outcome = ScriptOutcome {
+                        statement_count: outcome.statement_count + 1,
+                        rows_returned: current_rows,
+                        rows_affected: result.rows_affected(),
+                    };
+                    current_rows = 0;
+                }
+                sqlx::Either::Right(_) => current_rows += 1,
+            }
+        }
+        outcome
+    };
+    connection.close().await?;
+    Ok(outcome)
 }
 
 fn connection_options(

@@ -1,5 +1,6 @@
 //! In-memory SQL tab state for the TUI session.
 
+use pgrustadmin_api_client::ExecutionResult;
 use uuid::Uuid;
 
 use crate::sql_editor::SqlEditor;
@@ -24,6 +25,19 @@ pub struct TabFile {
     pub sha256: String,
 }
 
+/// Latest SQL execution state of a tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TabExecution {
+    #[default]
+    Idle,
+    Running,
+    Succeeded(ExecutionResult),
+    Failed {
+        code: Option<String>,
+        message: String,
+    },
+}
+
 pub struct SqlTab {
     pub id: TabId,
     pub editor: SqlEditor,
@@ -33,6 +47,7 @@ pub struct SqlTab {
     pub connection_id: Uuid,
     pub connection_name: String,
     pub database: String,
+    pub execution: TabExecution,
 }
 
 impl SqlTab {
@@ -117,6 +132,7 @@ impl SqlTabs {
             connection_id,
             connection_name: connection_name.to_owned(),
             database: database.to_owned(),
+            execution: TabExecution::Idle,
         });
         self.active = self.tabs.len() - 1;
         Ok(id)

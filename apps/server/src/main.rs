@@ -5,11 +5,13 @@ pub mod api;
 pub mod auth;
 pub mod connections;
 pub mod credentials;
+pub mod executions;
 pub mod sql_files;
 
 use api::router as api_router;
 use auth::handlers::router as auth_router;
 use connections::router as connections_router;
+use executions::router as executions_router;
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
 use sql_files::{SQL_FILES_DIR_ENV, router as sql_files_router};
 use tokio::net::TcpListener;
@@ -64,6 +66,7 @@ async fn run_server() -> io::Result<()> {
         .merge(api_router())
         .merge(auth_router(metadata_pool.clone()))
         .merge(connections_router(metadata_pool.clone()))
+        .merge(executions_router(metadata_pool.clone()))
         .merge(sql_files_router(metadata_pool, sql_files_dir));
     axum::serve(listener, app).await
 }

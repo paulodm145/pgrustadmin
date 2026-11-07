@@ -31,7 +31,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | SQL-001 | Estado das abas | TUI-001 | Concluída — `specs/sql-editor.md`; abas só em memória na TUI (`apps/tui/src/sql_tabs.rs`) com ID único não reutilizado, SQL, arquivo, dirty e vínculo fixo a conexão/database; limite de 20; fechar ativa a seguinte/anterior; `s` em databases abre aba, seção SQL alterna (`[`/`]`) e fecha (`x`); execução/resultado/duração/erro ficam para SQL-004/005; 5 testes do modelo e 2 testes TUI (incl. renderização) passaram. |
 | SQL-002 | Editor/dirty tracking | SQL-001 | Concluída — `specs/sql-editor.md`; editor próprio multilinha (`apps/tui/src/sql_editor.rs`) em modo modal (Enter/`i` edita, Esc sai), cursor/rolagem, Tab = 4 espaços, bracketed paste com quebras normalizadas; dirty = SQL ≠ conteúdo base; confirmação ao fechar aba dirty e ao sair (`q`/Esc/Ctrl+C) com abas dirty; colar em login/formulário continua digitando; 5 testes do editor, 6 do modelo de abas e 4 novos testes TUI passaram; smoke em tmux confirmou bracketed paste no login e saída limpa. |
 | SQL-003 | Arquivos SQL | SQL-002/API-001 | Concluída — `specs/sql-editor.md`; migration v5 `sql_files`, conteúdo em `PGRUSTADMIN_SQL_FILES_DIR/<owner>/<storage_key>.sql` (paths só de UUIDs), CRUD owner-scoped em `/api/v1/sql-files` com limite de 1 MiB, nomes `.sql` validados e gravação condicional por SHA-256 (`409 file_conflict`); TUI salva (`w`/`W`), resolve conflito (sobrescrever/salvar como) e abre arquivos (`o`) em nova aba; integração HTTP+PostgreSQL+disco, 2 testes unitários do servidor, cliente, 6 testes TUI novos e smoke do servidor passaram. |
-| SQL-004 | Execução assíncrona | CON-001 | Pendente |
+| SQL-004 | Execução assíncrona | CON-001 | Concluída — `specs/sql-editor.md`; `POST .../databases/{database}/executions` (202) e `GET /api/v1/executions/{id}`, job em memória por usuário (máx. 5 em execução, 50 retidas), conexão nova em autocommit com simple query protocol, contagem de comandos/linhas sem armazenar linhas, erro com SQLSTATE e mensagem do PostgreSQL; TUI executa com `e` e acompanha em tarefa própria; 4 testes do servidor (incl. integração com limite real), cliente, 3 testes TUI e smoke ponta a ponta do binário passaram. |
 | SQL-005 | Resultados/duração | SQL-004 | Pendente |
 | SQL-006 | Timeout/cancelamento | SQL-004 | Pendente |
 | TUI-004 | Temas | TUI-001 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-SQL-003 está concluída com arquivos `.sql` no servidor e na TUI. Próxima tarefa: SQL-004, execução assíncrona de SQL associada a usuário/conexão/database.
+SQL-004 está concluída com execução assíncrona de SQL. Próxima tarefa: SQL-005, resultados (colunas/linhas com limite de linhas/volume) e duração.
