@@ -1,3 +1,5 @@
+mod sql_tabs;
+
 use std::{io, time::Duration};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -11,13 +13,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs},
 };
+use sql_tabs::{MAX_SQL_TABS, SqlTabs};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const RELATION_PAGE_SIZE: usize = 100;
+/// View index of the SQL tabs section; catalog views use 2..=5.
+const SQL_VIEW: usize = 6;
 const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
 const CONNECTION_FIELDS: [&str; 7] = [
     "Name", "Host", "Port", "Database", "Username", "Password", "TLS",
@@ -238,6 +243,7 @@ struct App {
     columns: Vec<Column>,
     indexes: Vec<Index>,
     selected_column: usize,
+    sql_tabs: SqlTabs,
     selected_relation: usize,
     relation_page: u64,
     form: Option<ConnectionForm>,
@@ -284,6 +290,7 @@ impl App {
             columns: Vec::new(),
             indexes: Vec::new(),
             selected_column: 0,
+            sql_tabs: SqlTabs::default(),
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -297,6 +304,14 @@ impl App {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
+            return UiAction::None;
+        }
+        if key.code == KeyCode::Esc
+            && self.view == SQL_VIEW
+            && self.form.is_none()
+            && matches!(self.state, ScreenState::Authenticated(_))
+        {
+            self.view = 1;
             return UiAction::None;
         }
         if key.code == KeyCode::Esc
@@ -375,7 +390,21 @@ impl App {
             },
             ScreenState::Authenticating => {}
             ScreenState::Authenticated(_) => {
-                if self.view == 5 {
+                if self.view == SQL_VIEW {
+                    match key.code {
+                        KeyCode::Char(']') => self.sql_tabs.select_next(),
+                        KeyCode::Char('[') => self.sql_tabs.select_previous(),
+                        KeyCode::Char('x') => {
+                            self.sql_tabs.close_active();
+                            if self.sql_tabs.is_empty() {
+                                self.view = 1;
+                                self.message = "All SQL tabs are closed.".to_owned();
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 1,
+                        _ => {}
+                    }
+                } else if self.view == 5 {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') if !self.columns.is_empty() => {
                             self.selected_column = (self.selected_column + self.columns.len() - 1)
@@ -490,6 +519,7 @@ impl App {
                                 return UiAction::LoadSchemas(connection_id);
                             }
                         }
+                        KeyCode::Char('s') => self.open_sql_tab(),
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 1,
                         _ => {}
                     }
@@ -551,6 +581,7 @@ impl App {
                                 return UiAction::LoadDatabases(connection.id);
                             }
                         }
+                        KeyCode::Char('s') => self.show_sql_tabs(),
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 0,
                         _ => {}
                     }
@@ -559,6 +590,7 @@ impl App {
                         KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
                             self.view = 1
                         }
+                        KeyCode::Char('s') => self.show_sql_tabs(),
                         KeyCode::Tab | KeyCode::Enter => {
                             self.view = (self.view + 1) % MENU_ITEMS.len();
                             if self.view == 1 {
@@ -571,6 +603,36 @@ impl App {
             }
         }
         UiAction::None
+    }
+
+    fn open_sql_tab(&mut self) {
+        let (Some(connection_id), Some(database)) = (
+            self.catalog_connection,
+            self.databases.get(self.selected_database),
+        ) else {
+            return;
+        };
+        match self
+            .sql_tabs
+            .open(connection_id, &self.catalog_connection_name, &database.name)
+        {
+            Ok(_) => {
+                self.view = SQL_VIEW;
+                self.message.clear();
+            }
+            Err(_) => {
+                self.message =
+                    format!("Close a SQL tab before opening another (limit {MAX_SQL_TABS}).");
+            }
+        }
+    }
+
+    fn show_sql_tabs(&mut self) {
+        if self.sql_tabs.is_empty() {
+            self.message = "No SQL tabs open. Press s on a database to open one.".to_owned();
+        } else {
+            self.view = SQL_VIEW;
+        }
     }
 
     fn start_operation(&mut self, operation: Operation, action: UiAction) {
@@ -920,6 +982,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                     app.selected_schema,
                     &app.message,
                 );
+            } else if app.view == SQL_VIEW {
+                render_sql_tabs(frame, sections[1], app);
             } else if app.view == 5 {
                 render_relation_detail(frame, sections[1], app);
             } else if app.view == 4 {
@@ -965,9 +1029,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if app.confirm_delete.is_some() {
         "Delete this connection? y: confirm   n/Esc: cancel"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
-        "n: new   e: edit   t: test   c: databases   d: delete   [ / ]: pages   r: reload   Tab: overview   q: quit"
+        "n: new   e: edit   t: test   c: databases   d: delete   s: SQL   [ / ]: pages   r: reload   Tab: overview   q: quit"
+    } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == SQL_VIEW {
+        "[ / ]: switch tab   x: close tab   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
-        "↑/↓: navigate   Enter: schemas   r: reload   Tab/Esc: connections   q: quit"
+        "↑/↓: navigate   Enter: schemas   s: new SQL tab   r: reload   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
         "↑/↓: navigate   Enter: relations   r: reload   Tab/Esc: databases   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 4 {
@@ -975,7 +1041,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
         "↑/↓: navigate columns   r: reload   Tab/Esc: relations   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
-        "Tab/Enter: open Connections   ↑/↓: select   q/Esc: quit"
+        "Tab/Enter: open Connections   s: SQL tabs   ↑/↓: select   q/Esc: quit"
     } else {
         "Tab: next field   Enter: continue/sign in   Esc: quit"
     };
@@ -1065,6 +1131,7 @@ fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App, session: &Auth
         Line::from(format!("User: {}", session.user_id)),
         Line::from(format!("Session lifetime: {} seconds", session.expires_in)),
         Line::from("Select Connections to manage saved PostgreSQL servers."),
+        Line::from("Press s to show open SQL tabs."),
     ]);
     frame.render_widget(
         Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(" Workspace ")),
@@ -1220,6 +1287,51 @@ fn index_line(index: &Index) -> Line<'_> {
             Style::default().fg(Color::DarkGray),
         ),
     ])
+}
+
+fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+    let titles = app.sql_tabs.tabs().iter().map(|tab| {
+        let marker = if tab.dirty { " *" } else { "" };
+        Line::from(format!(
+            "{} {}@{}{marker}",
+            tab.id.get(),
+            tab.database,
+            tab.connection_name
+        ))
+    });
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::ALL).title(" SQL tabs "))
+        .select(app.sql_tabs.active_index())
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        );
+    frame.render_widget(tabs, panes[0]);
+
+    let Some(tab) = app.sql_tabs.active() else {
+        frame.render_widget(Paragraph::new(app.message.as_str()), panes[1]);
+        return;
+    };
+    let title = format!(
+        " {} — {} / {} ",
+        tab.file.as_deref().unwrap_or("untitled"),
+        tab.connection_name,
+        tab.database
+    );
+    let body = if tab.sql.is_empty() {
+        Paragraph::new("No SQL yet.").style(Style::default().fg(Color::DarkGray))
+    } else {
+        Paragraph::new(tab.sql.as_str())
+    };
+    frame.render_widget(
+        body.block(Block::default().borders(Borders::ALL).title(title)),
+        panes[1],
+    );
 }
 
 fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1443,7 +1555,9 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
-    use super::{App, ConnectionForm, LoginField, ScreenState, UiAction, render};
+    use super::{
+        App, ConnectionForm, LoginField, MAX_SQL_TABS, SQL_VIEW, ScreenState, UiAction, render,
+    };
 
     fn client() -> ApiClient {
         ApiClient::new("http://127.0.0.1:3000").expect("valid API URL")
@@ -1774,6 +1888,89 @@ mod tests {
         assert!(rendered.contains("Columns"));
         assert!(rendered.contains("integer  not null, primary key"));
         assert!(rendered.contains("users_pkey  btree (id)  primary, unique"));
+    }
+
+    #[test]
+    fn database_list_opens_sql_tabs_and_sql_view_manages_them() {
+        let mut app = authenticated_app();
+        let connection_id = Uuid::new_v4();
+        app.view = 2;
+        app.catalog_connection = Some(connection_id);
+        app.catalog_connection_name = "local".to_owned();
+        app.databases = vec![
+            Database {
+                name: "app".to_owned(),
+            },
+            Database {
+                name: "analytics".to_owned(),
+            },
+        ];
+        app.selected_database = 1;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.view, SQL_VIEW);
+        let active = app.sql_tabs.active().expect("tab opened");
+        assert_eq!(active.connection_id, connection_id);
+        assert_eq!(active.database, "analytics");
+
+        app.view = 2;
+        app.selected_database = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.sql_tabs.tabs().len(), 2);
+        assert_eq!(app.sql_tabs.active_index(), 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert_eq!(app.sql_tabs.active_index(), 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert_eq!(app.sql_tabs.active_index(), 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render sql tabs");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("1 analytics@local"));
+        assert!(rendered.contains("2 app@local"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.view, SQL_VIEW);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.sql_tabs.tabs().len(), 1);
+        assert_eq!(app.view, SQL_VIEW);
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.sql_tabs.is_empty());
+        assert_eq!(app.view, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.view, 1);
+    }
+
+    #[test]
+    fn opening_sql_tab_beyond_limit_keeps_existing_tabs() {
+        let mut app = authenticated_app();
+        let connection_id = Uuid::new_v4();
+        for _ in 0..MAX_SQL_TABS {
+            app.sql_tabs
+                .open(connection_id, "local", "app")
+                .expect("open tab");
+        }
+        app.view = 2;
+        app.catalog_connection = Some(connection_id);
+        app.databases = vec![Database {
+            name: "app".to_owned(),
+        }];
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.view, 2);
+        assert_eq!(app.sql_tabs.tabs().len(), MAX_SQL_TABS);
+        assert!(app.message.contains("20"));
     }
 
     fn column(name: &str) -> Column {
