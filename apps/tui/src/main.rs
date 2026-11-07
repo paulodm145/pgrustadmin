@@ -13,8 +13,8 @@ use crossterm::{
 use futures_util::StreamExt;
 use pgrustadmin_api_client::{
     ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
-    ConnectionInput, ConnectionTest, Database, Index, Relation, RelationKind, RelationRef, Schema,
-    SqlFile, SqlFileContent,
+    ConnectionInput, ConnectionTest, Database, Execution, ExecutionStatus, Index, Relation,
+    RelationKind, RelationRef, Schema, SqlFile, SqlFileContent,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -23,13 +23,14 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
-use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabFile, TabId};
+use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const RELATION_PAGE_SIZE: usize = 100;
 const FILE_LIST_SIZE: u64 = 100;
+const EXECUTION_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// View index of the SQL tabs section; catalog views use 2..=5.
 const SQL_VIEW: usize = 6;
 const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
@@ -126,6 +127,7 @@ enum UiAction {
     SaveFile(TabId),
     CreateFile(TabId),
     OverwriteFile(TabId),
+    ExecuteSql(TabId),
 }
 
 /// Name typed for "save as" on one SQL tab.
@@ -302,6 +304,10 @@ struct App {
     file_name: String,
     save_conflict: Option<TabId>,
     file_picker: Option<FilePicker>,
+    /// Authenticated client copy for execution polling, which runs beside
+    /// other API operations.
+    execution_client: Option<ApiClient>,
+    executions: Vec<(TabId, JoinHandle<Result<Execution, ApiError>>)>,
     selected_relation: usize,
     relation_page: u64,
     form: Option<ConnectionForm>,
@@ -356,6 +362,8 @@ impl App {
             file_name: String::new(),
             save_conflict: None,
             file_picker: None,
+            execution_client: None,
+            executions: Vec::new(),
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -557,6 +565,17 @@ impl App {
                             }
                         }
                         KeyCode::Char('o') => return UiAction::ListFiles,
+                        KeyCode::Char('e') => {
+                            if let Some(tab) = self.sql_tabs.active() {
+                                if tab.execution == TabExecution::Running {
+                                    self.message = "This tab is already running SQL.".to_owned();
+                                } else if tab.editor.text().trim().is_empty() {
+                                    self.message = "This tab has no SQL to execute.".to_owned();
+                                } else {
+                                    return UiAction::ExecuteSql(tab.id);
+                                }
+                            }
+                        }
                         KeyCode::Char('x') => {
                             if self.sql_tabs.active().is_some_and(SqlTab::is_dirty) {
                                 self.confirm_close_tab = true;
@@ -824,6 +843,73 @@ impl App {
         }
     }
 
+    /// Starts the tab's SQL in a task that polls until the execution ends.
+    fn start_execution(&mut self, tab_id: TabId) {
+        let Some(client) = self.execution_client.clone() else {
+            self.message = "Sign in again to execute SQL.".to_owned();
+            return;
+        };
+        let Some(tab) = self.sql_tabs.get_mut(tab_id) else {
+            return;
+        };
+        let sql = tab.editor.text();
+        let connection_id = tab.connection_id;
+        let database = tab.database.clone();
+        tab.execution = TabExecution::Running;
+        self.message.clear();
+        let handle = tokio::spawn(async move {
+            let started = client
+                .start_execution(connection_id, &database, &sql)
+                .await?;
+            loop {
+                tokio::time::sleep(EXECUTION_POLL_INTERVAL).await;
+                let execution = client.execution(started.id).await?;
+                if execution.status != ExecutionStatus::Running {
+                    return Ok(execution);
+                }
+            }
+        });
+        self.executions.push((tab_id, handle));
+    }
+
+    async fn complete_executions(&mut self) {
+        let (finished, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.executions)
+            .into_iter()
+            .partition(|(_, handle)| handle.is_finished());
+        self.executions = running;
+        for (tab, handle) in finished {
+            let result = handle.await.unwrap_or(Err(ApiError::InvalidResponse));
+            self.finish_execution(tab, result);
+        }
+    }
+
+    fn finish_execution(&mut self, tab_id: TabId, result: Result<Execution, ApiError>) {
+        let Some(tab) = self.sql_tabs.get_mut(tab_id) else {
+            return;
+        };
+        tab.execution = match result {
+            Ok(Execution {
+                status: ExecutionStatus::Succeeded,
+                result: Some(result),
+                ..
+            }) => TabExecution::Succeeded(result),
+            Ok(Execution {
+                error: Some(error), ..
+            }) => TabExecution::Failed {
+                code: error.code,
+                message: error.message,
+            },
+            Ok(_) => TabExecution::Failed {
+                code: None,
+                message: "The API returned an incomplete execution.".to_owned(),
+            },
+            Err(error) => TabExecution::Failed {
+                code: None,
+                message: execution_error_message(error).to_owned(),
+            },
+        };
+    }
+
     fn request_quit(&mut self) {
         let dirty = self.sql_tabs.dirty_count();
         if dirty == 0 {
@@ -835,7 +921,14 @@ impl App {
     }
 
     fn close_sql_tab(&mut self) {
-        self.sql_tabs.close_active();
+        if let Some(closed) = self.sql_tabs.close_active() {
+            self.executions.retain(|(tab, handle)| {
+                if *tab == closed.id {
+                    handle.abort();
+                }
+                *tab != closed.id
+            });
+        }
         if self.sql_tabs.is_empty() {
             self.view = 1;
             self.message = "All SQL tabs are closed.".to_owned();
@@ -948,6 +1041,10 @@ impl App {
                 self.message = "Loading SQL files…".to_owned();
             }
             UiAction::OpenFile(_) => self.message = "Opening SQL file…".to_owned(),
+            UiAction::ExecuteSql(_) => {
+                self.client = Some(client);
+                return;
+            }
             UiAction::SaveFile(_) | UiAction::CreateFile(_) | UiAction::OverwriteFile(_) => {
                 self.message = "Saving SQL file…".to_owned();
             }
@@ -1014,6 +1111,7 @@ impl App {
         match result {
             OperationResult::Login(Ok(session)) => {
                 self.state = ScreenState::Authenticated(session);
+                self.execution_client = self.client.clone();
                 self.start_operation(
                     Operation::LoadConnections {
                         page: self.connection_page,
@@ -1237,6 +1335,24 @@ impl App {
     }
 }
 
+fn execution_error_message(error: ApiError) -> &'static str {
+    match error {
+        ApiError::Http {
+            code: Some("execution_limit_reached"),
+            ..
+        } => "Too many SQL executions are running. Wait for one to finish.",
+        ApiError::Http {
+            code: Some("not_found"),
+            ..
+        } => "The connection or execution is no longer available.",
+        ApiError::Http {
+            code: Some("credential_encryption_unavailable"),
+            ..
+        } => "The server cannot decrypt saved credentials.",
+        error => api_error_message(error),
+    }
+}
+
 fn file_error_message(error: ApiError) -> &'static str {
     match error {
         ApiError::Http {
@@ -1312,6 +1428,7 @@ async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Resul
             }
             _ = redraw.tick() => {
                 app.complete_operation_if_ready().await;
+                app.complete_executions().await;
                 terminal.draw(|frame| render(frame, &app))?;
             }
         }
@@ -1322,6 +1439,10 @@ async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Resul
 fn start_action(app: &mut App, action: UiAction) {
     let operation = match action {
         UiAction::None => return,
+        UiAction::ExecuteSql(tab) => {
+            app.start_execution(tab);
+            return;
+        }
         UiAction::Login => Operation::Login,
         UiAction::LoadConnections(page) => Operation::LoadConnections { page },
         UiAction::LoadDatabases(connection_id) => Operation::LoadDatabases { connection_id },
@@ -1466,7 +1587,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
         "n: new   e: edit   t: test   c: databases   d: delete   s: SQL   [ / ]: pages   r: reload   Tab: overview   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == SQL_VIEW {
-        "Enter/i: edit   w: save   W: save as   o: open   [ / ]: tabs   x: close   Tab/Esc: back   q: quit"
+        "Enter/i: edit  e: run  w/W: save/as  o: open  [ ]: tabs  x: close  Esc: back  q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
         "↑/↓: navigate   Enter: schemas   s: new SQL tab   r: reload   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
@@ -1730,16 +1851,29 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(area);
+    let execution = app
+        .sql_tabs
+        .active()
+        .map(|tab| execution_line(&tab.execution))
+        .unwrap_or_default();
     frame.render_widget(
-        Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Yellow)),
+        Paragraph::new(vec![
+            execution,
+            Line::styled(app.message.as_str(), Style::default().fg(Color::Yellow)),
+        ]),
         panes[2],
     );
     render_file_overlays(frame, panes[1], app);
     let titles = app.sql_tabs.tabs().iter().map(|tab| {
-        let marker = if tab.is_dirty() { " *" } else { "" };
+        let marker = match (tab.is_dirty(), tab.execution == TabExecution::Running) {
+            (true, true) => " * …",
+            (true, false) => " *",
+            (false, true) => " …",
+            (false, false) => "",
+        };
         Line::from(format!(
             "{} {}@{}{marker}",
             tab.id.get(),
@@ -1806,6 +1940,30 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let x = u16::try_from(col - scroll_col).unwrap_or(inner.width);
         let y = u16::try_from(row - scroll_row).unwrap_or(inner.height);
         frame.set_cursor_position((inner.x.saturating_add(x), inner.y.saturating_add(y)));
+    }
+}
+
+fn execution_line(execution: &TabExecution) -> Line<'static> {
+    match execution {
+        TabExecution::Idle => Line::default(),
+        TabExecution::Running => Line::styled("Running…", Style::default().fg(Color::Cyan)),
+        TabExecution::Succeeded(result) => Line::styled(
+            format!(
+                "Succeeded: {} statement(s); last returned {} row(s), affected {}.",
+                result.statement_count, result.rows_returned, result.rows_affected
+            ),
+            Style::default().fg(Color::Green),
+        ),
+        TabExecution::Failed { code, message } => {
+            let code = code
+                .as_deref()
+                .map(|code| format!(" [{code}]"))
+                .unwrap_or_default();
+            Line::styled(
+                format!("Failed{code}: {message}"),
+                Style::default().fg(Color::Red),
+            )
+        }
     }
 }
 
@@ -2137,15 +2295,16 @@ async fn run_operation(
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pgrustadmin_api_client::{
-        ApiClient, ApiError, AuthSession, Column, Connection, Database, Index, Relation,
-        RelationKind, Schema, SqlFile, SqlFileContent,
+        ApiClient, ApiError, AuthSession, Column, Connection, Database, Execution, ExecutionError,
+        ExecutionResult, ExecutionStatus, Index, Relation, RelationKind, Schema, SqlFile,
+        SqlFileContent,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
     use super::{
         App, ConnectionForm, LoginField, MAX_SQL_TABS, OperationResult, SQL_VIEW, ScreenState,
-        UiAction, render,
+        TabExecution, UiAction, render,
     };
 
     fn client() -> ApiClient {
@@ -2846,6 +3005,123 @@ mod tests {
         app.apply_result(OperationResult::Files(Ok(Vec::new())));
         assert!(app.file_picker.is_none());
         assert!(app.message.contains("No saved SQL files"));
+    }
+
+    fn execution(status: ExecutionStatus) -> Execution {
+        Execution {
+            id: Uuid::new_v4(),
+            connection_id: Uuid::new_v4(),
+            database: "app".to_owned(),
+            status,
+            result: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn execute_key_runs_non_empty_sql_once_per_tab() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('e')),
+            UiAction::None
+        ));
+        assert!(app.message.contains("no SQL"));
+
+        app.sql_tabs
+            .active_mut()
+            .expect("active tab")
+            .editor
+            .insert_str("SELECT 1;");
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('e')),
+            UiAction::ExecuteSql(id) if id == tab_id
+        ));
+        app.sql_tabs.active_mut().expect("active tab").execution = TabExecution::Running;
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('e')),
+            UiAction::None
+        ));
+        assert!(app.message.contains("already running"));
+    }
+
+    #[test]
+    fn finished_executions_update_their_tab_and_render() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        app.finish_execution(
+            tab_id,
+            Ok(Execution {
+                result: Some(ExecutionResult {
+                    statement_count: 3,
+                    rows_returned: 2,
+                    rows_affected: 2,
+                }),
+                ..execution(ExecutionStatus::Succeeded)
+            }),
+        );
+        let render_text = |app: &App| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
+            terminal
+                .draw(|frame| render(frame, app))
+                .expect("render execution state");
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(
+            render_text(&app)
+                .contains("Succeeded: 3 statement(s); last returned 2 row(s), affected 2.")
+        );
+
+        app.finish_execution(
+            tab_id,
+            Ok(Execution {
+                error: Some(ExecutionError {
+                    code: Some("42601".to_owned()),
+                    message: "syntax error at or near \"SELEC\"".to_owned(),
+                }),
+                ..execution(ExecutionStatus::Failed)
+            }),
+        );
+        assert!(render_text(&app).contains("Failed [42601]: syntax error at or near \"SELEC\""));
+
+        app.finish_execution(
+            tab_id,
+            Err(ApiError::Http {
+                status: 429,
+                code: Some("execution_limit_reached"),
+            }),
+        );
+        assert!(render_text(&app).contains("Too many SQL executions are running"));
+
+        let closed = app
+            .sql_tabs
+            .open(Uuid::new_v4(), "local", "other")
+            .expect("open tab");
+        app.sql_tabs.close_active();
+        app.finish_execution(closed, Err(ApiError::Transport));
+        assert_eq!(
+            app.sql_tabs.tabs().len(),
+            1,
+            "results for closed tabs are dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_tab_stops_tracking_its_execution() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        app.executions
+            .push((tab_id, tokio::spawn(std::future::pending())));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.sql_tabs.is_empty());
+        assert!(app.executions.is_empty());
     }
 
     fn column(name: &str) -> Column {

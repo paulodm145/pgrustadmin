@@ -11,6 +11,9 @@ const API_BASE_URL_ENV: &str = "PGRUSTADMIN_API_BASE_URL";
 const DEFAULT_API_BASE_URL: &str = "http://127.0.0.1:3000";
 const API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Cloning shares the HTTP connection pool and copies the session token, so
+/// long-running work such as execution polling can run beside other calls.
+#[derive(Clone)]
 pub struct ApiClient {
     base_url: Url,
     http: Client,
@@ -247,6 +250,48 @@ struct UpdateSqlFileRequest<'a> {
     expected_sha256: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct ExecutionResult {
+    pub statement_count: u64,
+    pub rows_returned: u64,
+    pub rows_affected: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ExecutionError {
+    pub code: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Execution {
+    pub id: Uuid,
+    pub connection_id: Uuid,
+    pub database: String,
+    pub status: ExecutionStatus,
+    pub result: Option<ExecutionResult>,
+    pub error: Option<ExecutionError>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct StartedExecution {
+    pub id: Uuid,
+    pub status: ExecutionStatus,
+}
+
+#[derive(Serialize)]
+struct ExecutionRequest<'a> {
+    sql: &'a str,
+}
+
 /// Identifies one relation in the catalog of a saved connection.
 #[derive(Clone, Copy, Debug)]
 pub struct RelationRef<'a> {
@@ -428,6 +473,26 @@ impl ApiClient {
         expect_no_content(response).await
     }
 
+    pub async fn start_execution(
+        &self,
+        connection_id: Uuid,
+        database: &str,
+        sql: &str,
+    ) -> Result<StartedExecution, ApiError> {
+        let database = utf8_percent_encode(database, NON_ALPHANUMERIC);
+        self.send_json(
+            Method::POST,
+            &format!("api/v1/connections/{connection_id}/databases/{database}/executions"),
+            &ExecutionRequest { sql },
+        )
+        .await
+    }
+
+    pub async fn execution(&self, id: Uuid) -> Result<Execution, ApiError> {
+        self.get_json(&format!("api/v1/executions/{id}"), true)
+            .await
+    }
+
     pub async fn test_connection(&self, id: Uuid) -> Result<ConnectionTest, ApiError> {
         let request = self.request(Method::POST, &format!("api/v1/connections/{id}/test"), true)?;
         decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
@@ -570,6 +635,7 @@ async fn http_error(response: reqwest::Response) -> ApiError {
             "file_conflict" => Some("file_conflict"),
             "file_too_large" => Some("file_too_large"),
             "file_storage_unavailable" => Some("file_storage_unavailable"),
+            "execution_limit_reached" => Some("execution_limit_reached"),
             _ => None,
         });
     ApiError::Http { status, code }
@@ -756,6 +822,33 @@ mod tests {
                 })
                 .delete(|| async { axum::http::StatusCode::NO_CONTENT }),
             )
+            .route(
+                "/api/v1/connections/{id}/databases/{database}/executions",
+                post(|Path((_, database)): Path<(Uuid, String)>| async move {
+                    if database == "busy db" {
+                        return (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            Json(serde_json::json!({"error": "execution_limit_reached"})),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::ACCEPTED,
+                        Json(serde_json::json!({"id": SQL_FILE_ID, "status": "running"})),
+                    )
+                }),
+            )
+            .route(
+                "/api/v1/executions/{id}",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "id": SQL_FILE_ID,
+                        "connection_id": SQL_FILE_ID,
+                        "database": "app",
+                        "status": "failed",
+                        "error": {"code": "42601", "message": "syntax error"},
+                    }))
+                }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -900,6 +993,28 @@ mod tests {
             })
         );
         client.delete_sql_file(file_id).await.expect("delete file");
+        let started = client
+            .start_execution(file_id, "app", "SELEC 1")
+            .await
+            .expect("start execution");
+        assert_eq!(started.status, super::ExecutionStatus::Running);
+        assert_eq!(
+            client.start_execution(file_id, "busy db", "SELECT 1").await,
+            Err(ApiError::Http {
+                status: 429,
+                code: Some("execution_limit_reached"),
+            })
+        );
+        let execution = client.execution(started.id).await.expect("execution");
+        assert_eq!(execution.status, super::ExecutionStatus::Failed);
+        assert_eq!(execution.result, None);
+        assert_eq!(
+            execution.error,
+            Some(super::ExecutionError {
+                code: Some("42601".to_owned()),
+                message: "syntax error".to_owned(),
+            })
+        );
         client.logout().await.expect("logout succeeds");
         assert_eq!(
             client.current_session().await,

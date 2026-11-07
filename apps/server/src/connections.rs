@@ -239,11 +239,11 @@ struct IndexResponse {
 /// PostgreSQL identifiers are truncated beyond NAMEDATALEN - 1 bytes.
 const MAX_IDENTIFIER_BYTES: usize = 63;
 
-fn is_valid_identifier(name: &str) -> bool {
+pub(crate) fn is_valid_identifier(name: &str) -> bool {
     !name.is_empty() && name.len() <= MAX_IDENTIFIER_BYTES && !name.contains('\0')
 }
 
-enum SavedConnectionError {
+pub(crate) enum SavedConnectionError {
     NotFound,
     CredentialKeyUnavailable,
     Internal,
@@ -260,7 +260,7 @@ impl IntoResponse for SavedConnectionError {
 }
 
 /// Loads an owner's saved connection and decrypts its password in memory.
-async fn load_saved_connection(
+pub(crate) async fn load_saved_connection(
     pool: &PgPool,
     owner_id: Uuid,
     connection_id: Uuid,
