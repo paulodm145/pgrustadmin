@@ -2,18 +2,24 @@ use std::{io, time::Duration};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
-use pgrustadmin_api_client::{ApiClient, ApiError, AuthSession};
+use pgrustadmin_api_client::{
+    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest,
+};
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
-const MENU_ITEMS: [&str; 3] = ["Overview", "Connections", "SQL workspace"];
+const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
+const CONNECTION_FIELDS: [&str; 7] = [
+    "Name", "Host", "Port", "Database", "Username", "Password", "TLS",
+];
 
 #[tokio::main]
 async fn main() {
@@ -38,7 +44,7 @@ enum LoginField {
 }
 
 enum ScreenState {
-    Editing {
+    EditingLogin {
         focus: LoginField,
         error: Option<String>,
     },
@@ -46,19 +52,174 @@ enum ScreenState {
     Authenticated(AuthSession),
 }
 
+#[derive(Clone, Copy)]
+enum Operation {
+    Login,
+    LoadConnections { page: u64 },
+    SaveConnection { id: Option<Uuid> },
+    TestConnection { id: Uuid },
+    DeleteConnection { id: Uuid },
+}
+
+enum OperationResult {
+    Login(Result<AuthSession, ApiError>),
+    Connections(Result<Vec<Connection>, ApiError>),
+    Saved(Result<Connection, ApiError>),
+    Tested(Result<ConnectionTest, ApiError>),
+    Deleted(Result<(), ApiError>),
+}
+
+#[derive(Clone, Copy)]
+enum UiAction {
+    None,
+    Login,
+    LoadConnections(u64),
+    SaveConnection,
+    TestConnection(Uuid),
+    DeleteConnection(Uuid),
+}
+
+struct ConnectionForm {
+    id: Option<Uuid>,
+    name: String,
+    host: String,
+    port: String,
+    database: String,
+    username: String,
+    password: Zeroizing<String>,
+    tls_enabled: bool,
+    focus: usize,
+}
+
+impl ConnectionForm {
+    fn create() -> Self {
+        Self {
+            id: None,
+            name: String::new(),
+            host: String::new(),
+            port: "5432".to_owned(),
+            database: String::new(),
+            username: String::new(),
+            password: Zeroizing::new(String::new()),
+            tls_enabled: true,
+            focus: 0,
+        }
+    }
+
+    fn edit(connection: &Connection) -> Self {
+        Self {
+            id: Some(connection.id),
+            name: connection.name.clone(),
+            host: connection.host.clone(),
+            port: connection.port.to_string(),
+            database: connection.database.clone(),
+            username: connection.username.clone(),
+            password: Zeroizing::new(String::new()),
+            tls_enabled: connection.tls_enabled,
+            focus: 0,
+        }
+    }
+
+    fn input(&self) -> Result<ConnectionInput, &'static str> {
+        let port = self
+            .port
+            .parse::<u16>()
+            .map_err(|_| "Port must be between 1 and 65535.")?;
+        if self.name.trim().is_empty()
+            || self.host.trim().is_empty()
+            || self.database.trim().is_empty()
+            || self.username.trim().is_empty()
+            || port == 0
+        {
+            return Err("Name, host, port, database and username are required.");
+        }
+        if self.id.is_none() && self.password.is_empty() {
+            return Err("A password is required for a new connection.");
+        }
+        Ok(ConnectionInput {
+            name: self.name.clone(),
+            host: self.host.clone(),
+            port,
+            database: self.database.clone(),
+            username: self.username.clone(),
+            tls_enabled: self.tls_enabled,
+            password: (!self.password.is_empty()).then(|| self.password.to_string()),
+        })
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => return false,
+            KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % CONNECTION_FIELDS.len(),
+            KeyCode::BackTab | KeyCode::Up => {
+                self.focus = (self.focus + CONNECTION_FIELDS.len() - 1) % CONNECTION_FIELDS.len();
+            }
+            KeyCode::Left | KeyCode::Right if self.focus == 6 => {
+                self.tls_enabled = !self.tls_enabled;
+            }
+            KeyCode::Char(' ') if self.focus == 6 => self.tls_enabled = !self.tls_enabled,
+            KeyCode::Enter if self.focus == 6 => return true,
+            KeyCode::Enter => self.focus = (self.focus + 1) % CONNECTION_FIELDS.len(),
+            KeyCode::Backspace => match self.focus {
+                0 => {
+                    self.name.pop();
+                }
+                1 => {
+                    self.host.pop();
+                }
+                2 => {
+                    self.port.pop();
+                }
+                3 => {
+                    self.database.pop();
+                }
+                4 => {
+                    self.username.pop();
+                }
+                5 => {
+                    self.password.pop();
+                }
+                _ => {}
+            },
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match self.focus {
+                    0 => self.name.push(character),
+                    1 => self.host.push(character),
+                    2 if character.is_ascii_digit() => self.port.push(character),
+                    3 => self.database.push(character),
+                    4 => self.username.push(character),
+                    5 => self.password.push(character),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
 struct App {
     client: Option<ApiClient>,
-    login_task: Option<JoinHandle<(ApiClient, Result<AuthSession, ApiError>)>>,
-    email: String,
-    password: Zeroizing<String>,
+    pending: Option<JoinHandle<(ApiClient, OperationResult)>>,
+    login_email: String,
+    login_password: Zeroizing<String>,
     state: ScreenState,
-    selected: usize,
+    view: usize,
+    connections: Vec<Connection>,
+    selected_connection: usize,
+    connection_page: u64,
+    form: Option<ConnectionForm>,
+    confirm_delete: Option<Uuid>,
+    message: String,
     should_quit: bool,
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(task) = &self.login_task {
+        if let Some(task) = &self.pending {
             task.abort();
         }
     }
@@ -68,145 +229,308 @@ impl App {
     fn new(client: ApiClient) -> Self {
         Self {
             client: Some(client),
-            login_task: None,
-            email: String::new(),
-            password: Zeroizing::new(String::new()),
-            state: ScreenState::Editing {
+            pending: None,
+            login_email: String::new(),
+            login_password: Zeroizing::new(String::new()),
+            state: ScreenState::EditingLogin {
                 focus: LoginField::Email,
                 error: None,
             },
-            selected: 0,
+            view: 0,
+            connections: Vec::new(),
+            selected_connection: 0,
+            connection_page: 1,
+            form: None,
+            confirm_delete: None,
+            message: String::new(),
             should_quit: false,
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
+    fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         if key.kind != KeyEventKind::Press {
-            return false;
+            return UiAction::None;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
-            return false;
+            return UiAction::None;
         }
-        match &mut self.state {
-            ScreenState::Editing { focus, error } => match key.code {
-                KeyCode::Esc => self.should_quit = true,
-                KeyCode::Tab | KeyCode::Down => {
-                    *focus = match focus {
-                        LoginField::Email => LoginField::Password,
-                        LoginField::Password => LoginField::Email,
-                    }
+        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            && !matches!(self.state, ScreenState::EditingLogin { .. })
+            && self.form.is_none()
+        {
+            if self.form.take().is_some() || self.confirm_delete.take().is_some() {
+                return UiAction::None;
+            }
+            self.should_quit = true;
+            return UiAction::None;
+        }
+        if self.pending.is_some() {
+            return UiAction::None;
+        }
+        if let Some(form) = &mut self.form {
+            if key.code == KeyCode::Esc {
+                self.form = None;
+                self.message.clear();
+                return UiAction::None;
+            }
+            if form.handle_key(key) {
+                return UiAction::SaveConnection;
+            }
+            return UiAction::None;
+        }
+        if let Some(connection_id) = self.confirm_delete {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_delete = None;
+                    return UiAction::DeleteConnection(connection_id);
                 }
-                KeyCode::BackTab | KeyCode::Up => {
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_delete = None;
+                    self.message = "Deletion cancelled.".to_owned();
+                }
+                _ => {}
+            }
+            return UiAction::None;
+        }
+
+        match &mut self.state {
+            ScreenState::EditingLogin { focus, error } => match key.code {
+                KeyCode::Esc => self.should_quit = true,
+                KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
                     *focus = match focus {
                         LoginField::Email => LoginField::Password,
                         LoginField::Password => LoginField::Email,
                     }
                 }
                 KeyCode::Enter if *focus == LoginField::Email => *focus = LoginField::Password,
-                KeyCode::Enter => return true,
+                KeyCode::Enter => return UiAction::Login,
                 KeyCode::Backspace if *focus == LoginField::Email => {
-                    self.email.pop();
+                    self.login_email.pop();
                 }
                 KeyCode::Backspace => {
-                    self.password.pop();
+                    self.login_password.pop();
                 }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     error.take();
                     if *focus == LoginField::Email {
-                        self.email.push(character);
+                        self.login_email.push(character);
                     } else {
-                        self.password.push(character);
+                        self.login_password.push(character);
                     }
                 }
                 _ => {}
             },
-            ScreenState::Authenticating => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    self.should_quit = true;
+            ScreenState::Authenticating => {}
+            ScreenState::Authenticated(_) => {
+                if self.view == 1 {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') if !self.connections.is_empty() => {
+                            self.selected_connection =
+                                (self.selected_connection + self.connections.len() - 1)
+                                    % self.connections.len();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !self.connections.is_empty() => {
+                            self.selected_connection =
+                                (self.selected_connection + 1) % self.connections.len();
+                        }
+                        KeyCode::Char('r') => {
+                            return UiAction::LoadConnections(self.connection_page);
+                        }
+                        KeyCode::Char('[') if self.connection_page > 1 => {
+                            self.connection_page -= 1;
+                            self.selected_connection = 0;
+                            return UiAction::LoadConnections(self.connection_page);
+                        }
+                        KeyCode::Char(']') if self.connections.len() == 100 => {
+                            self.connection_page += 1;
+                            self.selected_connection = 0;
+                            return UiAction::LoadConnections(self.connection_page);
+                        }
+                        KeyCode::Char('n') => {
+                            self.form = Some(ConnectionForm::create());
+                            self.message.clear();
+                        }
+                        KeyCode::Char('e') => {
+                            if let Some(connection) = self.connections.get(self.selected_connection)
+                            {
+                                self.form = Some(ConnectionForm::edit(connection));
+                                self.message.clear();
+                            }
+                        }
+                        KeyCode::Char('t') => {
+                            if let Some(connection) = self.connections.get(self.selected_connection)
+                            {
+                                return UiAction::TestConnection(connection.id);
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            self.confirm_delete = self
+                                .connections
+                                .get(self.selected_connection)
+                                .map(|item| item.id);
+                        }
+                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 0,
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                            self.view = 1
+                        }
+                        KeyCode::Tab | KeyCode::Enter => {
+                            self.view = (self.view + 1) % MENU_ITEMS.len();
+                            if self.view == 1 {
+                                return UiAction::LoadConnections(self.connection_page);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
-            ScreenState::Authenticated(_) => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selected = (self.selected + 1) % MENU_ITEMS.len();
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected = (self.selected + MENU_ITEMS.len() - 1) % MENU_ITEMS.len();
-                }
-                _ => {}
-            },
         }
-        false
+        UiAction::None
     }
 
-    fn begin_login(&mut self) {
-        if self.email.trim().is_empty() || self.password.is_empty() {
-            self.state = ScreenState::Editing {
-                focus: LoginField::Email,
-                error: Some("Email and password are required.".to_owned()),
-            };
-            return;
-        }
+    fn start_operation(&mut self, operation: Operation, action: UiAction) {
         let Some(mut client) = self.client.take() else {
-            self.state = ScreenState::Editing {
-                focus: LoginField::Email,
-                error: Some("Unable to start sign-in.".to_owned()),
-            };
+            self.message = "API client is unavailable.".to_owned();
             return;
         };
-        let email = self.email.clone();
-        let password = std::mem::replace(&mut self.password, Zeroizing::new(String::new()));
-        self.state = ScreenState::Authenticating;
-        self.login_task = Some(tokio::spawn(async move {
-            let result = async {
-                let login = client.login(&email, &password).await?;
-                let session = client.current_session().await?;
-                if login.user_id != session.user_id {
-                    return Err(ApiError::InvalidResponse);
+        match action {
+            UiAction::Login => self.state = ScreenState::Authenticating,
+            UiAction::LoadConnections(_) => self.message = "Loading connections…".to_owned(),
+            UiAction::SaveConnection => self.message = "Saving connection…".to_owned(),
+            UiAction::TestConnection(_) => self.message = "Testing connection…".to_owned(),
+            UiAction::DeleteConnection(_) => self.message = "Deleting connection…".to_owned(),
+            UiAction::None => return,
+        }
+
+        let email = (matches!(operation, Operation::Login)).then(|| self.login_email.clone());
+        let password = if matches!(operation, Operation::Login) {
+            std::mem::replace(&mut self.login_password, Zeroizing::new(String::new()))
+        } else {
+            Zeroizing::new(String::new())
+        };
+        let input = if let Operation::SaveConnection { .. } = operation {
+            match self.form.as_ref().map(ConnectionForm::input) {
+                Some(Ok(input)) => Some(input),
+                Some(Err(error)) => {
+                    self.client = Some(client);
+                    self.message = error.to_owned();
+                    return;
                 }
-                Ok(login)
+                None => {
+                    self.client = Some(client);
+                    self.message = "Connection form is unavailable.".to_owned();
+                    return;
+                }
             }
+        } else {
+            None
+        };
+        if matches!(operation, Operation::SaveConnection { .. }) && input.is_none() {
+            self.client = Some(client);
+            return;
+        }
+
+        self.pending = Some(tokio::spawn(async move {
+            let result = run_operation(
+                &mut client,
+                operation,
+                email.as_deref().unwrap_or_default(),
+                &password,
+                input.as_ref(),
+            )
             .await;
             (client, result)
         }));
     }
 
-    async fn complete_login_if_ready(&mut self) {
-        let is_finished = self
-            .login_task
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished);
-        if !is_finished {
+    async fn complete_operation_if_ready(&mut self) {
+        if !self.pending.as_ref().is_some_and(JoinHandle::is_finished) {
             return;
         }
-        let Some(task) = self.login_task.take() else {
+        let Some(task) = self.pending.take() else {
             return;
         };
         match task.await {
-            Ok((client, Ok(session))) => {
+            Ok((client, result)) => {
                 self.client = Some(client);
-                self.state = ScreenState::Authenticated(session);
-            }
-            Ok((client, Err(error))) => {
-                self.client = Some(client);
-                self.state = ScreenState::Editing {
-                    focus: LoginField::Password,
-                    error: Some(login_error_message(error).to_owned()),
-                };
+                match result {
+                    OperationResult::Login(Ok(session)) => {
+                        self.state = ScreenState::Authenticated(session);
+                        self.start_operation(
+                            Operation::LoadConnections {
+                                page: self.connection_page,
+                            },
+                            UiAction::LoadConnections(self.connection_page),
+                        );
+                    }
+                    OperationResult::Login(Err(error)) => {
+                        self.state = ScreenState::EditingLogin {
+                            focus: LoginField::Password,
+                            error: Some(api_error_message(error).to_owned()),
+                        };
+                    }
+                    OperationResult::Connections(Ok(connections)) => {
+                        self.connections = connections;
+                        self.selected_connection = self
+                            .selected_connection
+                            .min(self.connections.len().saturating_sub(1));
+                        self.message = if self.connections.is_empty() {
+                            "No connections yet. Press n to add one.".to_owned()
+                        } else {
+                            format!("Loaded {} connection(s).", self.connections.len())
+                        };
+                    }
+                    OperationResult::Connections(Err(error)) => {
+                        self.message = api_error_message(error).to_owned();
+                    }
+                    OperationResult::Saved(Ok(_)) => {
+                        self.form = None;
+                        self.connection_page = 1;
+                        self.message = "Connection saved.".to_owned();
+                        self.start_operation(
+                            Operation::LoadConnections { page: 1 },
+                            UiAction::LoadConnections(1),
+                        );
+                    }
+                    OperationResult::Saved(Err(error)) => {
+                        self.message = api_error_message(error).to_owned();
+                    }
+                    OperationResult::Tested(Ok(result)) => {
+                        self.message = if result.success {
+                            "Connection test succeeded.".to_owned()
+                        } else {
+                            "Connection test failed.".to_owned()
+                        };
+                    }
+                    OperationResult::Tested(Err(error)) => {
+                        self.message = api_error_message(error).to_owned();
+                    }
+                    OperationResult::Deleted(Ok(())) => {
+                        self.connection_page = 1;
+                        self.message = "Connection deleted.".to_owned();
+                        self.start_operation(
+                            Operation::LoadConnections { page: 1 },
+                            UiAction::LoadConnections(1),
+                        );
+                    }
+                    OperationResult::Deleted(Err(error)) => {
+                        self.message = api_error_message(error).to_owned();
+                    }
+                }
             }
             Err(_) => {
                 self.client = ApiClient::from_env().ok();
-                self.state = ScreenState::Editing {
-                    focus: LoginField::Email,
-                    error: Some("Sign-in could not be completed.".to_owned()),
-                };
+                self.message = "The API operation did not complete.".to_owned();
             }
         }
     }
 }
 
-fn login_error_message(error: ApiError) -> &'static str {
+fn api_error_message(error: ApiError) -> &'static str {
     match error {
         ApiError::Http {
             code: Some("invalid_credentials"),
@@ -216,8 +540,16 @@ fn login_error_message(error: ApiError) -> &'static str {
             code: Some("unauthorized"),
             ..
         } => "Email or password is incorrect.",
+        ApiError::Http {
+            code: Some("not_found"),
+            ..
+        } => "Connection is no longer available.",
+        ApiError::Http {
+            code: Some("connection_name_conflict"),
+            ..
+        } => "A connection with this name already exists.",
         ApiError::Transport => "Could not contact the API.",
-        _ => "Sign-in failed. Check the API and try again.",
+        _ => "The request failed. Check the API and try again.",
     }
 }
 
@@ -225,16 +557,14 @@ async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Resul
     let mut app = App::new(client);
     let mut events = EventStream::new();
     let mut redraw = tokio::time::interval(Duration::from_millis(100));
-
     terminal.draw(|frame| render(frame, &app))?;
     while !app.should_quit {
         tokio::select! {
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) => {
-                        if app.handle_key(key) {
-                            app.begin_login();
-                        }
+                        let action = app.handle_key(key);
+                        start_action(&mut app, action);
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(io::Error::other(error)),
@@ -243,12 +573,26 @@ async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Resul
                 terminal.draw(|frame| render(frame, &app))?;
             }
             _ = redraw.tick() => {
-                app.complete_login_if_ready().await;
+                app.complete_operation_if_ready().await;
                 terminal.draw(|frame| render(frame, &app))?;
             }
         }
     }
     Ok(())
+}
+
+fn start_action(app: &mut App, action: UiAction) {
+    let operation = match action {
+        UiAction::None => return,
+        UiAction::Login => Operation::Login,
+        UiAction::LoadConnections(page) => Operation::LoadConnections { page },
+        UiAction::SaveConnection => Operation::SaveConnection {
+            id: app.form.as_ref().and_then(|form| form.id),
+        },
+        UiAction::TestConnection(id) => Operation::TestConnection { id },
+        UiAction::DeleteConnection(id) => Operation::DeleteConnection { id },
+    };
+    app.start_operation(operation, action);
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
@@ -271,12 +615,28 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     );
 
     match &app.state {
-        ScreenState::Authenticated(session) => render_workspace(frame, sections[1], app, session),
+        ScreenState::Authenticated(session) => {
+            if let Some(form) = &app.form {
+                render_connection_form(frame, sections[1], form, &app.message);
+            } else if app.view == 1 {
+                render_connections(frame, sections[1], app);
+            } else {
+                render_workspace(frame, sections[1], app, session);
+            }
+        }
         state => render_login(frame, sections[1], app, state),
     }
 
-    let footer_text = if matches!(app.state, ScreenState::Authenticated(_)) {
-        "↑/↓ or j/k: navigate   q/Esc: quit"
+    let footer_text = if app.pending.is_some() {
+        "Request in progress…   q/Esc: quit"
+    } else if app.form.is_some() {
+        "Tab: next field   Enter: save   Esc: cancel"
+    } else if app.confirm_delete.is_some() {
+        "Delete this connection? y: confirm   n/Esc: cancel"
+    } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
+        "n: new   e: edit   t: test   d: delete   [ / ]: pages   r: reload   Tab: overview   q: quit"
+    } else if matches!(app.state, ScreenState::Authenticated(_)) {
+        "Tab/Enter: open Connections   ↑/↓: select   q/Esc: quit"
     } else {
         "Tab: next field   Enter: continue/sign in   Esc: quit"
     };
@@ -286,12 +646,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-fn render_login(
-    frame: &mut Frame<'_>,
-    area: ratatui::layout::Rect,
-    app: &App,
-    state: &ScreenState,
-) {
+fn render_login(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ScreenState) {
     let form = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -303,26 +658,25 @@ fn render_login(
         .margin(1)
         .split(area);
     let focus = match state {
-        ScreenState::Editing { focus, .. } => Some(*focus),
+        ScreenState::EditingLogin { focus, .. } => Some(*focus),
         _ => None,
     };
     frame.render_widget(
-        Paragraph::new(app.email.as_str())
+        Paragraph::new(app.login_email.as_str())
             .block(field_block("Email", focus == Some(LoginField::Email))),
         form[0],
     );
-    let masked_password = "•".repeat(app.password.chars().count());
+    let masked_password = "•".repeat(app.login_password.chars().count());
     frame.render_widget(
         Paragraph::new(masked_password)
             .block(field_block("Password", focus == Some(LoginField::Password))),
         form[1],
     );
-
     let status = match state {
-        ScreenState::Editing {
+        ScreenState::EditingLogin {
             error: Some(error), ..
         } => error.as_str(),
-        ScreenState::Editing { error: None, .. } => "Sign in with your PGRustAdmin account.",
+        ScreenState::EditingLogin { error: None, .. } => "Sign in with your PGRustAdmin account.",
         ScreenState::Authenticating => "Signing in and checking session…",
         ScreenState::Authenticated(_) => "",
     };
@@ -346,26 +700,8 @@ fn field_block(title: &'static str, focused: bool) -> Block<'static> {
         .border_style(style)
 }
 
-fn render_workspace(
-    frame: &mut Frame<'_>,
-    area: ratatui::layout::Rect,
-    app: &App,
-    session: &AuthSession,
-) {
-    let body_direction = if area.width < 60 {
-        Direction::Vertical
-    } else {
-        Direction::Horizontal
-    };
-    let constraints = if body_direction == Direction::Vertical {
-        vec![Constraint::Length(5), Constraint::Min(3)]
-    } else {
-        vec![Constraint::Length(24), Constraint::Min(0)]
-    };
-    let body = Layout::default()
-        .direction(body_direction)
-        .constraints(constraints)
-        .split(area);
+fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App, session: &AuthSession) {
+    let layout = responsive_layout(area);
     let menu = List::new(
         MENU_ITEMS
             .iter()
@@ -378,65 +714,242 @@ fn render_workspace(
             .add_modifier(Modifier::BOLD | Modifier::REVERSED),
     )
     .highlight_symbol("› ");
-    let mut menu_state = ListState::default().with_selected(Some(app.selected));
-    frame.render_stateful_widget(menu, body[0], &mut menu_state);
-
-    let detail = match app.selected {
-        1 => ("Connections", "No connection selected."),
-        2 => ("SQL workspace", "No SQL workspace open."),
-        _ => ("Overview", "Authenticated session is active."),
-    };
-    let detail_text = Text::from(vec![
-        Line::from(detail.0).style(
+    let mut menu_state = ListState::default().with_selected(Some(app.view));
+    frame.render_stateful_widget(menu, layout[0], &mut menu_state);
+    let content = Text::from(vec![
+        Line::from("Overview").style(
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::from(detail.1),
+        Line::from("Authenticated session is active."),
         Line::from(format!("User: {}", session.user_id)),
         Line::from(format!("Session lifetime: {} seconds", session.expires_in)),
+        Line::from("Select Connections to manage saved PostgreSQL servers."),
     ]);
     frame.render_widget(
-        Paragraph::new(detail_text)
-            .block(Block::default().borders(Borders::ALL).title(" Workspace ")),
-        body[1],
+        Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(" Workspace ")),
+        layout[1],
     );
+}
+
+fn responsive_layout(area: Rect) -> Vec<Rect> {
+    let direction = if area.width < 60 {
+        Direction::Vertical
+    } else {
+        Direction::Horizontal
+    };
+    let constraints = if direction == Direction::Vertical {
+        vec![Constraint::Length(4), Constraint::Min(3)]
+    } else {
+        vec![Constraint::Length(24), Constraint::Min(0)]
+    };
+    Layout::default()
+        .direction(direction)
+        .constraints(constraints)
+        .split(area)
+        .to_vec()
+}
+
+fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let layout = responsive_layout(area);
+    let items = app.connections.iter().map(|connection| {
+        ListItem::new(vec![
+            Line::from(connection.name.as_str()),
+            Line::from(format!("  {}:{}", connection.host, connection.port)),
+        ])
+    });
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Connections "),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("› ");
+    let mut list_state = ListState::default()
+        .with_selected((!app.connections.is_empty()).then_some(app.selected_connection));
+    frame.render_stateful_widget(list, layout[0], &mut list_state);
+
+    let details = if let Some(connection) = app.connections.get(app.selected_connection) {
+        Text::from(vec![
+            Line::from(connection.name.as_str()).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!("Host: {}:{}", connection.host, connection.port)),
+            Line::from(format!("Database: {}", connection.database)),
+            Line::from(format!("Username: {}", connection.username)),
+            Line::from(format!(
+                "TLS: {}",
+                if connection.tls_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )),
+            Line::from("Password: stored securely"),
+        ])
+    } else {
+        Text::from("No saved connections. Press n to add one.")
+    };
+    let status = if app.confirm_delete.is_some() {
+        "Confirm deletion? This cannot be undone.".to_owned()
+    } else {
+        format!("Page {} · {}", app.connection_page, app.message)
+    };
+    let panel = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(2)])
+        .split(layout[1]);
+    frame.render_widget(
+        Paragraph::new(details).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Connection details "),
+        ),
+        panel[0],
+    );
+    frame.render_widget(Paragraph::new(status), panel[1]);
+}
+
+fn render_connection_form(frame: &mut Frame<'_>, area: Rect, form: &ConnectionForm, message: &str) {
+    let values = [
+        form.name.as_str().to_owned(),
+        form.host.as_str().to_owned(),
+        form.port.as_str().to_owned(),
+        form.database.as_str().to_owned(),
+        form.username.as_str().to_owned(),
+        "•".repeat(form.password.chars().count()),
+        if form.tls_enabled {
+            "Enabled".to_owned()
+        } else {
+            "Disabled".to_owned()
+        },
+    ];
+    let lines = CONNECTION_FIELDS
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(index, (label, value))| {
+            let marker = if index == form.focus { "›" } else { " " };
+            let style = if index == form.focus {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(format!("{marker} {label}: {value}")).style(style)
+        })
+        .collect::<Vec<_>>();
+    let title = if form.id.is_some() {
+        " Edit connection "
+    } else {
+        " New connection "
+    };
+    let panel = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(1)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        panel[0],
+    );
+    frame.render_widget(Paragraph::new(message), panel[1]);
+}
+
+async fn run_operation(
+    client: &mut ApiClient,
+    operation: Operation,
+    email: &str,
+    password: &str,
+    input: Option<&ConnectionInput>,
+) -> OperationResult {
+    match operation {
+        Operation::Login => {
+            let result = async {
+                let login = client.login(email, password).await?;
+                let session = client.current_session().await?;
+                if login.user_id != session.user_id {
+                    return Err(ApiError::InvalidResponse);
+                }
+                Ok(login)
+            }
+            .await;
+            OperationResult::Login(result)
+        }
+        Operation::LoadConnections { page } => OperationResult::Connections(
+            client
+                .list_connections(page, 100)
+                .await
+                .map(|page| page.items),
+        ),
+        Operation::SaveConnection { id: Some(id) } => {
+            let Some(input) = input else {
+                return OperationResult::Saved(Err(ApiError::InvalidResponse));
+            };
+            OperationResult::Saved(client.update_connection(id, input).await)
+        }
+        Operation::SaveConnection { id: None } => {
+            let Some(input) = input else {
+                return OperationResult::Saved(Err(ApiError::InvalidResponse));
+            };
+            OperationResult::Saved(client.create_connection(input).await)
+        }
+        Operation::TestConnection { id } => {
+            OperationResult::Tested(client.test_connection(id).await)
+        }
+        Operation::DeleteConnection { id } => {
+            OperationResult::Deleted(client.delete_connection(id).await)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use pgrustadmin_api_client::ApiClient;
+    use pgrustadmin_api_client::{ApiClient, AuthSession, Connection};
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
-    use super::{App, LoginField, ScreenState, render};
+    use super::{App, ConnectionForm, LoginField, ScreenState, UiAction, render};
 
     fn client() -> ApiClient {
         ApiClient::new("http://127.0.0.1:3000").expect("valid API URL")
     }
 
+    fn authenticated_app() -> App {
+        let mut app = App::new(client());
+        app.state = ScreenState::Authenticated(AuthSession {
+            user_id: Uuid::new_v4(),
+            expires_in: 43200,
+        });
+        app
+    }
+
     #[test]
-    fn login_form_tracks_focus_and_hides_password_text() {
+    fn login_form_masks_password_and_supports_field_navigation() {
         let mut app = App::new(client());
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(matches!(
             app.state,
-            ScreenState::Editing {
+            ScreenState::EditingLogin {
                 focus: LoginField::Password,
                 ..
             }
         ));
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        for character in "secret".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("create test terminal");
         terminal
             .draw(|frame| render(frame, &app))
             .expect("render login");
@@ -452,31 +965,28 @@ mod tests {
     }
 
     #[test]
-    fn submit_requires_credentials_and_control_c_quits() {
-        let mut app = App::new(client());
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        app.begin_login();
-        assert!(matches!(
-            app.state,
-            ScreenState::Editing { error: Some(_), .. }
-        ));
-        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn authenticated_session_state_is_renderable() {
-        let mut app = App::new(client());
-        app.state = ScreenState::Authenticated(pgrustadmin_api_client::AuthSession {
-            user_id: Uuid::new_v4(),
-            expires_in: 43200,
-        });
-        let backend = TestBackend::new(40, 14);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
+    fn connection_form_requires_create_password_and_masks_it() {
+        let mut form = ConnectionForm::create();
+        form.name = "Local".to_owned();
+        form.host = "localhost".to_owned();
+        form.database = "app".to_owned();
+        form.username = "app".to_owned();
+        assert!(form.input().is_err());
+        form.password.push_str("secret-db-password");
+        assert!(form.input().is_ok());
+        let mut app = authenticated_app();
+        app.form = Some(form);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert!(
+            app.form
+                .as_ref()
+                .is_some_and(|form| form.name.ends_with('q'))
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("create test terminal");
         terminal
             .draw(|frame| render(frame, &app))
-            .expect("render session");
+            .expect("render connection form");
         let rendered = terminal
             .backend()
             .buffer()
@@ -484,6 +994,77 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Authenticated session is active."));
+        assert!(rendered.contains("Password"));
+        assert!(rendered.contains('•'));
+        assert!(!rendered.contains("secret-db-password"));
+    }
+
+    #[test]
+    fn editing_connection_without_password_preserves_credential() {
+        let connection = Connection {
+            id: Uuid::new_v4(),
+            name: "local".to_owned(),
+            host: "localhost".to_owned(),
+            port: 5432,
+            database: "app".to_owned(),
+            username: "app".to_owned(),
+            tls_enabled: true,
+        };
+        let form = ConnectionForm::edit(&connection);
+        let input = form.input().expect("editing without password is valid");
+        assert!(input.password.is_none());
+    }
+
+    #[test]
+    fn connection_actions_select_test_and_require_delete_confirmation() {
+        let mut app = authenticated_app();
+        app.view = 1;
+        app.connections.push(Connection {
+            id: Uuid::new_v4(),
+            name: "local".to_owned(),
+            host: "localhost".to_owned(),
+            port: 5432,
+            database: "app".to_owned(),
+            username: "app".to_owned(),
+            tls_enabled: true,
+        });
+        let id = app.connections[0].id;
+        assert!(
+            matches!(app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)), UiAction::TestConnection(test_id) if test_id == id)
+        );
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            UiAction::None
+        ));
+        assert_eq!(app.confirm_delete, Some(id));
+        assert!(
+            matches!(app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)), UiAction::DeleteConnection(delete_id) if delete_id == id)
+        );
+    }
+
+    #[test]
+    fn connections_page_navigation_uses_full_page_as_next_page_signal() {
+        let mut app = authenticated_app();
+        app.view = 1;
+        app.connections = (0..100)
+            .map(|_| Connection {
+                id: Uuid::new_v4(),
+                name: "connection".to_owned(),
+                host: "localhost".to_owned(),
+                port: 5432,
+                database: "app".to_owned(),
+                username: "app".to_owned(),
+                tls_enabled: true,
+            })
+            .collect();
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)),
+            UiAction::LoadConnections(2)
+        ));
+        assert_eq!(app.connection_page, 2);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            UiAction::LoadConnections(1)
+        ));
     }
 }

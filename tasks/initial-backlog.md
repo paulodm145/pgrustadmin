@@ -23,7 +23,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | API-002 | Cliente HTTP | API-001 | Concluída — cliente reqwest reutilizável, URL/env local, timeout, TLS Rustls, auth e conexões tipados; token e senha protegidos, erros sem body arbitrário; 3 testes de cliente e suíte workspace passaram. |
 | TUI-001 | Loop eventos/layout | PREP-001 | Concluída — terminal restaura em erro/saída, loop Tokio não bloqueante, resize/redraw e layout adaptável com foco/navegação; 2 testes de estado/layout passaram. |
 | TUI-002 | Login TUI | API-002/AUTH-003 | Concluída — formulário com senha mascarada, navegação por teclado, login e verificação de sessão em tarefa assíncrona; erros seguros, senha zeroizada e cancelamento ao sair; 3 testes TUI passaram. |
-| TUI-003 | Conexões TUI | TUI-002/CON-001 | Pendente |
+| TUI-003 | Conexões TUI | TUI-002/CON-001 | Concluída — listagem paginada, criação/edição (senha vazia preserva credencial), teste e exclusão confirmada; chamadas assíncronas, mensagens sem segredo; 5 testes TUI passaram. |
 | CAT-001 | Databases | TUI-003 | Pendente |
 | CAT-002 | Schemas | CAT-001 | Pendente |
 | CAT-003 | Tabelas/views | CAT-002 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-TUI-002 está concluída com login e verificação de sessão pela API, sem bloquear eventos. Próxima tarefa: TUI-003, listar e operar conexões pela TUI usando o cliente API.
+TUI-003 está concluída com CRUD/teste de conexões assíncrono e paginação. Próxima tarefa: CAT-001, listar databases PostgreSQL pela API e TUI.
