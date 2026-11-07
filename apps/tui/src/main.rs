@@ -3,7 +3,7 @@ use std::{io, time::Duration};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use pgrustadmin_api_client::{
-    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest,
+    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest, Database,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -56,6 +56,7 @@ enum ScreenState {
 enum Operation {
     Login,
     LoadConnections { page: u64 },
+    LoadDatabases { connection_id: Uuid },
     SaveConnection { id: Option<Uuid> },
     TestConnection { id: Uuid },
     DeleteConnection { id: Uuid },
@@ -64,6 +65,7 @@ enum Operation {
 enum OperationResult {
     Login(Result<AuthSession, ApiError>),
     Connections(Result<Vec<Connection>, ApiError>),
+    Databases(Result<Vec<Database>, ApiError>),
     Saved(Result<Connection, ApiError>),
     Tested(Result<ConnectionTest, ApiError>),
     Deleted(Result<(), ApiError>),
@@ -74,6 +76,7 @@ enum UiAction {
     None,
     Login,
     LoadConnections(u64),
+    LoadDatabases(Uuid),
     SaveConnection,
     TestConnection(Uuid),
     DeleteConnection(Uuid),
@@ -211,6 +214,10 @@ struct App {
     connections: Vec<Connection>,
     selected_connection: usize,
     connection_page: u64,
+    catalog_connection: Option<Uuid>,
+    catalog_connection_name: String,
+    databases: Vec<Database>,
+    selected_database: usize,
     form: Option<ConnectionForm>,
     confirm_delete: Option<Uuid>,
     message: String,
@@ -240,6 +247,10 @@ impl App {
             connections: Vec::new(),
             selected_connection: 0,
             connection_page: 1,
+            catalog_connection: None,
+            catalog_connection_name: String::new(),
+            databases: Vec::new(),
+            selected_database: 0,
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -253,6 +264,14 @@ impl App {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
+            return UiAction::None;
+        }
+        if key.code == KeyCode::Esc
+            && self.view == 2
+            && self.form.is_none()
+            && matches!(self.state, ScreenState::Authenticated(_))
+        {
+            self.view = 1;
             return UiAction::None;
         }
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -323,7 +342,26 @@ impl App {
             },
             ScreenState::Authenticating => {}
             ScreenState::Authenticated(_) => {
-                if self.view == 1 {
+                if self.view == 2 {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') if !self.databases.is_empty() => {
+                            self.selected_database =
+                                (self.selected_database + self.databases.len() - 1)
+                                    % self.databases.len();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !self.databases.is_empty() => {
+                            self.selected_database =
+                                (self.selected_database + 1) % self.databases.len();
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(connection_id) = self.catalog_connection {
+                                return UiAction::LoadDatabases(connection_id);
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 1,
+                        _ => {}
+                    }
+                } else if self.view == 1 {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') if !self.connections.is_empty() => {
                             self.selected_connection =
@@ -370,6 +408,17 @@ impl App {
                                 .get(self.selected_connection)
                                 .map(|item| item.id);
                         }
+                        KeyCode::Char('c') => {
+                            if let Some(connection) = self.connections.get(self.selected_connection)
+                            {
+                                self.catalog_connection = Some(connection.id);
+                                self.catalog_connection_name = connection.name.clone();
+                                self.databases.clear();
+                                self.selected_database = 0;
+                                self.view = 2;
+                                return UiAction::LoadDatabases(connection.id);
+                            }
+                        }
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 0,
                         _ => {}
                     }
@@ -400,6 +449,7 @@ impl App {
         match action {
             UiAction::Login => self.state = ScreenState::Authenticating,
             UiAction::LoadConnections(_) => self.message = "Loading connections…".to_owned(),
+            UiAction::LoadDatabases(_) => self.message = "Loading databases…".to_owned(),
             UiAction::SaveConnection => self.message = "Saving connection…".to_owned(),
             UiAction::TestConnection(_) => self.message = "Testing connection…".to_owned(),
             UiAction::DeleteConnection(_) => self.message = "Deleting connection…".to_owned(),
@@ -487,6 +537,18 @@ impl App {
                     OperationResult::Connections(Err(error)) => {
                         self.message = api_error_message(error).to_owned();
                     }
+                    OperationResult::Databases(Ok(databases)) => {
+                        self.databases = databases;
+                        self.selected_database = self
+                            .selected_database
+                            .min(self.databases.len().saturating_sub(1));
+                        self.message = format!("Loaded {} database(s).", self.databases.len());
+                    }
+                    OperationResult::Databases(Err(error)) => {
+                        self.databases.clear();
+                        self.selected_database = 0;
+                        self.message = api_error_message(error).to_owned();
+                    }
                     OperationResult::Saved(Ok(_)) => {
                         self.form = None;
                         self.connection_page = 1;
@@ -548,6 +610,10 @@ fn api_error_message(error: ApiError) -> &'static str {
             code: Some("connection_name_conflict"),
             ..
         } => "A connection with this name already exists.",
+        ApiError::Http {
+            code: Some("catalog_unavailable"),
+            ..
+        } => "Could not retrieve databases from this connection.",
         ApiError::Transport => "Could not contact the API.",
         _ => "The request failed. Check the API and try again.",
     }
@@ -586,6 +652,7 @@ fn start_action(app: &mut App, action: UiAction) {
         UiAction::None => return,
         UiAction::Login => Operation::Login,
         UiAction::LoadConnections(page) => Operation::LoadConnections { page },
+        UiAction::LoadDatabases(connection_id) => Operation::LoadDatabases { connection_id },
         UiAction::SaveConnection => Operation::SaveConnection {
             id: app.form.as_ref().and_then(|form| form.id),
         },
@@ -620,6 +687,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 render_connection_form(frame, sections[1], form, &app.message);
             } else if app.view == 1 {
                 render_connections(frame, sections[1], app);
+            } else if app.view == 2 {
+                render_databases(frame, sections[1], app);
             } else {
                 render_workspace(frame, sections[1], app, session);
             }
@@ -634,7 +703,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if app.confirm_delete.is_some() {
         "Delete this connection? y: confirm   n/Esc: cancel"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
-        "n: new   e: edit   t: test   d: delete   [ / ]: pages   r: reload   Tab: overview   q: quit"
+        "n: new   e: edit   t: test   c: databases   d: delete   [ / ]: pages   r: reload   Tab: overview   q: quit"
+    } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
+        "↑/↓: navigate   r: reload   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
         "Tab/Enter: open Connections   ↑/↓: select   q/Esc: quit"
     } else {
@@ -818,6 +889,31 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(status), panel[1]);
 }
 
+fn render_databases(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let items = app
+        .databases
+        .iter()
+        .map(|database| ListItem::new(database.name.as_str()));
+    let title = format!(" Databases — {} ", app.catalog_connection_name);
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("› ");
+    let mut list_state = ListState::default()
+        .with_selected((!app.databases.is_empty()).then_some(app.selected_database));
+    frame.render_stateful_widget(list, area, &mut list_state);
+    if app.databases.is_empty() {
+        frame.render_widget(
+            Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+    }
+}
+
 fn render_connection_form(frame: &mut Frame<'_>, area: Rect, form: &ConnectionForm, message: &str) {
     let values = [
         form.name.as_str().to_owned(),
@@ -891,6 +987,12 @@ async fn run_operation(
                 .await
                 .map(|page| page.items),
         ),
+        Operation::LoadDatabases { connection_id } => OperationResult::Databases(
+            client
+                .list_databases(connection_id)
+                .await
+                .map(|databases| databases.items),
+        ),
         Operation::SaveConnection { id: Some(id) } => {
             let Some(input) = input else {
                 return OperationResult::Saved(Err(ApiError::InvalidResponse));
@@ -915,7 +1017,7 @@ async fn run_operation(
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use pgrustadmin_api_client::{ApiClient, AuthSession, Connection};
+    use pgrustadmin_api_client::{ApiClient, AuthSession, Connection, Database};
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
@@ -1040,6 +1142,53 @@ mod tests {
         assert!(
             matches!(app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)), UiAction::DeleteConnection(delete_id) if delete_id == id)
         );
+    }
+
+    #[test]
+    fn selected_connection_opens_database_list_and_escape_returns() {
+        let mut app = authenticated_app();
+        app.view = 1;
+        let connection = Connection {
+            id: Uuid::new_v4(),
+            name: "local".to_owned(),
+            host: "localhost".to_owned(),
+            port: 5432,
+            database: "app".to_owned(),
+            username: "app".to_owned(),
+            tls_enabled: true,
+        };
+        app.connections.push(connection.clone());
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            UiAction::LoadDatabases(connection_id) if connection_id == connection.id
+        ));
+        assert_eq!(app.view, 2);
+        app.databases = vec![
+            Database {
+                name: "alpha".to_owned(),
+            },
+            Database {
+                name: "beta".to_owned(),
+            },
+        ];
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected_database, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, 1);
+
+        let other = Connection {
+            id: Uuid::new_v4(),
+            name: "other".to_owned(),
+            ..connection
+        };
+        app.connections = vec![other.clone()];
+        app.selected_connection = 0;
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            UiAction::LoadDatabases(connection_id) if connection_id == other.id
+        ));
+        assert!(app.databases.is_empty());
+        assert_eq!(app.selected_database, 0);
     }
 
     #[test]

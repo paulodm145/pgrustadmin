@@ -124,6 +124,16 @@ pub struct ConnectionTest {
     pub success: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Database {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DatabaseList {
+    pub items: Vec<Database>,
+}
+
 impl ApiClient {
     pub fn new(base_url: &str) -> Result<Self, ApiError> {
         let mut base_url = Url::parse(base_url).map_err(|_| ApiError::InvalidBaseUrl)?;
@@ -240,6 +250,14 @@ impl ApiClient {
         decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
     }
 
+    pub async fn list_databases(&self, connection_id: Uuid) -> Result<DatabaseList, ApiError> {
+        self.get_json(
+            &format!("api/v1/connections/{connection_id}/databases"),
+            true,
+        )
+        .await
+    }
+
     async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -323,6 +341,7 @@ async fn http_error(response: reqwest::Response) -> ApiError {
             "credential_encryption_unavailable" => Some("credential_encryption_unavailable"),
             "internal_error" => Some("internal_error"),
             "method_not_allowed" => Some("method_not_allowed"),
+            "catalog_unavailable" => Some("catalog_unavailable"),
             _ => None,
         });
     ApiError::Http { status, code }
@@ -414,6 +433,10 @@ mod tests {
                 "/api/v1/version",
                 get(|| async { Json(serde_json::json!({"version":"test"})) }),
             )
+            .route(
+                "/api/v1/connections/{id}/databases",
+                get(|| async { Json(serde_json::json!({"items":[{"name":"app_db"}]})) }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -456,6 +479,16 @@ mod tests {
                 .expect("session succeeds")
                 .user_id,
             user_id
+        );
+        assert_eq!(
+            client
+                .list_databases(Uuid::new_v4())
+                .await
+                .expect("database catalog succeeds")
+                .items,
+            vec![super::Database {
+                name: "app_db".to_owned()
+            }]
         );
         client.logout().await.expect("logout succeeds");
         assert_eq!(

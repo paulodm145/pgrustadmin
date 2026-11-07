@@ -24,7 +24,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | TUI-001 | Loop eventos/layout | PREP-001 | Concluída — terminal restaura em erro/saída, loop Tokio não bloqueante, resize/redraw e layout adaptável com foco/navegação; 2 testes de estado/layout passaram. |
 | TUI-002 | Login TUI | API-002/AUTH-003 | Concluída — formulário com senha mascarada, navegação por teclado, login e verificação de sessão em tarefa assíncrona; erros seguros, senha zeroizada e cancelamento ao sair; 3 testes TUI passaram. |
 | TUI-003 | Conexões TUI | TUI-002/CON-001 | Concluída — listagem paginada, criação/edição (senha vazia preserva credencial), teste e exclusão confirmada; chamadas assíncronas, mensagens sem segredo; 5 testes TUI passaram. |
-| CAT-001 | Databases | TUI-003 | Pendente |
+| CAT-001 | Databases | TUI-003 | Concluída — `specs/catalog.md`; `GET /api/v1/connections/{id}/databases` owner-scoped (404 para outro usuário, 502 `catalog_unavailable` sem mensagem do driver), filtra templates/sem `CONNECT`, ordenado por nome; cliente tipado e lista navegável na TUI com retorno às conexões; teste de integração do servidor e 6 testes TUI passaram. |
 | CAT-002 | Schemas | CAT-001 | Pendente |
 | CAT-003 | Tabelas/views | CAT-002 | Pendente |
 | CAT-004 | Colunas/índices | CAT-003 | Pendente |

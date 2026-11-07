@@ -11,7 +11,8 @@ use axum::{
 use pgrustadmin_postgres_driver::{
     ConnectionData, ConnectionSummary, PgPool, PostgresError, create_connection,
     delete_connection_for_owner, find_connection_credentials_for_owner, find_connection_for_owner,
-    list_connections_for_owner, test_database_connection, update_connection_for_owner,
+    list_connections_for_owner, list_databases, test_database_connection,
+    update_connection_for_owner,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -28,6 +29,10 @@ pub fn router(pool: PgPool) -> Router {
             get(read).put(update).delete(remove),
         )
         .route("/api/v1/connections/{id}/test", axum::routing::post(test))
+        .route(
+            "/api/v1/connections/{id}/databases",
+            get(list_remote_databases),
+        )
         .with_state(pool)
 }
 
@@ -94,6 +99,16 @@ struct ConnectionTestResponse {
     success: bool,
 }
 
+#[derive(Serialize)]
+struct DatabaseListResponse {
+    items: Vec<DatabaseResponse>,
+}
+
+#[derive(Serialize)]
+struct DatabaseResponse {
+    name: String,
+}
+
 async fn test(
     State(pool): State<PgPool>,
     headers: HeaderMap,
@@ -127,6 +142,51 @@ async fn test(
         .await
         .is_ok();
     (StatusCode::OK, Json(ConnectionTestResponse { success })).into_response()
+}
+
+async fn list_remote_databases(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    connection_path: Result<Path<Uuid>, PathRejection>,
+) -> Response {
+    let owner_id = match authenticated_owner(&pool, &headers).await {
+        Ok(owner_id) => owner_id,
+        Err(error) => return authentication_error_response(error),
+    };
+    let Ok(Path(connection_id)) = connection_path else {
+        return bad_request();
+    };
+    let connection =
+        match find_connection_credentials_for_owner(&pool, owner_id, connection_id).await {
+            Ok(Some(connection)) => connection,
+            Ok(None) => return not_found(),
+            Err(_) => return internal_error(),
+        };
+    let cipher = match CredentialCipher::from_env() {
+        Ok(cipher) => cipher,
+        Err(_) => return credential_configuration_error(),
+    };
+    let password = match cipher.decrypt(&connection.credential_envelope, owner_id, connection_id) {
+        Ok(password) => password,
+        Err(_) => return internal_error(),
+    };
+    let Ok(password) = std::str::from_utf8(&password) else {
+        return internal_error();
+    };
+
+    match list_databases(&connection, password).await {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(DatabaseListResponse {
+                items: items
+                    .into_iter()
+                    .map(|name| DatabaseResponse { name })
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(_) => catalog_unavailable(),
+    }
 }
 
 async fn list(
@@ -432,6 +492,16 @@ fn credential_configuration_error() -> Response {
         .into_response()
 }
 
+fn catalog_unavailable() -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse {
+            error: "catalog_unavailable",
+        }),
+    )
+        .into_response()
+}
+
 fn bad_request() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -648,6 +718,49 @@ mod tests {
             serde_json::from_slice(&test_body).expect("decode connection test response");
         assert_eq!(test_json, serde_json::json!({"success": true}));
 
+        let databases = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("/api/v1/connections/{connection_id}/databases"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(databases.status(), StatusCode::OK);
+        let databases_body = to_bytes(databases.into_body(), 4096)
+            .await
+            .expect("read database catalog response");
+        let databases_json: serde_json::Value =
+            serde_json::from_slice(&databases_body).expect("decode database catalog response");
+        let database_names = databases_json["items"]
+            .as_array()
+            .expect("catalog response has items")
+            .iter()
+            .filter_map(|database| database["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(database_names.contains(&"pgrustadmin_test"));
+        assert!(database_names.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let unauthenticated_databases = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("/api/v1/connections/{connection_id}/databases"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(unauthenticated_databases.status(), StatusCode::UNAUTHORIZED);
+
+        let other_owner_databases = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("/api/v1/connections/{connection_id}/databases"),
+            Some(other_owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(other_owner_databases.status(), StatusCode::NOT_FOUND);
+
         let mut invalid_credentials = payload.clone();
         invalid_credentials["password"] = serde_json::json!("incorrect-test-password");
         let updated = send_request(
@@ -675,6 +788,25 @@ mod tests {
             serde_json::from_slice(&failed_body).expect("decode failed connection test response");
         assert_eq!(failed_json, serde_json::json!({"success": false}));
         assert!(!String::from_utf8_lossy(&failed_body).contains("incorrect-test-password"));
+
+        let failed_catalog = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("/api/v1/connections/{connection_id}/databases"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(failed_catalog.status(), StatusCode::BAD_GATEWAY);
+        let failed_catalog_body = to_bytes(failed_catalog.into_body(), 4096)
+            .await
+            .expect("read failed catalog response");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&failed_catalog_body)
+                .expect("decode failed catalog response"),
+            serde_json::json!({"error": "catalog_unavailable"})
+        );
+        assert!(!String::from_utf8_lossy(&failed_catalog_body).contains("incorrect-test-password"));
 
         let other_owner_test = send_request(
             app.clone(),

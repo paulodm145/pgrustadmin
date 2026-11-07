@@ -71,6 +71,28 @@ pub async fn test_database_connection(
     .map_err(|_| sqlx::Error::PoolTimedOut)?
 }
 
+pub async fn list_databases(
+    connection: &StoredConnectionCredentials,
+    password: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let options = connection_options(connection, password)?;
+    tokio::time::timeout(CONNECTION_TEST_TIMEOUT, async {
+        let mut connection = sqlx::PgConnection::connect_with(&options).await?;
+        let databases = sqlx::query_scalar::<_, String>(
+            "SELECT datname FROM pg_database \
+             WHERE datallowconn AND NOT datistemplate \
+               AND has_database_privilege(datname, 'CONNECT') \
+             ORDER BY datname",
+        )
+        .fetch_all(&mut connection)
+        .await?;
+        connection.close().await?;
+        Ok(databases)
+    })
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
 fn connection_options(
     connection: &StoredConnectionCredentials,
     password: &str,
