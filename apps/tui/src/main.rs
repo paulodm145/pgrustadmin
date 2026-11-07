@@ -3,7 +3,7 @@ use std::{io, time::Duration};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use pgrustadmin_api_client::{
-    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest, Database,
+    ApiClient, ApiError, AuthSession, Connection, ConnectionInput, ConnectionTest, Database, Schema,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -57,6 +57,7 @@ enum Operation {
     Login,
     LoadConnections { page: u64 },
     LoadDatabases { connection_id: Uuid },
+    LoadSchemas { connection_id: Uuid },
     SaveConnection { id: Option<Uuid> },
     TestConnection { id: Uuid },
     DeleteConnection { id: Uuid },
@@ -66,6 +67,7 @@ enum OperationResult {
     Login(Result<AuthSession, ApiError>),
     Connections(Result<Vec<Connection>, ApiError>),
     Databases(Result<Vec<Database>, ApiError>),
+    Schemas(Result<Vec<Schema>, ApiError>),
     Saved(Result<Connection, ApiError>),
     Tested(Result<ConnectionTest, ApiError>),
     Deleted(Result<(), ApiError>),
@@ -77,6 +79,7 @@ enum UiAction {
     Login,
     LoadConnections(u64),
     LoadDatabases(Uuid),
+    LoadSchemas(Uuid),
     SaveConnection,
     TestConnection(Uuid),
     DeleteConnection(Uuid),
@@ -218,6 +221,9 @@ struct App {
     catalog_connection_name: String,
     databases: Vec<Database>,
     selected_database: usize,
+    catalog_database: String,
+    schemas: Vec<Schema>,
+    selected_schema: usize,
     form: Option<ConnectionForm>,
     confirm_delete: Option<Uuid>,
     message: String,
@@ -251,6 +257,9 @@ impl App {
             catalog_connection_name: String::new(),
             databases: Vec::new(),
             selected_database: 0,
+            catalog_database: String::new(),
+            schemas: Vec::new(),
+            selected_schema: 0,
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -267,11 +276,11 @@ impl App {
             return UiAction::None;
         }
         if key.code == KeyCode::Esc
-            && self.view == 2
+            && matches!(self.view, 2 | 3)
             && self.form.is_none()
             && matches!(self.state, ScreenState::Authenticated(_))
         {
-            self.view = 1;
+            self.view -= 1;
             return UiAction::None;
         }
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -342,7 +351,24 @@ impl App {
             },
             ScreenState::Authenticating => {}
             ScreenState::Authenticated(_) => {
-                if self.view == 2 {
+                if self.view == 3 {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') if !self.schemas.is_empty() => {
+                            self.selected_schema = (self.selected_schema + self.schemas.len() - 1)
+                                % self.schemas.len();
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !self.schemas.is_empty() => {
+                            self.selected_schema = (self.selected_schema + 1) % self.schemas.len();
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(connection_id) = self.catalog_connection {
+                                return UiAction::LoadSchemas(connection_id);
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 2,
+                        _ => {}
+                    }
+                } else if self.view == 2 {
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') if !self.databases.is_empty() => {
                             self.selected_database =
@@ -356,6 +382,18 @@ impl App {
                         KeyCode::Char('r') => {
                             if let Some(connection_id) = self.catalog_connection {
                                 return UiAction::LoadDatabases(connection_id);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let (Some(connection_id), Some(database)) = (
+                                self.catalog_connection,
+                                self.databases.get(self.selected_database),
+                            ) {
+                                self.catalog_database = database.name.clone();
+                                self.schemas.clear();
+                                self.selected_schema = 0;
+                                self.view = 3;
+                                return UiAction::LoadSchemas(connection_id);
                             }
                         }
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 1,
@@ -450,6 +488,7 @@ impl App {
             UiAction::Login => self.state = ScreenState::Authenticating,
             UiAction::LoadConnections(_) => self.message = "Loading connections…".to_owned(),
             UiAction::LoadDatabases(_) => self.message = "Loading databases…".to_owned(),
+            UiAction::LoadSchemas(_) => self.message = "Loading schemas…".to_owned(),
             UiAction::SaveConnection => self.message = "Saving connection…".to_owned(),
             UiAction::TestConnection(_) => self.message = "Testing connection…".to_owned(),
             UiAction::DeleteConnection(_) => self.message = "Deleting connection…".to_owned(),
@@ -462,6 +501,8 @@ impl App {
         } else {
             Zeroizing::new(String::new())
         };
+        let database = matches!(operation, Operation::LoadSchemas { .. })
+            .then(|| self.catalog_database.clone());
         let input = if let Operation::SaveConnection { .. } = operation {
             match self.form.as_ref().map(ConnectionForm::input) {
                 Some(Ok(input)) => Some(input),
@@ -490,6 +531,7 @@ impl App {
                 operation,
                 email.as_deref().unwrap_or_default(),
                 &password,
+                database.as_deref().unwrap_or_default(),
                 input.as_ref(),
             )
             .await;
@@ -543,6 +585,18 @@ impl App {
                             .selected_database
                             .min(self.databases.len().saturating_sub(1));
                         self.message = format!("Loaded {} database(s).", self.databases.len());
+                    }
+                    OperationResult::Schemas(Ok(schemas)) => {
+                        self.schemas = schemas;
+                        self.selected_schema = self
+                            .selected_schema
+                            .min(self.schemas.len().saturating_sub(1));
+                        self.message = format!("Loaded {} schema(s).", self.schemas.len());
+                    }
+                    OperationResult::Schemas(Err(error)) => {
+                        self.schemas.clear();
+                        self.selected_schema = 0;
+                        self.message = api_error_message(error).to_owned();
                     }
                     OperationResult::Databases(Err(error)) => {
                         self.databases.clear();
@@ -613,7 +667,7 @@ fn api_error_message(error: ApiError) -> &'static str {
         ApiError::Http {
             code: Some("catalog_unavailable"),
             ..
-        } => "Could not retrieve databases from this connection.",
+        } => "Could not read the catalog from this connection.",
         ApiError::Transport => "Could not contact the API.",
         _ => "The request failed. Check the API and try again.",
     }
@@ -653,6 +707,7 @@ fn start_action(app: &mut App, action: UiAction) {
         UiAction::Login => Operation::Login,
         UiAction::LoadConnections(page) => Operation::LoadConnections { page },
         UiAction::LoadDatabases(connection_id) => Operation::LoadDatabases { connection_id },
+        UiAction::LoadSchemas(connection_id) => Operation::LoadSchemas { connection_id },
         UiAction::SaveConnection => Operation::SaveConnection {
             id: app.form.as_ref().and_then(|form| form.id),
         },
@@ -688,7 +743,30 @@ fn render(frame: &mut Frame<'_>, app: &App) {
             } else if app.view == 1 {
                 render_connections(frame, sections[1], app);
             } else if app.view == 2 {
-                render_databases(frame, sections[1], app);
+                let names = app.databases.iter().map(|database| database.name.as_str());
+                let title = format!(" Databases — {} ", app.catalog_connection_name);
+                render_catalog_list(
+                    frame,
+                    sections[1],
+                    &title,
+                    names,
+                    app.selected_database,
+                    &app.message,
+                );
+            } else if app.view == 3 {
+                let names = app.schemas.iter().map(|schema| schema.name.as_str());
+                let title = format!(
+                    " Schemas — {} / {} ",
+                    app.catalog_connection_name, app.catalog_database
+                );
+                render_catalog_list(
+                    frame,
+                    sections[1],
+                    &title,
+                    names,
+                    app.selected_schema,
+                    &app.message,
+                );
             } else {
                 render_workspace(frame, sections[1], app, session);
             }
@@ -705,7 +783,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
         "n: new   e: edit   t: test   c: databases   d: delete   [ / ]: pages   r: reload   Tab: overview   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
-        "↑/↓: navigate   r: reload   Tab/Esc: connections   q: quit"
+        "↑/↓: navigate   Enter: schemas   r: reload   Tab/Esc: connections   q: quit"
+    } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
+        "↑/↓: navigate   r: reload   Tab/Esc: databases   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
         "Tab/Enter: open Connections   ↑/↓: select   q/Esc: quit"
     } else {
@@ -889,13 +969,16 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(status), panel[1]);
 }
 
-fn render_databases(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let items = app
-        .databases
-        .iter()
-        .map(|database| ListItem::new(database.name.as_str()));
-    let title = format!(" Databases — {} ", app.catalog_connection_name);
-    let list = List::new(items)
+fn render_catalog_list<'a>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    names: impl ExactSizeIterator<Item = &'a str>,
+    selected: usize,
+    message: &str,
+) {
+    let is_empty = names.len() == 0;
+    let list = List::new(names.map(ListItem::new))
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
             Style::default()
@@ -903,12 +986,11 @@ fn render_databases(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
         .highlight_symbol("› ");
-    let mut list_state = ListState::default()
-        .with_selected((!app.databases.is_empty()).then_some(app.selected_database));
+    let mut list_state = ListState::default().with_selected((!is_empty).then_some(selected));
     frame.render_stateful_widget(list, area, &mut list_state);
-    if app.databases.is_empty() {
+    if is_empty {
         frame.render_widget(
-            Paragraph::new(app.message.as_str()).style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(message).style(Style::default().fg(Color::Yellow)),
             area,
         );
     }
@@ -966,6 +1048,7 @@ async fn run_operation(
     operation: Operation,
     email: &str,
     password: &str,
+    database: &str,
     input: Option<&ConnectionInput>,
 ) -> OperationResult {
     match operation {
@@ -993,6 +1076,12 @@ async fn run_operation(
                 .await
                 .map(|databases| databases.items),
         ),
+        Operation::LoadSchemas { connection_id } => OperationResult::Schemas(
+            client
+                .list_schemas(connection_id, database)
+                .await
+                .map(|schemas| schemas.items),
+        ),
         Operation::SaveConnection { id: Some(id) } => {
             let Some(input) = input else {
                 return OperationResult::Saved(Err(ApiError::InvalidResponse));
@@ -1017,7 +1106,7 @@ async fn run_operation(
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use pgrustadmin_api_client::{ApiClient, AuthSession, Connection, Database};
+    use pgrustadmin_api_client::{ApiClient, AuthSession, Connection, Database, Schema};
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
 
@@ -1189,6 +1278,51 @@ mod tests {
         ));
         assert!(app.databases.is_empty());
         assert_eq!(app.selected_database, 0);
+    }
+
+    #[test]
+    fn selected_database_opens_schema_list_and_escape_returns() {
+        let mut app = authenticated_app();
+        let connection_id = Uuid::new_v4();
+        app.view = 2;
+        app.catalog_connection = Some(connection_id);
+        app.databases = vec![
+            Database {
+                name: "alpha".to_owned(),
+            },
+            Database {
+                name: "beta".to_owned(),
+            },
+        ];
+        app.selected_database = 1;
+        app.schemas = vec![Schema {
+            name: "stale".to_owned(),
+        }];
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            UiAction::LoadSchemas(id) if id == connection_id
+        ));
+        assert_eq!(app.view, 3);
+        assert_eq!(app.catalog_database, "beta");
+        assert!(app.schemas.is_empty());
+
+        app.schemas = vec![
+            Schema {
+                name: "pg_catalog".to_owned(),
+            },
+            Schema {
+                name: "public".to_owned(),
+            },
+        ];
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected_schema, 1);
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            UiAction::LoadSchemas(id) if id == connection_id
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, 2);
+        assert_eq!(app.selected_database, 1);
     }
 
     #[test]
