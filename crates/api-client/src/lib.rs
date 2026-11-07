@@ -277,8 +277,20 @@ pub struct Execution {
     pub connection_id: Uuid,
     pub database: String,
     pub status: ExecutionStatus,
+    /// Server-measured duration, present once the execution finished.
+    pub duration_ms: Option<u64>,
     pub result: Option<ExecutionResult>,
     pub error: Option<ExecutionError>,
+}
+
+/// Columns and text values of the last statement, possibly truncated.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ExecutionRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub stored_rows: u64,
+    pub total_rows: u64,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -493,6 +505,11 @@ impl ApiClient {
             .await
     }
 
+    pub async fn execution_rows(&self, id: Uuid) -> Result<ExecutionRows, ApiError> {
+        self.get_json(&format!("api/v1/executions/{id}/result"), true)
+            .await
+    }
+
     pub async fn test_connection(&self, id: Uuid) -> Result<ConnectionTest, ApiError> {
         let request = self.request(Method::POST, &format!("api/v1/connections/{id}/test"), true)?;
         decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
@@ -636,6 +653,8 @@ async fn http_error(response: reqwest::Response) -> ApiError {
             "file_too_large" => Some("file_too_large"),
             "file_storage_unavailable" => Some("file_storage_unavailable"),
             "execution_limit_reached" => Some("execution_limit_reached"),
+            "result_unavailable" => Some("result_unavailable"),
+            "result_expired" => Some("result_expired"),
             _ => None,
         });
     ApiError::Http { status, code }
@@ -845,8 +864,18 @@ mod tests {
                         "connection_id": SQL_FILE_ID,
                         "database": "app",
                         "status": "failed",
+                        "duration_ms": 12,
                         "error": {"code": "42601", "message": "syntax error"},
                     }))
+                }),
+            )
+            .route(
+                "/api/v1/executions/{id}/result",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::GONE,
+                        Json(serde_json::json!({"error": "result_expired"})),
+                    )
                 }),
             )
             .route("/api/v1/failure", get(internal_error))
@@ -1007,6 +1036,14 @@ mod tests {
         );
         let execution = client.execution(started.id).await.expect("execution");
         assert_eq!(execution.status, super::ExecutionStatus::Failed);
+        assert_eq!(execution.duration_ms, Some(12));
+        assert_eq!(
+            client.execution_rows(started.id).await,
+            Err(ApiError::Http {
+                status: 410,
+                code: Some("result_expired"),
+            })
+        );
         assert_eq!(execution.result, None);
         assert_eq!(
             execution.error,
