@@ -39,6 +39,8 @@ export PGRUSTADMIN_SQL_FILES_DIR=~/.local/share/pgrustadmin/sql-files
 
 Inclua esse diretório no backup junto com o banco de metadados: os metadados referenciam o conteúdo por storage key, e um sem o outro não restaura os arquivos. O teste de integração usa um diretório temporário próprio e não precisa da variável.
 
+Execuções de SQL têm tempo limite único por script, padrão de 300 segundos. Para mudar, defina `PGRUSTADMIN_EXECUTION_TIMEOUT_SECS` com um inteiro de 1 a 3600 antes de iniciar o servidor; valor inválido impede a inicialização.
+
 O teste de autorização precisa de um banco descartável. Crie-o uma vez:
 
 ```bash

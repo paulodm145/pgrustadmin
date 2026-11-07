@@ -2,8 +2,10 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
+    io,
     sync::{Arc, Mutex, PoisonError},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -16,10 +18,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use pgrustadmin_postgres_driver::{
-    PgPool, PostgresError, ResultSet, ScriptOutcome, execute_script,
-};
+use pgrustadmin_postgres_driver::{PgPool, PostgresError, ResultSet, ScriptEnd, execute_script};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::connections::{
@@ -34,6 +35,38 @@ const MAX_RETAINED_PER_OWNER: usize = 50;
 const MAX_RESULTS_WITH_ROWS_PER_OWNER: usize = 10;
 const CONNECTION_FAILED_MESSAGE: &str = "Could not connect to the database or read its response.";
 const STOPPED_MESSAGE: &str = "The execution stopped unexpectedly.";
+pub const EXECUTION_TIMEOUT_ENV: &str = "PGRUSTADMIN_EXECUTION_TIMEOUT_SECS";
+const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 300;
+const MAX_EXECUTION_TIMEOUT_SECS: u64 = 3600;
+
+/// Parses the execution timeout from its environment value, if set.
+pub fn execution_timeout(value: Option<OsString>) -> io::Result<Duration> {
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(DEFAULT_EXECUTION_TIMEOUT_SECS));
+    };
+    value
+        .into_string()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=MAX_EXECUTION_TIMEOUT_SECS).contains(seconds))
+        .map(Duration::from_secs)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{EXECUTION_TIMEOUT_ENV} must be a whole number of seconds from 1 to \
+                     {MAX_EXECUTION_TIMEOUT_SECS}"
+                ),
+            )
+        })
+}
+
+/// Why an execution stopped before the script finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopReason {
+    Cancelled,
+    TimedOut,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Counts {
@@ -54,6 +87,8 @@ enum ExecutionState {
         code: Option<String>,
         message: String,
     },
+    Cancelled,
+    TimedOut,
 }
 
 struct ExecutionEntry {
@@ -66,6 +101,8 @@ struct ExecutionEntry {
     finish_sequence: Option<u64>,
     duration_ms: Option<u64>,
     state: ExecutionState,
+    /// Signals the running task to cancel; taken by the first cancel request.
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 /// Status of an execution without its rows, cheap to copy for polling.
@@ -85,10 +122,18 @@ enum ViewState {
         code: Option<String>,
         message: String,
     },
+    Cancelled,
+    TimedOut,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct RunningLimitReached;
+
+#[derive(Debug, PartialEq, Eq)]
+enum CancelError {
+    NotFound,
+    NotRunning,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum ResultError {
@@ -146,6 +191,7 @@ impl ExecutionRegistry {
         owner_id: Uuid,
         connection_id: Uuid,
         database: &str,
+        cancel: oneshot::Sender<()>,
     ) -> Result<Uuid, RunningLimitReached> {
         let mut state = self.lock();
         let owned: Vec<(Uuid, u64, bool)> = state
@@ -181,6 +227,7 @@ impl ExecutionRegistry {
                 finish_sequence: None,
                 duration_ms: None,
                 state: ExecutionState::Running,
+                cancel: Some(cancel),
             },
         );
         Ok(id)
@@ -194,6 +241,7 @@ impl ExecutionRegistry {
             return;
         };
         entry.state = result;
+        entry.cancel = None;
         entry.duration_ms = Some(duration_ms);
         entry.finish_sequence = Some(finish_sequence);
         let owner_id = entry.owner_id;
@@ -213,6 +261,8 @@ impl ExecutionRegistry {
                 code: code.clone(),
                 message: message.clone(),
             },
+            ExecutionState::Cancelled => ViewState::Cancelled,
+            ExecutionState::TimedOut => ViewState::TimedOut,
         };
         Some(StatusView {
             connection_id: entry.connection_id,
@@ -234,10 +284,31 @@ impl ExecutionRegistry {
                 rows: Some(rows), ..
             } => Ok(rows.clone()),
             ExecutionState::Succeeded { rows: None, .. } => Err(ResultError::Expired),
-            ExecutionState::Running | ExecutionState::Failed { .. } => {
-                Err(ResultError::Unavailable)
-            }
+            ExecutionState::Running
+            | ExecutionState::Failed { .. }
+            | ExecutionState::Cancelled
+            | ExecutionState::TimedOut => Err(ResultError::Unavailable),
         }
+    }
+
+    /// Signals a running execution to stop. Repeated requests while it is
+    /// still stopping succeed without effect.
+    fn cancel(&self, owner_id: Uuid, id: Uuid) -> Result<(), CancelError> {
+        let mut state = self.lock();
+        let entry = state
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.owner_id == owner_id)
+            .ok_or(CancelError::NotFound)?;
+        if entry.state != ExecutionState::Running {
+            return Err(CancelError::NotRunning);
+        }
+        if let Some(cancel) = entry.cancel.take() {
+            // The receiver is gone only if the task already ended; its guard
+            // then records the final state.
+            let _ = cancel.send(());
+        }
+        Ok(())
     }
 }
 
@@ -289,9 +360,10 @@ impl Drop for FinishGuard {
 struct ExecutionsState {
     pool: PgPool,
     registry: Arc<ExecutionRegistry>,
+    timeout: Duration,
 }
 
-pub fn router(pool: PgPool) -> Router {
+pub fn router(pool: PgPool, timeout: Duration) -> Router {
     Router::new()
         .route(
             "/api/v1/connections/{id}/databases/{database}/executions",
@@ -299,10 +371,12 @@ pub fn router(pool: PgPool) -> Router {
         )
         .route("/api/v1/executions/{id}", get(status))
         .route("/api/v1/executions/{id}/result", get(result))
+        .route("/api/v1/executions/{id}/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(ExecutionsState {
             pool,
             registry: Arc::default(),
+            timeout,
         })
 }
 
@@ -382,13 +456,28 @@ async fn start(
             Ok(saved) => saved,
             Err(error) => return error.into_response(),
         };
-    let Ok(id) = state.registry.start(owner_id, connection_id, &database) else {
+    let (cancel_sender, cancel_receiver) = oneshot::channel();
+    let Ok(id) = state
+        .registry
+        .start(owner_id, connection_id, &database, cancel_sender)
+    else {
         return error_response(StatusCode::TOO_MANY_REQUESTS, "execution_limit_reached");
     };
 
     let guard = FinishGuard::new(Arc::clone(&state.registry), id);
+    let timeout = state.timeout;
     tokio::spawn(async move {
-        let result = execute_script(&connection, &database, &password, sql).await;
+        let stop = async {
+            tokio::select! {
+                () = tokio::time::sleep(timeout) => StopReason::TimedOut,
+                requested = cancel_receiver => match requested {
+                    Ok(()) => StopReason::Cancelled,
+                    // The sender only disappears once the execution finished.
+                    Err(_) => std::future::pending().await,
+                },
+            }
+        };
+        let result = execute_script(&connection, &database, &password, sql, stop).await;
         guard.finish(execution_state(result));
     });
     (
@@ -432,6 +521,8 @@ async fn status(
             None,
             Some(ExecutionErrorResponse { code, message }),
         ),
+        ViewState::Cancelled => ("cancelled", None, None),
+        ViewState::TimedOut => ("timed_out", None, None),
     };
     Json(ExecutionResponse {
         id,
@@ -472,11 +563,34 @@ async fn result(
     }
 }
 
+async fn cancel(
+    State(state): State<ExecutionsState>,
+    headers: HeaderMap,
+    path: Result<Path<Uuid>, PathRejection>,
+) -> Response {
+    let owner_id = match authenticated_owner(&state.pool, &headers).await {
+        Ok(owner_id) => owner_id,
+        Err(error) => return authentication_error_response(error),
+    };
+    let Ok(Path(id)) = path else {
+        return bad_request();
+    };
+    match state.registry.cancel(owner_id, id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(CancelError::NotFound) => error_response(StatusCode::NOT_FOUND, "not_found"),
+        Err(CancelError::NotRunning) => {
+            error_response(StatusCode::CONFLICT, "execution_not_running")
+        }
+    }
+}
+
 /// Keeps PostgreSQL's SQLSTATE and primary message for errors in the user's
 /// SQL; any other failure gets a generic message without driver text.
-fn execution_state(result: Result<ScriptOutcome, PostgresError>) -> ExecutionState {
+fn execution_state(result: Result<ScriptEnd<StopReason>, PostgresError>) -> ExecutionState {
     match result {
-        Ok(outcome) => ExecutionState::Succeeded {
+        Ok(ScriptEnd::Stopped(StopReason::Cancelled)) => ExecutionState::Cancelled,
+        Ok(ScriptEnd::Stopped(StopReason::TimedOut)) => ExecutionState::TimedOut,
+        Ok(ScriptEnd::Completed(outcome)) => ExecutionState::Succeeded {
             counts: Counts {
                 statement_count: outcome.statement_count,
                 rows_returned: outcome.rows_returned,
@@ -521,10 +635,15 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CONNECTION_FAILED_MESSAGE, Counts, ExecutionRegistry, ExecutionState, FinishGuard,
-        MAX_RESULTS_WITH_ROWS_PER_OWNER, MAX_RETAINED_PER_OWNER, MAX_RUNNING_PER_OWNER,
-        ResultError, RunningLimitReached, STOPPED_MESSAGE, ViewState, execution_state,
+        CONNECTION_FAILED_MESSAGE, CancelError, Counts, ExecutionRegistry, ExecutionState,
+        FinishGuard, MAX_RESULTS_WITH_ROWS_PER_OWNER, MAX_RETAINED_PER_OWNER,
+        MAX_RUNNING_PER_OWNER, ResultError, RunningLimitReached, STOPPED_MESSAGE, ViewState,
+        execution_state, execution_timeout,
     };
+
+    fn channel() -> tokio::sync::oneshot::Sender<()> {
+        tokio::sync::oneshot::channel().0
+    }
 
     fn succeeded() -> ExecutionState {
         ExecutionState::Succeeded {
@@ -538,20 +657,28 @@ mod tests {
         let registry = ExecutionRegistry::default();
         let owner = Uuid::new_v4();
         let ids: Vec<Uuid> = (0..MAX_RUNNING_PER_OWNER)
-            .map(|_| registry.start(owner, Uuid::new_v4(), "app").expect("start"))
+            .map(|_| {
+                registry
+                    .start(owner, Uuid::new_v4(), "app", channel())
+                    .expect("start")
+            })
             .collect();
         assert_eq!(
-            registry.start(owner, Uuid::new_v4(), "app"),
+            registry.start(owner, Uuid::new_v4(), "app", channel()),
             Err(RunningLimitReached)
         );
         assert!(
             registry
-                .start(Uuid::new_v4(), Uuid::new_v4(), "app")
+                .start(Uuid::new_v4(), Uuid::new_v4(), "app", channel())
                 .is_ok()
         );
 
         registry.finish(ids[0], succeeded(), 7);
-        assert!(registry.start(owner, Uuid::new_v4(), "app").is_ok());
+        assert!(
+            registry
+                .start(owner, Uuid::new_v4(), "app", channel())
+                .is_ok()
+        );
         assert!(
             registry.status(Uuid::new_v4(), ids[0]).is_none(),
             "owner scoped"
@@ -571,18 +698,24 @@ mod tests {
         let owner = Uuid::new_v4();
         let mut ids = Vec::new();
         for _ in 0..MAX_RETAINED_PER_OWNER {
-            let id = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+            let id = registry
+                .start(owner, Uuid::new_v4(), "app", channel())
+                .expect("start");
             registry.finish(id, succeeded(), 1);
             ids.push(id);
         }
-        let running = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        let running = registry
+            .start(owner, Uuid::new_v4(), "app", channel())
+            .expect("start");
         assert!(
             registry.status(owner, ids[0]).is_none(),
             "oldest finished evicted"
         );
         assert!(registry.status(owner, ids[1]).is_some());
         assert!(registry.status(owner, running).is_some());
-        registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        registry
+            .start(owner, Uuid::new_v4(), "app", channel())
+            .expect("start");
         assert!(registry.status(owner, ids[1]).is_none());
         assert!(
             registry.status(owner, running).is_some(),
@@ -596,7 +729,9 @@ mod tests {
         let owner = Uuid::new_v4();
         let ids: Vec<Uuid> = (0..=MAX_RESULTS_WITH_ROWS_PER_OWNER)
             .map(|_| {
-                let id = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+                let id = registry
+                    .start(owner, Uuid::new_v4(), "app", channel())
+                    .expect("start");
                 registry.finish(id, succeeded(), 1);
                 id
             })
@@ -609,7 +744,9 @@ mod tests {
             Err(ResultError::NotFound)
         );
 
-        let running = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        let running = registry
+            .start(owner, Uuid::new_v4(), "app", channel())
+            .expect("start");
         assert_eq!(
             registry.result(owner, running),
             Err(ResultError::Unavailable)
@@ -632,7 +769,9 @@ mod tests {
     fn dropped_execution_task_is_recorded_as_failed() {
         let registry = std::sync::Arc::new(ExecutionRegistry::default());
         let owner = Uuid::new_v4();
-        let id = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        let id = registry
+            .start(owner, Uuid::new_v4(), "app", channel())
+            .expect("start");
         drop(FinishGuard::new(std::sync::Arc::clone(&registry), id));
         let view = registry.status(owner, id).expect("status");
         assert_eq!(
@@ -644,11 +783,68 @@ mod tests {
         );
         assert!(view.duration_ms.is_some());
 
-        let finished = registry.start(owner, Uuid::new_v4(), "app").expect("start");
+        let finished = registry
+            .start(owner, Uuid::new_v4(), "app", channel())
+            .expect("start");
         FinishGuard::new(std::sync::Arc::clone(&registry), finished).finish(succeeded());
         assert_eq!(
             registry.status(owner, finished).expect("status").state,
             ViewState::Succeeded(Counts::default())
+        );
+    }
+
+    #[test]
+    fn execution_timeout_defaults_and_rejects_out_of_range_values() {
+        assert_eq!(
+            execution_timeout(None).expect("default"),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            execution_timeout(Some("3600".into())).expect("maximum"),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            execution_timeout(Some("1".into())).expect("minimum"),
+            Duration::from_secs(1)
+        );
+        for invalid in ["0", "3601", "-1", "5m", ""] {
+            assert!(
+                execution_timeout(Some(invalid.into())).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_signals_only_running_executions_of_the_owner() {
+        let registry = ExecutionRegistry::default();
+        let owner = Uuid::new_v4();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let id = registry
+            .start(owner, Uuid::new_v4(), "app", sender)
+            .expect("start");
+        assert_eq!(
+            registry.cancel(Uuid::new_v4(), id),
+            Err(CancelError::NotFound)
+        );
+        assert_eq!(registry.cancel(owner, id), Ok(()));
+        assert_eq!(
+            registry.cancel(owner, id),
+            Ok(()),
+            "repeated while stopping"
+        );
+        assert_eq!(receiver.await, Ok(()));
+        registry.finish(id, ExecutionState::Cancelled, 5);
+        assert_eq!(registry.cancel(owner, id), Err(CancelError::NotRunning));
+        assert_eq!(
+            registry.status(owner, id).expect("status").state,
+            ViewState::Cancelled
+        );
+        assert!(
+            registry
+                .start(owner, Uuid::new_v4(), "app", channel())
+                .is_ok(),
+            "cancelled executions free their slot"
         );
     }
 
@@ -722,7 +918,7 @@ mod tests {
         let connection_id = created["id"].as_str().expect("connection id").to_owned();
         let start_path =
             format!("/api/v1/connections/{connection_id}/databases/pgrustadmin_test/executions");
-        let app = super::router(pool.clone());
+        let app = super::router(pool.clone(), Duration::from_secs(300));
 
         let (status, started) = send(
             app.clone(),
@@ -903,6 +1099,86 @@ mod tests {
         for id in &sleeping {
             assert_eq!(wait_for(&app, id, owner).await["status"], "succeeded");
         }
+
+        let marker = Uuid::new_v4().simple().to_string();
+        let sleep_sql = format!("SELECT pg_sleep(30) /* cancel {marker} */");
+        let (_, started) = send(
+            app.clone(),
+            Method::POST,
+            &start_path,
+            owner,
+            Some(serde_json::json!({ "sql": sleep_sql })),
+        )
+        .await;
+        let id = started["id"].as_str().expect("id").to_owned();
+        wait_for_backend(&pool, &marker, 1).await;
+        let cancel_path = format!("/api/v1/executions/{id}/cancel");
+        let (status, _) = send(
+            app.clone(),
+            Method::POST,
+            &cancel_path,
+            Some(other_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(app.clone(), Method::POST, &cancel_path, owner, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let cancelled = wait_for(&app, &id, owner).await;
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(cancelled["duration_ms"].as_u64().expect("duration") < 30_000);
+        assert!(cancelled.get("result").is_none() && cancelled.get("error").is_none());
+        wait_for_backend(&pool, &marker, 0).await;
+        let (status, body) = send(app.clone(), Method::POST, &cancel_path, owner, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({"error": "execution_not_running"}));
+        let (status, _) = send(
+            app.clone(),
+            Method::GET,
+            &format!("/api/v1/executions/{id}/result"),
+            owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let short = super::router(pool.clone(), Duration::from_secs(1));
+        let marker = Uuid::new_v4().simple().to_string();
+        let (_, started) = send(
+            short.clone(),
+            Method::POST,
+            &start_path,
+            owner,
+            Some(serde_json::json!({
+                "sql": format!("SELECT 1; SELECT pg_sleep(30) /* timeout {marker} */")
+            })),
+        )
+        .await;
+        let timed_out = wait_for(&short, started["id"].as_str().expect("id"), owner).await;
+        assert_eq!(timed_out["status"], "timed_out");
+        let duration = timed_out["duration_ms"].as_u64().expect("duration");
+        assert!((1_000..30_000).contains(&duration), "{duration}");
+        wait_for_backend(&pool, &marker, 0).await;
+    }
+
+    /// Waits until `expected` backends are running the query tagged `marker`.
+    async fn wait_for_backend(pool: &sqlx::PgPool, marker: &str, expected: i64) {
+        for _ in 0..100 {
+            let running: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE state = 'active' AND query LIKE '%' || $1 || '%' \
+                   AND pid <> pg_backend_pid()",
+            )
+            .bind(marker)
+            .fetch_one(pool)
+            .await
+            .expect("query pg_stat_activity");
+            if running == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("expected {expected} backend(s) running {marker}");
     }
 
     async fn wait_for(app: &Router, id: &str, token: Option<&str>) -> serde_json::Value {

@@ -416,44 +416,97 @@ pub struct ScriptOutcome {
     pub result: ResultSet,
 }
 
+/// How a user script ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScriptEnd<T> {
+    Completed(ScriptOutcome),
+    /// `stop` resolved first with this value; the running statement was
+    /// cancelled on a best-effort basis and the connection dropped.
+    Stopped(T),
+}
+
 /// Runs arbitrary user SQL on a fresh autocommit connection to `database`
 /// with the simple query protocol, keeping only the last statement's rows.
-pub async fn execute_script(
+/// When `stop` resolves first, the backend is asked to cancel the running
+/// statement through a second connection with the same credentials.
+pub async fn execute_script<T>(
     connection: &StoredConnectionCredentials,
     database: &str,
     password: &str,
     sql: String,
-) -> Result<ScriptOutcome, sqlx::Error> {
+    stop: impl std::future::Future<Output = T>,
+) -> Result<ScriptEnd<T>, sqlx::Error> {
     let options = connection_options(connection, password)?.database(database);
-    let mut connection = tokio::time::timeout(
+    tokio::pin!(stop);
+    let connect = tokio::time::timeout(
         CONNECTION_TEST_TIMEOUT,
         sqlx::PgConnection::connect_with(&options),
-    )
-    .await
-    .map_err(|_| sqlx::Error::PoolTimedOut)??;
-    let outcome = {
-        // Arbitrary SQL is the feature: it is deliberately neither parsed nor filtered.
-        let mut results = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_many(&mut connection);
-        let mut outcome = ScriptOutcome::default();
-        let mut current = ResultSet::default();
-        while let Some(item) = results.try_next().await? {
-            match item {
-                sqlx::Either::Left(result) => {
-                    let finished = std::mem::take(&mut current);
-                    outcome = ScriptOutcome {
-                        statement_count: outcome.statement_count + 1,
-                        rows_returned: finished.total_rows,
-                        rows_affected: result.rows_affected(),
-                        result: finished,
-                    };
-                }
-                sqlx::Either::Right(row) => current.push(&row)?,
-            }
-        }
-        outcome
+    );
+    let mut connection = tokio::select! {
+        connected = connect => connected.map_err(|_| sqlx::Error::PoolTimedOut)??,
+        reason = &mut stop => return Ok(ScriptEnd::Stopped(reason)),
     };
-    connection.close().await?;
+    let backend_pid: i32 = tokio::select! {
+        pid = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut connection) => pid?,
+        reason = &mut stop => return Ok(ScriptEnd::Stopped(reason)),
+    };
+    let finished = tokio::select! {
+        outcome = run_script(&mut connection, sql) => Ok(outcome),
+        reason = &mut stop => Err(reason),
+    };
+    match finished {
+        Ok(outcome) => {
+            let outcome = outcome?;
+            connection.close().await?;
+            Ok(ScriptEnd::Completed(outcome))
+        }
+        Err(reason) => {
+            // The protocol state of an interrupted stream is unknown, so the
+            // connection is dropped instead of being closed gracefully.
+            cancel_backend(&options, backend_pid).await;
+            drop(connection);
+            Ok(ScriptEnd::Stopped(reason))
+        }
+    }
+}
+
+async fn run_script(
+    connection: &mut sqlx::PgConnection,
+    sql: String,
+) -> Result<ScriptOutcome, sqlx::Error> {
+    // Arbitrary SQL is the feature: it is deliberately neither parsed nor filtered.
+    let mut results = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).fetch_many(connection);
+    let mut outcome = ScriptOutcome::default();
+    let mut current = ResultSet::default();
+    while let Some(item) = results.try_next().await? {
+        match item {
+            sqlx::Either::Left(result) => {
+                let finished = std::mem::take(&mut current);
+                outcome = ScriptOutcome {
+                    statement_count: outcome.statement_count + 1,
+                    rows_returned: finished.total_rows,
+                    rows_affected: result.rows_affected(),
+                    result: finished,
+                };
+            }
+            sqlx::Either::Right(row) => current.push(&row)?,
+        }
+    }
     Ok(outcome)
+}
+
+/// Asks PostgreSQL to cancel the statement running in `backend_pid`. Failure
+/// only means the backend may finish its current statement; it is ignored.
+async fn cancel_backend(options: &PgConnectOptions, backend_pid: i32) {
+    let cancel = async {
+        let mut connection = sqlx::PgConnection::connect_with(options).await?;
+        sqlx::query("SELECT pg_cancel_backend($1)")
+            .bind(backend_pid)
+            .execute(&mut connection)
+            .await?;
+        connection.close().await
+    };
+    let _ = tokio::time::timeout(CONNECTION_TEST_TIMEOUT, cancel).await;
 }
 
 fn connection_options(
