@@ -1,15 +1,17 @@
-use std::{ffi::OsStr, io, net::SocketAddr};
+use std::{ffi::OsStr, io, net::SocketAddr, path::PathBuf};
 
 use axum::Router;
 pub mod api;
 pub mod auth;
 pub mod connections;
 pub mod credentials;
+pub mod sql_files;
 
 use api::router as api_router;
 use auth::handlers::router as auth_router;
 use connections::router as connections_router;
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
+use sql_files::{SQL_FILES_DIR_ENV, router as sql_files_router};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -52,11 +54,17 @@ async fn run_server() -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
+    let sql_files_dir = std::env::var_os(SQL_FILES_DIR_ENV).map(PathBuf::from);
+    if sql_files_dir.is_none() {
+        tracing::warn!("{SQL_FILES_DIR_ENV} is not set; SQL file routes respond 503");
+    }
+
     tracing::info!(%local_addr, "server listening");
     let app = Router::new()
         .merge(api_router())
         .merge(auth_router(metadata_pool.clone()))
-        .merge(connections_router(metadata_pool));
+        .merge(connections_router(metadata_pool.clone()))
+        .merge(sql_files_router(metadata_pool, sql_files_dir));
     axum::serve(listener, app).await
 }
 
