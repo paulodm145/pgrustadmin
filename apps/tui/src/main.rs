@@ -1,5 +1,6 @@
 mod sql_editor;
 mod sql_tabs;
+mod theme;
 
 use std::{io, time::Duration};
 
@@ -19,13 +20,14 @@ use pgrustadmin_api_client::{
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs,
     },
 };
 use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId, TabResult};
+use theme::{THEME_ENV, Theme, detect_color_mode, parse_theme_name};
 use tokio::{sync::oneshot, task::JoinHandle};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -343,6 +345,7 @@ struct App {
     confirm_explain: Option<TabId>,
     /// Whether the SQL section's arrow keys scroll the active tab's result.
     result_focus: bool,
+    theme: Theme,
     selected_relation: usize,
     relation_page: u64,
     form: Option<ConnectionForm>,
@@ -401,6 +404,7 @@ impl App {
             executions: Vec::new(),
             confirm_explain: None,
             result_focus: false,
+            theme: Theme::default(),
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -410,6 +414,11 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> UiAction {
         if key.kind != KeyEventKind::Press {
+            return UiAction::None;
+        }
+        if key.code == KeyCode::F(2) {
+            self.theme = self.theme.toggled();
+            self.message = format!("Theme: {}.", self.theme.name().label());
             return UiAction::None;
         }
         let ctrl_c =
@@ -1592,6 +1601,18 @@ fn api_error_message(error: ApiError) -> &'static str {
 
 async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Result<()> {
     let mut app = App::new(client);
+    let mode = detect_color_mode(
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("COLORTERM").as_deref(),
+    );
+    let name = match parse_theme_name(std::env::var_os(THEME_ENV).as_deref()) {
+        Ok(name) => name.unwrap_or(theme::ThemeName::Dark),
+        Err(()) => {
+            app.message = format!("Unknown {THEME_ENV}; using the dark theme.");
+            theme::ThemeName::Dark
+        }
+    };
+    app.theme = Theme::new(name, mode);
     let mut events = EventStream::new();
     let mut redraw = tokio::time::interval(Duration::from_millis(100));
     terminal.draw(|frame| render(frame, &app))?;
@@ -1654,7 +1675,9 @@ fn start_action(app: &mut App, action: UiAction) {
 }
 
 fn render(frame: &mut Frame<'_>, app: &App) {
+    let theme = &app.theme;
     let area = frame.area();
+    frame.render_widget(Block::default().style(theme.base()), area);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1676,7 +1699,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     match &app.state {
         ScreenState::Authenticated(session) => {
             if let Some(form) = &app.form {
-                render_connection_form(frame, sections[1], form, &app.message);
+                render_connection_form(frame, theme, sections[1], form, &app.message);
             } else if app.view == 1 {
                 render_connections(frame, sections[1], app);
             } else if app.view == 2 {
@@ -1688,6 +1711,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 let title = format!(" Databases — {} ", app.catalog_connection_name);
                 render_catalog_list(
                     frame,
+                    theme,
                     sections[1],
                     &title,
                     items,
@@ -1706,6 +1730,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 );
                 render_catalog_list(
                     frame,
+                    theme,
                     sections[1],
                     &title,
                     items,
@@ -1725,7 +1750,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                             Span::raw(relation.name.as_str()),
                             Span::styled(
                                 format!("  {}", relation_kind_label(relation.kind)),
-                                Style::default().fg(Color::DarkGray),
+                                theme.muted(),
                             ),
                         ]))
                     })
@@ -1739,6 +1764,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
                 );
                 render_catalog_list(
                     frame,
+                    theme,
                     sections[1],
                     &title,
                     items,
@@ -1789,7 +1815,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
         "↑/↓: navigate columns   r: reload   Tab/Esc: relations   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
-        "Tab/Enter: open Connections   s: SQL tabs   ↑/↓: select   q/Esc: quit"
+        "Tab/Enter: open Connections   s: SQL tabs   F2: theme   q/Esc: quit"
     } else {
         "Tab: next field   Enter: continue/sign in   Esc: quit"
     };
@@ -1800,6 +1826,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_login(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ScreenState) {
+    let theme = &app.theme;
     let form = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1815,35 +1842,39 @@ fn render_login(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ScreenStat
         _ => None,
     };
     frame.render_widget(
-        Paragraph::new(app.login_email.as_str())
-            .block(field_block("Email", focus == Some(LoginField::Email))),
+        Paragraph::new(app.login_email.as_str()).block(field_block(
+            theme,
+            "Email",
+            focus == Some(LoginField::Email),
+        )),
         form[0],
     );
     let masked_password = "•".repeat(app.login_password.chars().count());
     frame.render_widget(
-        Paragraph::new(masked_password)
-            .block(field_block("Password", focus == Some(LoginField::Password))),
+        Paragraph::new(masked_password).block(field_block(
+            theme,
+            "Password",
+            focus == Some(LoginField::Password),
+        )),
         form[1],
     );
     let status = match state {
         ScreenState::EditingLogin {
             error: Some(error), ..
         } => error.as_str(),
+        ScreenState::EditingLogin { error: None, .. } if !app.message.is_empty() => {
+            app.message.as_str()
+        }
         ScreenState::EditingLogin { error: None, .. } => "Sign in with your PGRustAdmin account.",
         ScreenState::Authenticating => "Signing in and checking session…",
         ScreenState::Authenticated(_) => "",
     };
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::Yellow)),
-        form[2],
-    );
+    frame.render_widget(Paragraph::new(status).style(theme.warning()), form[2]);
 }
 
-fn field_block(title: &'static str, focused: bool) -> Block<'static> {
+fn field_block(theme: &Theme, title: &'static str, focused: bool) -> Block<'static> {
     let style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        theme.focus()
     } else {
         Style::default()
     };
@@ -1854,6 +1885,7 @@ fn field_block(title: &'static str, focused: bool) -> Block<'static> {
 }
 
 fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App, session: &AuthSession) {
+    let theme = &app.theme;
     let layout = responsive_layout(area);
     let menu = List::new(
         MENU_ITEMS
@@ -1861,20 +1893,12 @@ fn render_workspace(frame: &mut Frame<'_>, area: Rect, app: &App, session: &Auth
             .map(|item| ListItem::new(Line::from(format!(" {item}")))),
     )
     .block(Block::default().borders(Borders::ALL).title(" Sections "))
-    .highlight_style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    )
+    .highlight_style(theme.selection())
     .highlight_symbol("› ");
     let mut menu_state = ListState::default().with_selected(Some(app.view));
     frame.render_stateful_widget(menu, layout[0], &mut menu_state);
     let content = Text::from(vec![
-        Line::from("Overview").style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Line::from("Overview").style(theme.focus()),
         Line::from("Authenticated session is active."),
         Line::from(format!("User: {}", session.user_id)),
         Line::from(format!("Session lifetime: {} seconds", session.expires_in)),
@@ -1906,6 +1930,7 @@ fn responsive_layout(area: Rect) -> Vec<Rect> {
 }
 
 fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = &app.theme;
     let layout = responsive_layout(area);
     let items = app.connections.iter().map(|connection| {
         ListItem::new(vec![
@@ -1919,11 +1944,7 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .borders(Borders::ALL)
                 .title(" Connections "),
         )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        )
+        .highlight_style(theme.selection())
         .highlight_symbol("› ");
     let mut list_state = ListState::default()
         .with_selected((!app.connections.is_empty()).then_some(app.selected_connection));
@@ -1931,11 +1952,7 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let details = if let Some(connection) = app.connections.get(app.selected_connection) {
         Text::from(vec![
-            Line::from(connection.name.as_str()).style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Line::from(connection.name.as_str()).style(theme.focus()),
             Line::from(format!("Host: {}:{}", connection.host, connection.port)),
             Line::from(format!("Database: {}", connection.database)),
             Line::from(format!("Username: {}", connection.username)),
@@ -1982,7 +1999,7 @@ fn relation_kind_label(kind: RelationKind) -> &'static str {
     }
 }
 
-fn column_line(column: &Column) -> Line<'_> {
+fn column_line<'a>(theme: &Theme, column: &'a Column) -> Line<'a> {
     let mut details = Vec::new();
     if !column.nullable {
         details.push("not null".to_owned());
@@ -2005,18 +2022,12 @@ fn column_line(column: &Column) -> Line<'_> {
     }
     Line::from(vec![
         Span::raw(column.name.as_str()),
-        Span::styled(
-            format!("  {}", column.data_type),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(
-            format!("  {}", details.join(", ")),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("  {}", column.data_type), theme.accent()),
+        Span::styled(format!("  {}", details.join(", ")), theme.muted()),
     ])
 }
 
-fn index_line(index: &Index) -> Line<'_> {
+fn index_line<'a>(theme: &Theme, index: &'a Index) -> Line<'a> {
     let mut flags = Vec::new();
     if index.primary {
         flags.push("primary");
@@ -2028,16 +2039,14 @@ fn index_line(index: &Index) -> Line<'_> {
         Span::raw(index.name.as_str()),
         Span::styled(
             format!("  {} ({})", index.method, index.columns.join(", ")),
-            Style::default().fg(Color::Cyan),
+            theme.accent(),
         ),
-        Span::styled(
-            format!("  {}", flags.join(", ")),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("  {}", flags.join(", ")), theme.muted()),
     ])
 }
 
 fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = &app.theme;
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2049,12 +2058,12 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let execution = app
         .sql_tabs
         .active()
-        .map(|tab| execution_line(&tab.execution))
+        .map(|tab| execution_line(theme, &tab.execution))
         .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(vec![
             execution,
-            Line::styled(app.message.as_str(), Style::default().fg(Color::Yellow)),
+            Line::styled(app.message.as_str(), theme.warning()),
         ]),
         panes[2],
     );
@@ -2076,11 +2085,7 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title(" SQL tabs "))
         .select(app.sql_tabs.active_index())
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        );
+        .highlight_style(theme.selection());
     frame.render_widget(tabs, panes[0]);
 
     let Some(tab) = app.sql_tabs.active() else {
@@ -2106,7 +2111,7 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 TabExecution::Succeeded { duration_ms, .. } => duration_text(" ·", duration_ms),
                 _ => String::new(),
             };
-            render_result(frame, split[1], result, app.result_focus, &duration);
+            render_result(frame, theme, split[1], result, app.result_focus, &duration);
             split[0]
         }
         None => panes[1],
@@ -2118,8 +2123,7 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let editor = &tab.editor;
     if !app.sql_editing && editor.text().is_empty() {
         frame.render_widget(
-            Paragraph::new("No SQL yet. Press Enter to edit.")
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("No SQL yet. Press Enter to edit.").style(theme.muted()),
             inner,
         );
         return;
@@ -2150,10 +2154,10 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn execution_line(execution: &TabExecution) -> Line<'static> {
+fn execution_line(theme: &Theme, execution: &TabExecution) -> Line<'static> {
     match execution {
         TabExecution::Idle => Line::default(),
-        TabExecution::Running => Line::styled("Running…", Style::default().fg(Color::Cyan)),
+        TabExecution::Running => Line::styled("Running…", theme.accent()),
         TabExecution::Succeeded {
             counts,
             duration_ms,
@@ -2165,7 +2169,7 @@ fn execution_line(execution: &TabExecution) -> Line<'static> {
                 counts.rows_returned,
                 counts.rows_affected
             ),
-            Style::default().fg(Color::Green),
+            theme.success(),
         ),
         TabExecution::Failed {
             code,
@@ -2181,16 +2185,16 @@ fn execution_line(execution: &TabExecution) -> Line<'static> {
                     "Failed{}{code}: {message}",
                     duration_text(" after", *duration_ms)
                 ),
-                Style::default().fg(Color::Red),
+                theme.error(),
             )
         }
         TabExecution::Cancelled { duration_ms } => Line::styled(
             format!("Cancelled{}.", duration_text(" after", *duration_ms)),
-            Style::default().fg(Color::Yellow),
+            theme.warning(),
         ),
         TabExecution::TimedOut { duration_ms } => Line::styled(
             format!("Timed out{}.", duration_text(" after", *duration_ms)),
-            Style::default().fg(Color::Red),
+            theme.error(),
         ),
     }
 }
@@ -2260,6 +2264,7 @@ fn duration_text(prefix: &str, duration_ms: Option<u64>) -> String {
 /// Renders the result table, showing the columns from `first_column` that fit.
 fn render_result(
     frame: &mut Frame<'_>,
+    theme: &Theme,
     area: Rect,
     result: &TabResult,
     focused: bool,
@@ -2272,7 +2277,7 @@ fn render_result(
         rows.stored_rows, rows.total_rows
     );
     let border = if focused {
-        Style::default().fg(Color::Cyan)
+        theme.focus_border()
     } else {
         Style::default()
     };
@@ -2284,8 +2289,7 @@ fn render_result(
     frame.render_widget(block, area);
     if rows.columns.is_empty() {
         frame.render_widget(
-            Paragraph::new("The last statement returned no rows.")
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new("The last statement returned no rows.").style(theme.muted()),
             inner,
         );
         return;
@@ -2325,7 +2329,7 @@ fn render_result(
                 .iter()
                 .map(|value| match value {
                     Some(text) => Cell::from(text.as_str()),
-                    None => Cell::from("NULL").style(Style::default().fg(Color::DarkGray)),
+                    None => Cell::from("NULL").style(theme.muted()),
                 }),
         )
     });
@@ -2338,6 +2342,7 @@ fn render_result(
 
 /// Draws the save-as prompt or the file picker over `area`.
 fn render_file_overlays(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = &app.theme;
     if let Some(prompt) = &app.file_prompt {
         let popup = centered(area, 60, 3);
         frame.render_widget(Clear, popup);
@@ -2345,6 +2350,7 @@ fn render_file_overlays(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Paragraph::new(format!("{}▏", prompt.name)).block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .style(theme.surface())
                     .title(" Save SQL file as "),
             ),
             popup,
@@ -2360,10 +2366,7 @@ fn render_file_overlays(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .map(|file| {
                 ListItem::new(Line::from(vec![
                     Span::raw(file.name.as_str()),
-                    Span::styled(
-                        format!("  {} bytes", file.size_bytes),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("  {} bytes", file.size_bytes), theme.muted()),
                 ]))
             })
             .collect();
@@ -2371,13 +2374,10 @@ fn render_file_overlays(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .style(theme.surface())
                     .title(" Open SQL file "),
             )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-            )
+            .highlight_style(theme.selection())
             .highlight_symbol("› ");
         let mut state = ListState::default().with_selected(Some(picker.selected));
         frame.render_widget(Clear, popup);
@@ -2399,6 +2399,7 @@ fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
 }
 
 fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = &app.theme;
     let panes = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
@@ -2410,10 +2411,11 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let items = app
         .columns
         .iter()
-        .map(|column| ListItem::new(column_line(column)))
+        .map(|column| ListItem::new(column_line(theme, column)))
         .collect();
     render_catalog_list(
         frame,
+        theme,
         panes[0],
         &title,
         items,
@@ -2432,7 +2434,7 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let items: Vec<_> = app
             .indexes
             .iter()
-            .map(|index| ListItem::new(index_line(index)))
+            .map(|index| ListItem::new(index_line(theme, index)))
             .collect();
         frame.render_widget(List::new(items).block(block), panes[1]);
     }
@@ -2440,6 +2442,7 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_catalog_list(
     frame: &mut Frame<'_>,
+    theme: &Theme,
     area: Rect,
     title: &str,
     items: Vec<ListItem<'_>>,
@@ -2449,23 +2452,22 @@ fn render_catalog_list(
     let is_empty = items.is_empty();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        )
+        .highlight_style(theme.selection())
         .highlight_symbol("› ");
     let mut list_state = ListState::default().with_selected((!is_empty).then_some(selected));
     frame.render_stateful_widget(list, area, &mut list_state);
     if is_empty {
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(Color::Yellow)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(message).style(theme.warning()), area);
     }
 }
 
-fn render_connection_form(frame: &mut Frame<'_>, area: Rect, form: &ConnectionForm, message: &str) {
+fn render_connection_form(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    form: &ConnectionForm,
+    message: &str,
+) {
     let values = [
         form.name.as_str().to_owned(),
         form.host.as_str().to_owned(),
@@ -2486,9 +2488,7 @@ fn render_connection_form(frame: &mut Frame<'_>, area: Rect, form: &ConnectionFo
         .map(|(index, (label, value))| {
             let marker = if index == form.focus { "›" } else { " " };
             let style = if index == form.focus {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                theme.focus()
             } else {
                 Style::default()
             };
@@ -3687,6 +3687,54 @@ mod tests {
             );
             assert!(render_text(&app).contains(expected), "{expected}");
         }
+    }
+
+    fn background_at_origin(app: &App) -> Option<ratatui::style::Color> {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("render app");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .first()
+            .map(|cell| cell.bg)
+    }
+
+    #[test]
+    fn f2_switches_theme_everywhere_without_typing() {
+        use ratatui::style::Color;
+
+        let mut app = App::new(client());
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.login_email, "", "F2 is not text");
+        assert!(
+            render_text(&app).contains("Theme: light."),
+            "login shows messages"
+        );
+        assert_eq!(app.theme.name(), crate::theme::ThemeName::Light);
+        assert_eq!(
+            background_at_origin(&app),
+            Some(Color::Rgb(0xF5, 0xF7, 0xFA))
+        );
+
+        let mut app = authenticated_app();
+        assert_eq!(
+            background_at_origin(&app),
+            Some(Color::Rgb(0x17, 0x19, 0x1F))
+        );
+        assert!(render_text(&app).contains("F2: theme"));
+        press(&mut app, KeyCode::F(2));
+        assert!(app.message.contains("light"));
+        press(&mut app, KeyCode::F(2));
+        assert_eq!(app.theme.name(), crate::theme::ThemeName::Dark);
+
+        app.theme = crate::theme::Theme::new(
+            crate::theme::ThemeName::Dark,
+            crate::theme::ColorMode::Monochrome,
+        );
+        assert_eq!(background_at_origin(&app), Some(Color::Reset));
     }
 
     #[test]
