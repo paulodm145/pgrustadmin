@@ -40,6 +40,12 @@ pub enum TabExecution {
         message: String,
         duration_ms: Option<u64>,
     },
+    Cancelled {
+        duration_ms: Option<u64>,
+    },
+    TimedOut {
+        duration_ms: Option<u64>,
+    },
 }
 
 /// Rows of the tab's latest successful execution and the scroll position.

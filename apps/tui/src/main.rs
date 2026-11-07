@@ -26,7 +26,7 @@ use ratatui::{
     },
 };
 use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId, TabResult};
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -93,6 +93,7 @@ enum Operation {
     SaveFile { tab: TabId },
     CreateFile { tab: TabId },
     OverwriteFile { tab: TabId },
+    CancelExecution { id: Uuid },
 }
 
 enum OperationResult {
@@ -112,6 +113,7 @@ enum OperationResult {
         content: String,
         result: Result<SqlFile, ApiError>,
     },
+    CancelRequested(Result<(), ApiError>),
 }
 
 #[derive(Clone, Copy)]
@@ -132,12 +134,31 @@ enum UiAction {
     CreateFile(TabId),
     OverwriteFile(TabId),
     ExecuteSql(TabId),
+    CancelExecution(Uuid),
 }
 
 /// A finished execution and, when it succeeded, the request for its rows.
 struct FinishedExecution {
     execution: Execution,
     rows: Option<Result<ExecutionRows, ApiError>>,
+}
+
+/// An execution followed by a background task for one tab.
+struct TrackedExecution {
+    tab: TabId,
+    handle: JoinHandle<Result<FinishedExecution, ApiError>>,
+    /// Delivers the server's execution ID once the start request succeeds.
+    id_receiver: oneshot::Receiver<Uuid>,
+    id: Option<Uuid>,
+}
+
+impl TrackedExecution {
+    fn id(&mut self) -> Option<Uuid> {
+        if self.id.is_none() {
+            self.id = self.id_receiver.try_recv().ok();
+        }
+        self.id
+    }
 }
 
 /// Name typed for "save as" on one SQL tab.
@@ -317,7 +338,9 @@ struct App {
     /// Authenticated client copy for execution polling, which runs beside
     /// other API operations.
     execution_client: Option<ApiClient>,
-    executions: Vec<(TabId, JoinHandle<Result<FinishedExecution, ApiError>>)>,
+    executions: Vec<TrackedExecution>,
+    /// Tab waiting for confirmation before running `EXPLAIN ANALYZE`.
+    confirm_explain: Option<TabId>,
     /// Whether the SQL section's arrow keys scroll the active tab's result.
     result_focus: bool,
     selected_relation: usize,
@@ -376,6 +399,7 @@ impl App {
             file_picker: None,
             execution_client: None,
             executions: Vec::new(),
+            confirm_explain: None,
             result_focus: false,
             form: None,
             confirm_delete: None,
@@ -404,6 +428,20 @@ impl App {
         }
         if ctrl_c {
             self.request_quit();
+            return UiAction::None;
+        }
+        if let Some(tab) = self.confirm_explain {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_explain = None;
+                    return UiAction::ExecuteSql(tab);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_explain = None;
+                    self.message = "Execution cancelled.".to_owned();
+                }
+                _ => {}
+            }
             return UiAction::None;
         }
         if self.confirm_close_tab {
@@ -588,11 +626,14 @@ impl App {
                                     self.message = "This tab is already running SQL.".to_owned();
                                 } else if tab.editor.text().trim().is_empty() {
                                     self.message = "This tab has no SQL to execute.".to_owned();
+                                } else if mentions_explain_analyze(&tab.editor.text()) {
+                                    self.confirm_explain = Some(tab.id);
                                 } else {
                                     return UiAction::ExecuteSql(tab.id);
                                 }
                             }
                         }
+                        KeyCode::Char('c') => return self.cancel_action(),
                         KeyCode::Char('x') => {
                             if self.sql_tabs.active().is_some_and(SqlTab::is_dirty) {
                                 self.confirm_close_tab = true;
@@ -878,10 +919,13 @@ impl App {
         tab.result = None;
         self.result_focus = false;
         self.message.clear();
+        let (id_sender, id_receiver) = oneshot::channel();
         let handle = tokio::spawn(async move {
             let started = client
                 .start_execution(connection_id, &database, &sql)
                 .await?;
+            // The TUI may have stopped tracking the tab; nothing to notify then.
+            let _ = id_sender.send(started.id);
             loop {
                 tokio::time::sleep(EXECUTION_POLL_INTERVAL).await;
                 let execution = client.execution(started.id).await?;
@@ -896,17 +940,25 @@ impl App {
                 return Ok(FinishedExecution { execution, rows });
             }
         });
-        self.executions.push((tab_id, handle));
+        self.executions.push(TrackedExecution {
+            tab: tab_id,
+            handle,
+            id_receiver,
+            id: None,
+        });
     }
 
     async fn complete_executions(&mut self) {
         let (finished, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.executions)
             .into_iter()
-            .partition(|(_, handle)| handle.is_finished());
+            .partition(|tracked| tracked.handle.is_finished());
         self.executions = running;
-        for (tab, handle) in finished {
-            let result = handle.await.unwrap_or(Err(ApiError::InvalidResponse));
-            self.finish_execution(tab, result);
+        for tracked in finished {
+            let result = tracked
+                .handle
+                .await
+                .unwrap_or(Err(ApiError::InvalidResponse));
+            self.finish_execution(tracked.tab, result);
         }
     }
 
@@ -936,6 +988,14 @@ impl App {
                 duration_ms,
             },
             Execution {
+                status: ExecutionStatus::Cancelled,
+                ..
+            } => TabExecution::Cancelled { duration_ms },
+            Execution {
+                status: ExecutionStatus::TimedOut,
+                ..
+            } => TabExecution::TimedOut { duration_ms },
+            Execution {
                 error: Some(error), ..
             } => TabExecution::Failed {
                 code: error.code,
@@ -958,6 +1018,27 @@ impl App {
                 );
             }
             None => tab.result = None,
+        }
+    }
+
+    fn cancel_action(&mut self) -> UiAction {
+        let Some(tab) = self.sql_tabs.active().map(|tab| tab.id) else {
+            return UiAction::None;
+        };
+        let Some(tracked) = self
+            .executions
+            .iter_mut()
+            .find(|tracked| tracked.tab == tab)
+        else {
+            self.message = "This tab is not running SQL.".to_owned();
+            return UiAction::None;
+        };
+        match tracked.id() {
+            Some(id) => UiAction::CancelExecution(id),
+            None => {
+                self.message = "The execution is still starting. Try again.".to_owned();
+                UiAction::None
+            }
         }
     }
 
@@ -1012,11 +1093,11 @@ impl App {
 
     fn close_sql_tab(&mut self) {
         if let Some(closed) = self.sql_tabs.close_active() {
-            self.executions.retain(|(tab, handle)| {
-                if *tab == closed.id {
-                    handle.abort();
+            self.executions.retain(|tracked| {
+                if tracked.tab == closed.id {
+                    tracked.handle.abort();
                 }
-                *tab != closed.id
+                tracked.tab != closed.id
             });
         }
         if self.sql_tabs.is_empty() {
@@ -1135,6 +1216,7 @@ impl App {
                 self.client = Some(client);
                 return;
             }
+            UiAction::CancelExecution(_) => self.message = "Cancelling execution…".to_owned(),
             UiAction::SaveFile(_) | UiAction::CreateFile(_) | UiAction::OverwriteFile(_) => {
                 self.message = "Saving SQL file…".to_owned();
             }
@@ -1315,6 +1397,18 @@ impl App {
             }
             OperationResult::Deleted(Err(error)) => {
                 self.message = api_error_message(error).to_owned();
+            }
+            OperationResult::CancelRequested(Ok(())) => {
+                self.message = "Cancellation requested.".to_owned();
+            }
+            OperationResult::CancelRequested(Err(ApiError::Http {
+                code: Some("execution_not_running"),
+                ..
+            })) => {
+                self.message = "The execution already finished.".to_owned();
+            }
+            OperationResult::CancelRequested(Err(error)) => {
+                self.message = execution_error_message(error).to_owned();
             }
             OperationResult::Files(Ok(files)) => {
                 if files.is_empty() {
@@ -1554,6 +1648,7 @@ fn start_action(app: &mut App, action: UiAction) {
         UiAction::SaveFile(tab) => Operation::SaveFile { tab },
         UiAction::CreateFile(tab) => Operation::CreateFile { tab },
         UiAction::OverwriteFile(tab) => Operation::OverwriteFile { tab },
+        UiAction::CancelExecution(id) => Operation::CancelExecution { id },
     };
     app.start_operation(operation, action);
 }
@@ -1565,7 +1660,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(2),
+            // Bordered footer: one line of shortcuts between the borders.
+            Constraint::Length(3),
         ])
         .split(area);
     frame.render_widget(
@@ -1658,6 +1754,8 @@ fn render(frame: &mut Frame<'_>, app: &App) {
 
     let footer_text = if app.confirm_quit {
         "Unsaved SQL changes will be lost. Quit anyway? y: quit   n/Esc: cancel"
+    } else if app.confirm_explain.is_some() {
+        "EXPLAIN ANALYZE runs the analyzed statement. Execute anyway? y: run   n/Esc: cancel"
     } else if app.confirm_close_tab {
         "Close tab with unsaved changes? y: close   n/Esc: cancel"
     } else if app.file_prompt.is_some() {
@@ -1680,7 +1778,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         if app.result_focus {
             "↑↓ PgUp PgDn: rows  ←→: columns  Tab: editor  e: run  Esc: back  q: quit"
         } else {
-            "Enter/i: edit  e: run  Tab: result  w/W: save  o: open  [ ]: tabs  x: close  Esc: back"
+            "Enter/i: edit  e: run  c: cancel  Tab: result  w/W: save  o: open  [ ]: tabs  x: close"
         }
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
         "↑/↓: navigate   Enter: schemas   s: new SQL tab   r: reload   Tab/Esc: connections   q: quit"
@@ -2086,7 +2184,71 @@ fn execution_line(execution: &TabExecution) -> Line<'static> {
                 Style::default().fg(Color::Red),
             )
         }
+        TabExecution::Cancelled { duration_ms } => Line::styled(
+            format!("Cancelled{}.", duration_text(" after", *duration_ms)),
+            Style::default().fg(Color::Yellow),
+        ),
+        TabExecution::TimedOut { duration_ms } => Line::styled(
+            format!("Timed out{}.", duration_text(" after", *duration_ms)),
+            Style::default().fg(Color::Red),
+        ),
     }
+}
+
+/// Heuristic warning check: whether a word `EXPLAIN` is followed by
+/// `ANALYZE`/`ANALYSE` before the next `;`, ignoring `--` and `/* */`
+/// comments and letter case. It may warn needlessly (for example inside
+/// string literals) and never changes or blocks the SQL.
+fn mentions_explain_analyze(sql: &str) -> bool {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    let finish_word = |word: &mut String, words: &mut Vec<String>| {
+        if !word.is_empty() {
+            words.push(std::mem::take(word).to_ascii_lowercase());
+        }
+    };
+    while let Some(character) = chars.next() {
+        match character {
+            '-' if chars.peek() == Some(&'-') => {
+                finish_word(&mut word, &mut words);
+                for skipped in chars.by_ref() {
+                    if skipped == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                finish_word(&mut word, &mut words);
+                chars.next();
+                let mut previous = '\0';
+                for skipped in chars.by_ref() {
+                    if previous == '*' && skipped == '/' {
+                        break;
+                    }
+                    previous = skipped;
+                }
+            }
+            ';' => {
+                finish_word(&mut word, &mut words);
+                words.push(";".to_owned());
+            }
+            character if character.is_alphanumeric() || character == '_' => word.push(character),
+            _ => finish_word(&mut word, &mut words),
+        }
+    }
+    finish_word(&mut word, &mut words);
+
+    let mut after_explain = false;
+    for word in words {
+        match word.as_str() {
+            "explain" => after_explain = true,
+            "analyze" | "analyse" if after_explain => return true,
+            ";" => after_explain = false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn duration_text(prefix: &str, duration_ms: Option<u64>) -> String {
@@ -2446,6 +2608,9 @@ async fn run_operation(
         Operation::DeleteConnection { id } => {
             OperationResult::Deleted(client.delete_connection(id).await)
         }
+        Operation::CancelExecution { id } => {
+            OperationResult::CancelRequested(client.cancel_execution(id).await)
+        }
         Operation::ListFiles => OperationResult::Files(
             client
                 .list_sql_files(1, FILE_LIST_SIZE)
@@ -2511,7 +2676,8 @@ mod tests {
 
     use super::{
         App, ConnectionForm, FinishedExecution, LoginField, MAX_SQL_TABS, OperationResult,
-        SQL_VIEW, ScreenState, TabExecution, TabResult, UiAction, render,
+        SQL_VIEW, ScreenState, TabExecution, TabId, TabResult, TrackedExecution, UiAction,
+        mentions_explain_analyze, render,
     };
 
     fn client() -> ApiClient {
@@ -3436,8 +3602,8 @@ mod tests {
         assert_eq!(tab.execution, TabExecution::Running);
         assert!(!app.result_focus);
         assert_eq!(app.executions.len(), 1);
-        for (_, handle) in app.executions.drain(..) {
-            handle.abort();
+        for tracked in app.executions.drain(..) {
+            tracked.handle.abort();
         }
     }
 
@@ -3445,11 +3611,142 @@ mod tests {
     async fn closing_a_tab_stops_tracking_its_execution() {
         let mut app = app_with_sql_tab();
         let tab_id = app.sql_tabs.active().expect("active tab").id;
-        app.executions
-            .push((tab_id, tokio::spawn(std::future::pending())));
+        app.executions.push(tracked(tab_id, None));
         press(&mut app, KeyCode::Char('x'));
         assert!(app.sql_tabs.is_empty());
         assert!(app.executions.is_empty());
+    }
+
+    /// A tracked execution whose server ID is `id` once delivered.
+    fn tracked(tab: TabId, id: Option<Uuid>) -> TrackedExecution {
+        let (sender, id_receiver) = tokio::sync::oneshot::channel();
+        if let Some(id) = id {
+            sender.send(id).expect("deliver execution id");
+        }
+        TrackedExecution {
+            tab,
+            handle: tokio::spawn(std::future::pending()),
+            id_receiver,
+            id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_key_needs_a_running_execution_with_a_known_id() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c')),
+            UiAction::None
+        ));
+        assert!(app.message.contains("not running"));
+
+        app.executions.push(tracked(tab_id, None));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c')),
+            UiAction::None
+        ));
+        assert!(app.message.contains("still starting"));
+
+        let id = Uuid::new_v4();
+        for tracked in app.executions.drain(..) {
+            tracked.handle.abort();
+        }
+        app.executions.push(tracked(tab_id, Some(id)));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('c')),
+            UiAction::CancelExecution(cancelled) if cancelled == id
+        ));
+        app.apply_result(OperationResult::CancelRequested(Err(ApiError::Http {
+            status: 409,
+            code: Some("execution_not_running"),
+        })));
+        assert!(app.message.contains("already finished"));
+        for tracked in app.executions.drain(..) {
+            tracked.handle.abort();
+        }
+    }
+
+    #[test]
+    fn cancelled_and_timed_out_executions_render_their_duration() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        for (status, duration_ms, expected) in [
+            (ExecutionStatus::Cancelled, 40, "Cancelled after 40 ms."),
+            (ExecutionStatus::TimedOut, 1002, "Timed out after 1002 ms."),
+        ] {
+            app.finish_execution(
+                tab_id,
+                Ok(FinishedExecution {
+                    execution: Execution {
+                        duration_ms: Some(duration_ms),
+                        ..execution(status)
+                    },
+                    rows: None,
+                }),
+            );
+            assert!(render_text(&app).contains(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn footer_shows_shortcuts_and_confirmation_prompts() {
+        let mut app = authenticated_app();
+        app.view = 1;
+        assert!(render_text(&app).contains("n: new"));
+        app.confirm_delete = Some(Uuid::new_v4());
+        assert!(render_text(&app).contains("Delete this connection? y: confirm"));
+    }
+
+    #[test]
+    fn explain_analyze_heuristic_ignores_comments_and_case() {
+        for sql in [
+            "EXPLAIN ANALYZE SELECT 1",
+            "explain (analyse, buffers) select 1",
+            "-- check plan\n/* note */ Explain\n(FORMAT json, ANALYZE true) DELETE FROM t",
+            "SELECT 1; EXPLAIN ANALYZE UPDATE t SET x = 1",
+        ] {
+            assert!(mentions_explain_analyze(sql), "{sql}");
+        }
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "ANALYZE t",
+            "EXPLAIN SELECT 1; ANALYZE t",
+            "-- EXPLAIN ANALYZE\nSELECT 1",
+            "/* explain analyze */ SELECT 1",
+            "SELECT explain_analyze FROM t",
+        ] {
+            assert!(!mentions_explain_analyze(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn executing_explain_analyze_asks_for_confirmation() {
+        let mut app = app_with_sql_tab();
+        let tab_id = app.sql_tabs.active().expect("active tab").id;
+        app.sql_tabs
+            .active_mut()
+            .expect("active tab")
+            .editor
+            .insert_str("EXPLAIN ANALYZE DELETE FROM t");
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('e')),
+            UiAction::None
+        ));
+        assert_eq!(app.confirm_explain, Some(tab_id));
+        assert!(render_text(&app).contains("EXPLAIN ANALYZE runs the analyzed statement"));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.should_quit, "the prompt captures keys");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.confirm_explain.is_none());
+        assert_eq!(app.view, SQL_VIEW);
+
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('y')),
+            UiAction::ExecuteSql(id) if id == tab_id
+        ));
+        assert!(app.confirm_explain.is_none());
     }
 
     fn column(name: &str) -> Column {

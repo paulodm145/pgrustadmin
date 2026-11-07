@@ -256,6 +256,8 @@ pub enum ExecutionStatus {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
+    TimedOut,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -505,6 +507,20 @@ impl ApiClient {
             .await
     }
 
+    /// Asks the server to stop a running execution.
+    pub async fn cancel_execution(&self, id: Uuid) -> Result<(), ApiError> {
+        let response = self
+            .request(
+                Method::POST,
+                &format!("api/v1/executions/{id}/cancel"),
+                true,
+            )?
+            .send()
+            .await
+            .map_err(|_| ApiError::Transport)?;
+        expect_no_content(response).await
+    }
+
     pub async fn execution_rows(&self, id: Uuid) -> Result<ExecutionRows, ApiError> {
         self.get_json(&format!("api/v1/executions/{id}/result"), true)
             .await
@@ -655,6 +671,7 @@ async fn http_error(response: reqwest::Response) -> ApiError {
             "execution_limit_reached" => Some("execution_limit_reached"),
             "result_unavailable" => Some("result_unavailable"),
             "result_expired" => Some("result_expired"),
+            "execution_not_running" => Some("execution_not_running"),
             _ => None,
         });
     ApiError::Http { status, code }
@@ -878,6 +895,10 @@ mod tests {
                     )
                 }),
             )
+            .route(
+                "/api/v1/executions/{id}/cancel",
+                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1034,6 +1055,10 @@ mod tests {
                 code: Some("execution_limit_reached"),
             })
         );
+        client
+            .cancel_execution(started.id)
+            .await
+            .expect("cancel execution");
         let execution = client.execution(started.id).await.expect("execution");
         assert_eq!(execution.status, super::ExecutionStatus::Failed);
         assert_eq!(execution.duration_ms, Some(12));
