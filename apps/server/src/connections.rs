@@ -1043,6 +1043,18 @@ mod tests {
         assert_eq!(created_json["tls_enabled"], false);
         assert!(created_json.get("password").is_none());
         assert!(created_json.get("credential_envelope").is_none());
+        let stored_envelope: Vec<u8> =
+            sqlx::query_scalar("SELECT credential_envelope FROM connections WHERE id = $1::uuid")
+                .bind(connection_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read stored credential envelope");
+        assert!(
+            !stored_envelope
+                .windows(test_password.len())
+                .any(|window| window == test_password.as_bytes()),
+            "the saved password is never stored in plain text"
+        );
 
         let connection_test = send_request(
             app.clone(),
