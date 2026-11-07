@@ -23,5 +23,6 @@ Consulte `docs/development/spec-driven-workflow.md` para o ciclo de cada tarefa.
 17. API-002 — cliente assíncrono tipado para autenticação e conexões concluído; próxima tarefa: TUI-001, loop e layout.
 18. TUI-001 — loop assíncrono e layout responsivo concluídos; próxima tarefa: TUI-002, login e sessão.
 19. TUI-002 — login mascarado e verificação assíncrona de sessão concluídos; próxima tarefa: TUI-003, conexões na TUI.
+20. TUI-003 — listagem, CRUD, teste e paginação de conexões concluídos; próxima tarefa: CAT-001, catálogo de databases.
 
 Ao iniciar cada tarefa, identificar sua especificação, dependências e critérios verificáveis. Registrar bloqueios e validações reais no backlog. Não implementar enquanto houver decisão necessária sem resposta.
