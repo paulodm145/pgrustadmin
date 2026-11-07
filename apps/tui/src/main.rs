@@ -1,8 +1,15 @@
+mod sql_editor;
 mod sql_tabs;
 
 use std::{io, time::Duration};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers,
+    },
+    execute,
+};
 use futures_util::StreamExt;
 use pgrustadmin_api_client::{
     ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
@@ -15,7 +22,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs},
 };
-use sql_tabs::{MAX_SQL_TABS, SqlTabs};
+use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -39,9 +46,13 @@ async fn main() {
 async fn run() -> io::Result<()> {
     let client = ApiClient::from_env().map_err(io::Error::other)?;
     let mut terminal = ratatui::try_init()?;
-    let result = run_app(&mut terminal, client).await;
+    let result = match execute!(io::stdout(), EnableBracketedPaste) {
+        Ok(()) => run_app(&mut terminal, client).await,
+        Err(error) => Err(error),
+    };
+    let disable_paste = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::try_restore()?;
-    result
+    result.and(disable_paste)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -244,6 +255,9 @@ struct App {
     indexes: Vec<Index>,
     selected_column: usize,
     sql_tabs: SqlTabs,
+    sql_editing: bool,
+    confirm_close_tab: bool,
+    confirm_quit: bool,
     selected_relation: usize,
     relation_page: u64,
     form: Option<ConnectionForm>,
@@ -291,6 +305,9 @@ impl App {
             indexes: Vec::new(),
             selected_column: 0,
             sql_tabs: SqlTabs::default(),
+            sql_editing: false,
+            confirm_close_tab: false,
+            confirm_quit: false,
             form: None,
             confirm_delete: None,
             message: String::new(),
@@ -302,8 +319,40 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return UiAction::None;
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.confirm_quit {
+            match key.code {
+                _ if ctrl_c => self.should_quit = true,
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.should_quit = true,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_quit = false;
+                    self.message = "Quit cancelled.".to_owned();
+                }
+                _ => {}
+            }
+            return UiAction::None;
+        }
+        if ctrl_c {
+            self.request_quit();
+            return UiAction::None;
+        }
+        if self.confirm_close_tab {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_close_tab = false;
+                    self.close_sql_tab();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_close_tab = false;
+                    self.message = "Tab kept open.".to_owned();
+                }
+                _ => {}
+            }
+            return UiAction::None;
+        }
+        if self.sql_editing {
+            self.handle_editor_key(key);
             return UiAction::None;
         }
         if key.code == KeyCode::Esc
@@ -329,7 +378,7 @@ impl App {
             if self.form.take().is_some() || self.confirm_delete.take().is_some() {
                 return UiAction::None;
             }
-            self.should_quit = true;
+            self.request_quit();
             return UiAction::None;
         }
         if self.pending.is_some() {
@@ -394,11 +443,14 @@ impl App {
                     match key.code {
                         KeyCode::Char(']') => self.sql_tabs.select_next(),
                         KeyCode::Char('[') => self.sql_tabs.select_previous(),
+                        KeyCode::Enter | KeyCode::Char('i') if self.sql_tabs.active().is_some() => {
+                            self.sql_editing = true;
+                        }
                         KeyCode::Char('x') => {
-                            self.sql_tabs.close_active();
-                            if self.sql_tabs.is_empty() {
-                                self.view = 1;
-                                self.message = "All SQL tabs are closed.".to_owned();
+                            if self.sql_tabs.active().is_some_and(SqlTab::is_dirty) {
+                                self.confirm_close_tab = true;
+                            } else {
+                                self.close_sql_tab();
                             }
                         }
                         KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.view = 1,
@@ -603,6 +655,74 @@ impl App {
             }
         }
         UiAction::None
+    }
+
+    fn request_quit(&mut self) {
+        let dirty = self.sql_tabs.dirty_count();
+        if dirty == 0 {
+            self.should_quit = true;
+        } else {
+            self.confirm_quit = true;
+            self.message = format!("{dirty} SQL tab(s) have unsaved changes.");
+        }
+    }
+
+    fn close_sql_tab(&mut self) {
+        self.sql_tabs.close_active();
+        if self.sql_tabs.is_empty() {
+            self.view = 1;
+            self.message = "All SQL tabs are closed.".to_owned();
+        }
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) {
+        let Some(tab) = self.sql_tabs.active_mut().filter(|_| self.view == SQL_VIEW) else {
+            self.sql_editing = false;
+            return;
+        };
+        let editor = &mut tab.editor;
+        match key.code {
+            KeyCode::Esc => self.sql_editing = false,
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.insert_char(character);
+            }
+            KeyCode::Enter => editor.new_line(),
+            KeyCode::Tab => editor.insert_tab(),
+            KeyCode::Backspace => editor.backspace(),
+            KeyCode::Delete => editor.delete(),
+            KeyCode::Left => editor.move_left(),
+            KeyCode::Right => editor.move_right(),
+            KeyCode::Up => editor.move_up(),
+            KeyCode::Down => editor.move_down(),
+            KeyCode::Home => editor.move_home(),
+            KeyCode::End => editor.move_end(),
+            KeyCode::PageUp => editor.page_up(),
+            KeyCode::PageDown => editor.page_down(),
+            _ => {}
+        }
+    }
+
+    /// Inserts bracketed-paste text into the SQL editor, or types it into the
+    /// focused login/connection field as before bracketed paste was enabled.
+    fn handle_paste(&mut self, text: &str) {
+        if self.confirm_quit || self.confirm_close_tab {
+            return;
+        }
+        if self.sql_editing {
+            if let Some(tab) = self.sql_tabs.active_mut() {
+                tab.editor.insert_str(text);
+            }
+            return;
+        }
+        if self.form.is_some() || matches!(self.state, ScreenState::EditingLogin { .. }) {
+            for character in text.chars().filter(|character| !character.is_control()) {
+                self.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+            }
+        }
     }
 
     fn open_sql_tab(&mut self) {
@@ -886,6 +1006,7 @@ async fn run_app(terminal: &mut DefaultTerminal, client: ApiClient) -> io::Resul
                         let action = app.handle_key(key);
                         start_action(&mut app, action);
                     }
+                    Some(Ok(Event::Paste(text))) => app.handle_paste(&text),
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(io::Error::other(error)),
                     None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream ended")),
@@ -1022,7 +1143,13 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         state => render_login(frame, sections[1], app, state),
     }
 
-    let footer_text = if app.pending.is_some() {
+    let footer_text = if app.confirm_quit {
+        "Unsaved SQL changes will be lost. Quit anyway? y: quit   n/Esc: cancel"
+    } else if app.confirm_close_tab {
+        "Close tab with unsaved changes? y: close   n/Esc: cancel"
+    } else if app.sql_editing {
+        "EDIT   Esc: commands   ←↑↓→ Home End PgUp PgDn: move   Ctrl+C: quit"
+    } else if app.pending.is_some() {
         "Request in progress…   q/Esc: quit"
     } else if app.form.is_some() {
         "Tab: next field   Enter: save   Esc: cancel"
@@ -1031,7 +1158,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 1 {
         "n: new   e: edit   t: test   c: databases   d: delete   s: SQL   [ / ]: pages   r: reload   Tab: overview   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == SQL_VIEW {
-        "[ / ]: switch tab   x: close tab   Tab/Esc: connections   q: quit"
+        "Enter/i: edit   [ / ]: switch tab   x: close tab   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 2 {
         "↑/↓: navigate   Enter: schemas   s: new SQL tab   r: reload   Tab/Esc: connections   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 3 {
@@ -1295,7 +1422,7 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(area);
     let titles = app.sql_tabs.tabs().iter().map(|tab| {
-        let marker = if tab.dirty { " *" } else { "" };
+        let marker = if tab.is_dirty() { " *" } else { "" };
         Line::from(format!(
             "{} {}@{}{marker}",
             tab.id.get(),
@@ -1317,21 +1444,50 @@ fn render_sql_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(app.message.as_str()), panes[1]);
         return;
     };
+    let mode = if app.sql_editing { " [EDIT]" } else { "" };
     let title = format!(
-        " {} — {} / {} ",
+        " {} — {} / {}{mode} ",
         tab.file.as_deref().unwrap_or("untitled"),
         tab.connection_name,
         tab.database
     );
-    let body = if tab.sql.is_empty() {
-        Paragraph::new("No SQL yet.").style(Style::default().fg(Color::DarkGray))
-    } else {
-        Paragraph::new(tab.sql.as_str())
-    };
-    frame.render_widget(
-        body.block(Block::default().borders(Borders::ALL).title(title)),
-        panes[1],
-    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(panes[1]);
+    frame.render_widget(block, panes[1]);
+
+    let editor = &tab.editor;
+    if !app.sql_editing && editor.text().is_empty() {
+        frame.render_widget(
+            Paragraph::new("No SQL yet. Press Enter to edit.")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+    let height = usize::from(inner.height);
+    let width = usize::from(inner.width);
+    let (scroll_row, scroll_col) = editor.viewport_offset(height, width);
+    let lines: Vec<Line> = editor
+        .lines()
+        .iter()
+        .skip(scroll_row)
+        .take(height)
+        .map(|line| {
+            Line::from(
+                line.chars()
+                    .skip(scroll_col)
+                    .take(width)
+                    .collect::<String>(),
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+    if app.sql_editing {
+        let (row, col) = editor.cursor();
+        let x = u16::try_from(col - scroll_col).unwrap_or(inner.width);
+        let y = u16::try_from(row - scroll_row).unwrap_or(inner.height);
+        frame.set_cursor_position((inner.x.saturating_add(x), inner.y.saturating_add(y)));
+    }
 }
 
 fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1971,6 +2127,146 @@ mod tests {
         assert_eq!(app.view, 2);
         assert_eq!(app.sql_tabs.tabs().len(), MAX_SQL_TABS);
         assert!(app.message.contains("20"));
+    }
+
+    fn app_with_sql_tab() -> App {
+        let mut app = authenticated_app();
+        app.sql_tabs
+            .open(Uuid::new_v4(), "local", "app")
+            .expect("open tab");
+        app.view = SQL_VIEW;
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> UiAction {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn sql_view_edit_mode_types_into_active_tab_and_escape_leaves_it() {
+        let mut app = app_with_sql_tab();
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.sql_tabs.is_empty(), "clean tab closes without asking");
+
+        let mut app = app_with_sql_tab();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.sql_editing);
+        for character in "select 1".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('q'));
+        let tab = app.sql_tabs.active().expect("active tab");
+        assert_eq!(tab.editor.text(), "select 1\n    xq");
+        assert!(tab.is_dirty());
+        assert!(!app.should_quit);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("create test terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render sql editor");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("select 1"));
+        assert!(rendered.contains("1 app@local *"));
+        assert!(rendered.contains("EDIT"));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.sql_editing);
+        assert_eq!(app.view, SQL_VIEW);
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.sql_editing);
+    }
+
+    #[test]
+    fn closing_dirty_sql_tab_requires_confirmation() {
+        let mut app = app_with_sql_tab();
+        app.sql_tabs
+            .active_mut()
+            .expect("active tab")
+            .editor
+            .insert_str("select 1");
+
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.confirm_close_tab);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.confirm_close_tab);
+        assert_eq!(app.sql_tabs.tabs().len(), 1);
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.sql_tabs.tabs().len(), 1);
+        assert_eq!(app.view, SQL_VIEW);
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.sql_tabs.is_empty());
+        assert_eq!(app.view, 1);
+    }
+
+    #[test]
+    fn quitting_with_dirty_sql_tabs_requires_confirmation() {
+        let mut app = app_with_sql_tab();
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit, "no dirty tabs quits immediately");
+
+        let mut app = app_with_sql_tab();
+        app.sql_tabs
+            .active_mut()
+            .expect("active tab")
+            .editor
+            .insert_str("select 1");
+        app.view = 1;
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.confirm_quit);
+        assert!(!app.should_quit);
+        assert!(app.message.contains("1 SQL tab"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.confirm_quit);
+        assert!(!app.should_quit);
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_c);
+        assert!(app.confirm_quit);
+        assert!(!app.should_quit);
+        app.handle_key(ctrl_c);
+        assert!(app.should_quit);
+
+        let mut app = app_with_sql_tab();
+        app.sql_tabs
+            .active_mut()
+            .expect("active tab")
+            .editor
+            .insert_str("select 1");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.confirm_quit);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn paste_goes_to_sql_editor_or_text_fields_only() {
+        let mut app = app_with_sql_tab();
+        app.handle_paste("ignored in command mode");
+        assert_eq!(app.sql_tabs.active().expect("active tab").editor.text(), "");
+        press(&mut app, KeyCode::Enter);
+        app.handle_paste("select 1;\r\nselect 2;");
+        assert_eq!(
+            app.sql_tabs.active().expect("active tab").editor.text(),
+            "select 1;\nselect 2;"
+        );
+
+        let mut app = App::new(client());
+        app.handle_paste("user@example.test\n");
+        assert_eq!(app.login_email, "user@example.test");
     }
 
     fn column(name: &str) -> Column {

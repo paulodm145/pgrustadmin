@@ -29,7 +29,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | CAT-003 | Tabelas/views | CAT-002 | Concluída — `specs/catalog.md`; `GET .../schemas/{schema}/relations` paginado (padrão 25, máx. 100) lista tabelas, particionadas, views, views materializadas e foreign tables com `kind`, sem partições filhas nem filtro por privilégio do objeto; schema inexistente/sem `USAGE` retorna lista vazia; paginação e validação de identificador compartilhadas no servidor; TUI abre relações com Enter e pagina com `[`/`]`; integração do servidor, 3 testes de cliente e 8 testes TUI passaram. |
 | CAT-004 | Colunas/índices | CAT-003 | Concluída — `specs/catalog.md`; `GET .../relations/{relation}/columns` (posição, tipo formatado, nullable, default, PK, identity, generated) e `.../indexes` (método, unique, primary, colunas-chave/expressões com `DESC`/`NULLS`), sem paginação; relação inexistente retorna lista vazia; TUI mostra colunas e índices com Enter sobre a relação; integração do servidor com fixture de identity/gerada/índices, 3 testes de cliente e 10 testes TUI (incl. renderização) passaram. |
 | SQL-001 | Estado das abas | TUI-001 | Concluída — `specs/sql-editor.md`; abas só em memória na TUI (`apps/tui/src/sql_tabs.rs`) com ID único não reutilizado, SQL, arquivo, dirty e vínculo fixo a conexão/database; limite de 20; fechar ativa a seguinte/anterior; `s` em databases abre aba, seção SQL alterna (`[`/`]`) e fecha (`x`); execução/resultado/duração/erro ficam para SQL-004/005; 5 testes do modelo e 2 testes TUI (incl. renderização) passaram. |
-| SQL-002 | Editor/dirty tracking | SQL-001 | Pendente |
+| SQL-002 | Editor/dirty tracking | SQL-001 | Concluída — `specs/sql-editor.md`; editor próprio multilinha (`apps/tui/src/sql_editor.rs`) em modo modal (Enter/`i` edita, Esc sai), cursor/rolagem, Tab = 4 espaços, bracketed paste com quebras normalizadas; dirty = SQL ≠ conteúdo base; confirmação ao fechar aba dirty e ao sair (`q`/Esc/Ctrl+C) com abas dirty; colar em login/formulário continua digitando; 5 testes do editor, 6 do modelo de abas e 4 novos testes TUI passaram; smoke em tmux confirmou bracketed paste no login e saída limpa. |
 | SQL-003 | Arquivos SQL | SQL-002/API-001 | Pendente |
 | SQL-004 | Execução assíncrona | CON-001 | Pendente |
 | SQL-005 | Resultados/duração | SQL-004 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-SQL-001 está concluída com o estado e a gestão de abas SQL na TUI. Próxima tarefa: SQL-002, edição do SQL na aba com dirty tracking e alerta ao fechar aba dirty.
+SQL-002 está concluída com edição e dirty tracking nas abas SQL. SQL-003 (arquivos `.sql`) depende também de API-001, já concluída. Alternativas sem dependência pendente: SQL-004 (execução assíncrona) e TUI-004 (temas).

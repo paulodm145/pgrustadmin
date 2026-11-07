@@ -2,6 +2,8 @@
 
 use uuid::Uuid;
 
+use crate::sql_editor::SqlEditor;
+
 pub const MAX_SQL_TABS: usize = 20;
 
 /// Session-unique tab identifier; never reused after a tab closes.
@@ -16,9 +18,10 @@ impl TabId {
 
 pub struct SqlTab {
     pub id: TabId,
-    pub sql: String,
+    pub editor: SqlEditor,
+    /// Content of the last saved state; empty until files exist (SQL-003).
+    pub saved_sql: String,
     pub file: Option<String>,
-    pub dirty: bool,
     #[cfg_attr(
         not(test),
         expect(
@@ -29,6 +32,13 @@ pub struct SqlTab {
     pub connection_id: Uuid,
     pub connection_name: String,
     pub database: String,
+}
+
+impl SqlTab {
+    /// A tab is dirty while its SQL differs from the last saved content.
+    pub fn is_dirty(&self) -> bool {
+        self.editor.text() != self.saved_sql
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,9 +66,9 @@ impl SqlTabs {
         let id = TabId(self.last_id);
         self.tabs.push(SqlTab {
             id,
-            sql: String::new(),
+            editor: SqlEditor::default(),
+            saved_sql: String::new(),
             file: None,
-            dirty: false,
             connection_id,
             connection_name: connection_name.to_owned(),
             database: database.to_owned(),
@@ -92,6 +102,14 @@ impl SqlTabs {
 
     pub fn active(&self) -> Option<&SqlTab> {
         self.tabs.get(self.active)
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut SqlTab> {
+        self.tabs.get_mut(self.active)
+    }
+
+    pub fn dirty_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.is_dirty()).count()
     }
 
     pub fn active_index(&self) -> usize {
@@ -129,9 +147,9 @@ mod tests {
         assert_eq!(active.connection_id, connection_id);
         assert_eq!(active.connection_name, "local");
         assert_eq!(active.database, "analytics");
-        assert!(active.sql.is_empty());
+        assert!(active.editor.text().is_empty());
         assert!(active.file.is_none());
-        assert!(!active.dirty);
+        assert!(!active.is_dirty());
     }
 
     #[test]
@@ -196,5 +214,24 @@ mod tests {
         assert_eq!(tabs.active().map(|tab| tab.id), Some(first));
         tabs.select_previous();
         assert_eq!(tabs.active().map(|tab| tab.id), Some(second));
+    }
+
+    #[test]
+    fn dirty_tracks_difference_from_saved_content() {
+        let mut tabs = SqlTabs::default();
+        let connection_id = Uuid::new_v4();
+        tabs.open(connection_id, "local", "a").expect("open tab");
+        tabs.open(connection_id, "local", "b").expect("open tab");
+        assert_eq!(tabs.dirty_count(), 0);
+
+        let tab = tabs.active_mut().expect("active tab");
+        tab.editor.insert_char('x');
+        assert!(tab.is_dirty());
+        assert_eq!(tabs.dirty_count(), 1);
+
+        let tab = tabs.active_mut().expect("active tab");
+        tab.editor.backspace();
+        assert!(!tab.is_dirty());
+        assert_eq!(tabs.dirty_count(), 0);
     }
 }
