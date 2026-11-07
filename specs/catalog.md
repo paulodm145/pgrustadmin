@@ -25,3 +25,13 @@ A TUI abre a lista de schemas com Enter sobre o database selecionado, permite na
 Recebe `page` (começa em 1) e `per_page` (padrão 25, máximo 100), como conexões. Resposta `200`: `{ "items": [{ "name": "...", "kind": "table" }], "page", "per_page" }`. Paginação inválida ou `{schema}` vazio, com byte nulo ou com mais de 63 bytes responde `400`. Validação de `{database}`, autorização e demais erros seguem CAT-002.
 
 A TUI abre a lista com Enter sobre o schema selecionado, mostra nome e tipo, permite navegar, recarregar e trocar de página com `[`/`]` (100 itens por página), e volta à lista de schemas com Esc. CAT-003 não lista colunas nem índices.
+
+## CAT-004 — Colunas e índices
+
+Dois endpoints sob `/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}` leem a relação informada (dos tipos listados em CAT-003) conectando ao database como em CAT-002. Não há paginação: PostgreSQL limita relações a 1600 colunas e índices por relação são poucos. Relação inexistente, de tipo não listado em CAT-003 ou em schema sem `USAGE` responde lista vazia. `{relation}` segue a validação de identificador de `{schema}` (`400`); autorização e demais erros seguem CAT-002.
+
+`GET .../columns` lista colunas não removidas em ordem de posição. Resposta `200`: `{ "items": [{ "name", "position", "data_type", "nullable", "default", "primary_key", "identity", "generated" }] }`. `data_type` é o tipo formatado pelo PostgreSQL (ex.: `character varying(255)`); `default` é a expressão default ou `null`; `primary_key` indica participação na chave primária; `identity` é `"always"`, `"by_default"` ou `null`; `generated` é `"stored"`, `"virtual"` ou `null` (colunas geradas têm `default` `null`).
+
+`GET .../indexes` lista índices da relação em ordem crescente por nome. Resposta `200`: `{ "items": [{ "name", "method", "unique", "primary", "columns": ["..."] }] }`. `method` é o método de acesso (ex.: `btree`, `gin`); `columns` traz as colunas-chave ou expressões na ordem do índice, com modificadores como `DESC`, sem colunas `INCLUDE`. A definição SQL completa não é retornada.
+
+A TUI abre os detalhes com Enter sobre a relação selecionada, mostra colunas (com seleção navegável) e índices da relação, permite recarregar e volta à lista de relações com Esc.

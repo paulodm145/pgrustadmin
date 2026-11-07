@@ -168,6 +168,72 @@ pub struct RelationList {
     pub per_page: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnIdentity {
+    Always,
+    ByDefault,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnGenerated {
+    Stored,
+    Virtual,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Column {
+    pub name: String,
+    pub position: i16,
+    pub data_type: String,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub primary_key: bool,
+    pub identity: Option<ColumnIdentity>,
+    pub generated: Option<ColumnGenerated>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ColumnList {
+    pub items: Vec<Column>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Index {
+    pub name: String,
+    pub method: String,
+    pub unique: bool,
+    pub primary: bool,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct IndexList {
+    pub items: Vec<Index>,
+}
+
+/// Identifies one relation in the catalog of a saved connection.
+#[derive(Clone, Copy, Debug)]
+pub struct RelationRef<'a> {
+    pub connection_id: Uuid,
+    pub database: &'a str,
+    pub schema: &'a str,
+    pub relation: &'a str,
+}
+
+impl RelationRef<'_> {
+    fn path(&self, detail: &str) -> String {
+        format!(
+            "api/v1/connections/{}/databases/{}/schemas/{}/relations/{}/{detail}",
+            self.connection_id,
+            utf8_percent_encode(self.database, NON_ALPHANUMERIC),
+            utf8_percent_encode(self.schema, NON_ALPHANUMERIC),
+            utf8_percent_encode(self.relation, NON_ALPHANUMERIC),
+        )
+    }
+}
+
 impl ApiClient {
     pub fn new(base_url: &str) -> Result<Self, ApiError> {
         let mut base_url = Url::parse(base_url).map_err(|_| ApiError::InvalidBaseUrl)?;
@@ -323,6 +389,14 @@ impl ApiClient {
             .append_pair("per_page", &per_page.to_string());
         let request = self.authenticated_request(self.http.get(url))?;
         decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
+    }
+
+    pub async fn list_columns(&self, relation: RelationRef<'_>) -> Result<ColumnList, ApiError> {
+        self.get_json(&relation.path("columns"), true).await
+    }
+
+    pub async fn list_indexes(&self, relation: RelationRef<'_>) -> Result<IndexList, ApiError> {
+        self.get_json(&relation.path("indexes"), true).await
     }
 
     async fn get_json<T: DeserializeOwned>(
@@ -529,6 +603,27 @@ mod tests {
                     },
                 ),
             )
+            .route(
+                "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/columns",
+                get(
+                    |Path((_, _, _, relation)): Path<(Uuid, String, String, String)>| async move {
+                        Json(serde_json::json!({"items": [{
+                            "name": relation, "position": 1, "data_type": "integer",
+                            "nullable": false, "default": null, "primary_key": true,
+                            "identity": "by_default", "generated": null,
+                        }]}))
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/indexes",
+                get(|| async {
+                    Json(serde_json::json!({"items": [{
+                        "name": "pkey", "method": "btree", "unique": true, "primary": true,
+                        "columns": ["id"],
+                    }]}))
+                }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -605,6 +700,43 @@ mod tests {
                 page: 3,
                 per_page: 100,
             }
+        );
+        let relation = super::RelationRef {
+            connection_id: Uuid::new_v4(),
+            database: "db",
+            schema: "public",
+            relation: "odd/table name",
+        };
+        assert_eq!(
+            client
+                .list_columns(relation)
+                .await
+                .expect("column catalog succeeds")
+                .items,
+            vec![super::Column {
+                name: "odd/table name".to_owned(),
+                position: 1,
+                data_type: "integer".to_owned(),
+                nullable: false,
+                default: None,
+                primary_key: true,
+                identity: Some(super::ColumnIdentity::ByDefault),
+                generated: None,
+            }]
+        );
+        assert_eq!(
+            client
+                .list_indexes(relation)
+                .await
+                .expect("index catalog succeeds")
+                .items,
+            vec![super::Index {
+                name: "pkey".to_owned(),
+                method: "btree".to_owned(),
+                unique: true,
+                primary: true,
+                columns: vec!["id".to_owned()],
+            }]
         );
         client.logout().await.expect("logout succeeds");
         assert_eq!(

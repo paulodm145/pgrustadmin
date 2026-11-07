@@ -9,11 +9,11 @@ use axum::{
     routing::get,
 };
 use pgrustadmin_postgres_driver::{
-    ConnectionData, ConnectionSummary, PgPool, PostgresError, RelationKind,
-    StoredConnectionCredentials, create_connection, delete_connection_for_owner,
-    find_connection_credentials_for_owner, find_connection_for_owner, list_connections_for_owner,
-    list_databases, list_relations, list_schemas, test_database_connection,
-    update_connection_for_owner,
+    Column, ColumnGenerated, ColumnIdentity, ConnectionData, ConnectionSummary, PgPool,
+    PostgresError, RelationKind, StoredConnectionCredentials, create_connection,
+    delete_connection_for_owner, find_connection_credentials_for_owner, find_connection_for_owner,
+    list_columns, list_connections_for_owner, list_databases, list_indexes, list_relations,
+    list_schemas, test_database_connection, update_connection_for_owner,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -41,6 +41,14 @@ pub fn router(pool: PgPool) -> Router {
         .route(
             "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations",
             get(list_remote_relations),
+        )
+        .route(
+            "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/columns",
+            get(list_remote_columns),
+        )
+        .route(
+            "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/indexes",
+            get(list_remote_indexes),
         )
         .with_state(pool)
 }
@@ -174,6 +182,58 @@ fn relation_kind_name(kind: RelationKind) -> &'static str {
         RelationKind::MaterializedView => "materialized_view",
         RelationKind::ForeignTable => "foreign_table",
     }
+}
+
+#[derive(Serialize)]
+struct ColumnListResponse {
+    items: Vec<ColumnResponse>,
+}
+
+#[derive(Serialize)]
+struct ColumnResponse {
+    name: String,
+    position: i16,
+    data_type: String,
+    nullable: bool,
+    default: Option<String>,
+    primary_key: bool,
+    identity: Option<&'static str>,
+    generated: Option<&'static str>,
+}
+
+impl From<Column> for ColumnResponse {
+    fn from(column: Column) -> Self {
+        Self {
+            name: column.name,
+            position: column.position,
+            data_type: column.data_type,
+            nullable: column.nullable,
+            default: column.default,
+            primary_key: column.primary_key,
+            identity: column.identity.map(|identity| match identity {
+                ColumnIdentity::Always => "always",
+                ColumnIdentity::ByDefault => "by_default",
+            }),
+            generated: column.generated.map(|generated| match generated {
+                ColumnGenerated::Stored => "stored",
+                ColumnGenerated::Virtual => "virtual",
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct IndexListResponse {
+    items: Vec<IndexResponse>,
+}
+
+#[derive(Serialize)]
+struct IndexResponse {
+    name: String,
+    method: String,
+    unique: bool,
+    primary: bool,
+    columns: Vec<String>,
 }
 
 /// PostgreSQL identifiers are truncated beyond NAMEDATALEN - 1 bytes.
@@ -350,6 +410,129 @@ async fn list_remote_relations(
                     .collect(),
                 page,
                 per_page,
+            }),
+        )
+            .into_response(),
+        Err(_) => catalog_unavailable(),
+    }
+}
+
+type RelationDetailPath = Path<(Uuid, String, String, String)>;
+
+struct RelationTarget {
+    connection: StoredConnectionCredentials,
+    password: Zeroizing<String>,
+    database: String,
+    schema: String,
+    relation: String,
+}
+
+enum RelationTargetError {
+    Authentication(AuthenticationError),
+    BadRequest,
+    SavedConnection(SavedConnectionError),
+}
+
+impl IntoResponse for RelationTargetError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Authentication(error) => authentication_error_response(error),
+            Self::BadRequest => bad_request(),
+            Self::SavedConnection(error) => error.into_response(),
+        }
+    }
+}
+
+/// Authenticates, validates a relation detail path and loads its connection.
+async fn relation_detail_target(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    path: Result<RelationDetailPath, PathRejection>,
+) -> Result<RelationTarget, RelationTargetError> {
+    let owner_id = authenticated_owner(pool, headers)
+        .await
+        .map_err(RelationTargetError::Authentication)?;
+    let Ok(Path((connection_id, database, schema, relation))) = path else {
+        return Err(RelationTargetError::BadRequest);
+    };
+    if ![&database, &schema, &relation]
+        .iter()
+        .all(|name| is_valid_identifier(name))
+    {
+        return Err(RelationTargetError::BadRequest);
+    }
+    let (connection, password) = load_saved_connection(pool, owner_id, connection_id)
+        .await
+        .map_err(RelationTargetError::SavedConnection)?;
+    Ok(RelationTarget {
+        connection,
+        password,
+        database,
+        schema,
+        relation,
+    })
+}
+
+async fn list_remote_columns(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    path: Result<RelationDetailPath, PathRejection>,
+) -> Response {
+    let target = match relation_detail_target(&pool, &headers, path).await {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
+    match list_columns(
+        &target.connection,
+        &target.database,
+        &target.schema,
+        &target.relation,
+        &target.password,
+    )
+    .await
+    {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(ColumnListResponse {
+                items: items.into_iter().map(ColumnResponse::from).collect(),
+            }),
+        )
+            .into_response(),
+        Err(_) => catalog_unavailable(),
+    }
+}
+
+async fn list_remote_indexes(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    path: Result<RelationDetailPath, PathRejection>,
+) -> Response {
+    let target = match relation_detail_target(&pool, &headers, path).await {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
+    match list_indexes(
+        &target.connection,
+        &target.database,
+        &target.schema,
+        &target.relation,
+        &target.password,
+    )
+    .await
+    {
+        Ok(items) => (
+            StatusCode::OK,
+            Json(IndexListResponse {
+                items: items
+                    .into_iter()
+                    .map(|index| IndexResponse {
+                        name: index.name,
+                        method: index.method,
+                        unique: index.unique,
+                        primary: index.primary,
+                        columns: index.columns,
+                    })
+                    .collect(),
             }),
         )
             .into_response(),
@@ -989,7 +1172,21 @@ mod tests {
         let catalog_schema = format!("cat003_{}", Uuid::new_v4().simple());
         for statement in [
             format!("CREATE SCHEMA {catalog_schema}"),
-            format!("CREATE TABLE {catalog_schema}.a_table (id int)"),
+            format!(
+                "CREATE TABLE {catalog_schema}.a_table (\
+                 id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 email varchar(255) NOT NULL, \
+                 created_at timestamptz DEFAULT now(), \
+                 email_lower text GENERATED ALWAYS AS (lower(email)) STORED)"
+            ),
+            format!(
+                "CREATE UNIQUE INDEX a_table_email_lower_idx ON {catalog_schema}.a_table \
+                 (lower(email)) INCLUDE (created_at)"
+            ),
+            format!(
+                "CREATE INDEX a_table_created_at_idx ON {catalog_schema}.a_table \
+                 (created_at DESC, email)"
+            ),
             format!("CREATE TABLE {catalog_schema}.b_partitioned (id int) PARTITION BY RANGE (id)"),
             format!(
                 "CREATE TABLE {catalog_schema}.b_partition_1 PARTITION OF \
@@ -1099,6 +1296,116 @@ mod tests {
         let missing_schema_json: serde_json::Value =
             serde_json::from_slice(&missing_schema_body).expect("decode missing schema response");
         assert_eq!(missing_schema_json["items"], serde_json::json!([]));
+
+        let a_table_path = format!(
+            "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations/a_table"
+        );
+        let columns = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("{a_table_path}/columns"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(columns.status(), StatusCode::OK);
+        let columns_body = to_bytes(columns.into_body(), 4096)
+            .await
+            .expect("read column catalog response");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&columns_body)
+                .expect("decode column catalog response"),
+            serde_json::json!({"items": [
+                {"name": "id", "position": 1, "data_type": "integer", "nullable": false,
+                 "default": null, "primary_key": true, "identity": "always", "generated": null},
+                {"name": "email", "position": 2, "data_type": "character varying(255)",
+                 "nullable": false, "default": null, "primary_key": false, "identity": null,
+                 "generated": null},
+                {"name": "created_at", "position": 3, "data_type": "timestamp with time zone",
+                 "nullable": true, "default": "now()", "primary_key": false, "identity": null,
+                 "generated": null},
+                {"name": "email_lower", "position": 4, "data_type": "text", "nullable": true,
+                 "default": null, "primary_key": false, "identity": null, "generated": "stored"},
+            ]})
+        );
+
+        let indexes = send_request(
+            app.clone(),
+            Method::GET,
+            &format!("{a_table_path}/indexes"),
+            Some(owner_token.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(indexes.status(), StatusCode::OK);
+        let indexes_body = to_bytes(indexes.into_body(), 4096)
+            .await
+            .expect("read index catalog response");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&indexes_body)
+                .expect("decode index catalog response"),
+            serde_json::json!({"items": [
+                {"name": "a_table_created_at_idx", "method": "btree", "unique": false,
+                 "primary": false, "columns": ["created_at DESC", "email"]},
+                {"name": "a_table_email_lower_idx", "method": "btree", "unique": true,
+                 "primary": false, "columns": ["lower(email::text)"]},
+                {"name": "a_table_pkey", "method": "btree", "unique": true, "primary": true,
+                 "columns": ["id"]},
+            ]})
+        );
+
+        for detail in ["columns", "indexes"] {
+            let missing_relation = send_request(
+                app.clone(),
+                Method::GET,
+                &format!(
+                    "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations/missing/{detail}"
+                ),
+                Some(owner_token.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(missing_relation.status(), StatusCode::OK, "{detail}");
+            let missing_relation_body = to_bytes(missing_relation.into_body(), 4096)
+                .await
+                .expect("read missing relation response");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&missing_relation_body)
+                    .expect("decode missing relation response"),
+                serde_json::json!({"items": []})
+            );
+
+            let invalid_relation = send_request(
+                app.clone(),
+                Method::GET,
+                &format!(
+                    "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations/{}/{detail}",
+                    "r".repeat(64)
+                ),
+                Some(owner_token.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(
+                invalid_relation.status(),
+                StatusCode::BAD_REQUEST,
+                "{detail}"
+            );
+
+            let other_owner_detail = send_request(
+                app.clone(),
+                Method::GET,
+                &format!("{a_table_path}/{detail}"),
+                Some(other_owner_token.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(
+                other_owner_detail.status(),
+                StatusCode::NOT_FOUND,
+                "{detail}"
+            );
+        }
 
         let other_owner_relations = send_request(
             app.clone(),
