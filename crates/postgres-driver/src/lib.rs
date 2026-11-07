@@ -119,6 +119,73 @@ pub async fn list_schemas(
     .map_err(|_| sqlx::Error::PoolTimedOut)?
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationKind {
+    Table,
+    PartitionedTable,
+    View,
+    MaterializedView,
+    ForeignTable,
+}
+
+impl RelationKind {
+    fn from_relkind(relkind: &str) -> Option<Self> {
+        match relkind {
+            "r" => Some(Self::Table),
+            "p" => Some(Self::PartitionedTable),
+            "v" => Some(Self::View),
+            "m" => Some(Self::MaterializedView),
+            "f" => Some(Self::ForeignTable),
+            _ => None,
+        }
+    }
+}
+
+pub struct Relation {
+    pub name: String,
+    pub kind: RelationKind,
+}
+
+/// Lists one page of tables, views, materialized views and foreign tables in
+/// `schema`, excluding partitions. A schema without `USAGE` yields no rows.
+pub async fn list_relations(
+    connection: &StoredConnectionCredentials,
+    database: &str,
+    schema: &str,
+    password: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Relation>, sqlx::Error> {
+    let options = connection_options(connection, password)?.database(database);
+    tokio::time::timeout(CONNECTION_TEST_TIMEOUT, async {
+        let mut connection = sqlx::PgConnection::connect_with(&options).await?;
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT c.relname::text, c.relkind::text \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 \
+               AND has_schema_privilege(n.oid, 'USAGE') \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+               AND NOT c.relispartition \
+             ORDER BY c.relname LIMIT $2 OFFSET $3",
+        )
+        .bind(schema)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut connection)
+        .await?;
+        connection.close().await?;
+        rows.into_iter()
+            .map(|(name, relkind)| {
+                RelationKind::from_relkind(&relkind)
+                    .map(|kind| Relation { name, kind })
+                    .ok_or_else(|| sqlx::Error::Protocol("unexpected relation kind".into()))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|_| sqlx::Error::PoolTimedOut)?
+}
+
 fn connection_options(
     connection: &StoredConnectionCredentials,
     password: &str,

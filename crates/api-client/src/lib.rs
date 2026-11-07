@@ -145,6 +145,29 @@ pub struct SchemaList {
     pub items: Vec<Schema>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationKind {
+    Table,
+    PartitionedTable,
+    View,
+    MaterializedView,
+    ForeignTable,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Relation {
+    pub name: String,
+    pub kind: RelationKind,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RelationList {
+    pub items: Vec<Relation>,
+    pub page: u64,
+    pub per_page: u64,
+}
+
 impl ApiClient {
     pub fn new(base_url: &str) -> Result<Self, ApiError> {
         let mut base_url = Url::parse(base_url).map_err(|_| ApiError::InvalidBaseUrl)?;
@@ -282,6 +305,26 @@ impl ApiClient {
         .await
     }
 
+    pub async fn list_relations(
+        &self,
+        connection_id: Uuid,
+        database: &str,
+        schema: &str,
+        page: u64,
+        per_page: u64,
+    ) -> Result<RelationList, ApiError> {
+        let database = utf8_percent_encode(database, NON_ALPHANUMERIC);
+        let schema = utf8_percent_encode(schema, NON_ALPHANUMERIC);
+        let mut url = self.url(&format!(
+            "api/v1/connections/{connection_id}/databases/{database}/schemas/{schema}/relations"
+        ))?;
+        url.query_pairs_mut()
+            .append_pair("page", &page.to_string())
+            .append_pair("per_page", &per_page.to_string());
+        let request = self.authenticated_request(self.http.get(url))?;
+        decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
+    }
+
     async fn get_json<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -375,11 +418,17 @@ async fn http_error(response: reqwest::Response) -> ApiError {
 mod tests {
     use axum::{
         Json, Router,
-        extract::{Path, State},
+        extract::{Path, Query, State},
         http::{HeaderMap, StatusCode, header::AUTHORIZATION},
         routing::{get, post},
     };
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Deserialize)]
+    struct RelationPageQuery {
+        page: u64,
+        per_page: u64,
+    }
     use tokio::net::TcpListener;
     use uuid::Uuid;
 
@@ -467,6 +516,19 @@ mod tests {
                     Json(serde_json::json!({"items":[{"name": database}]}))
                 }),
             )
+            .route(
+                "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations",
+                get(
+                    |Path((_, database, schema)): Path<(Uuid, String, String)>,
+                     Query(page): Query<RelationPageQuery>| async move {
+                        Json(serde_json::json!({
+                            "items": [{"name": format!("{database}.{schema}"), "kind": "materialized_view"}],
+                            "page": page.page,
+                            "per_page": page.per_page,
+                        }))
+                    },
+                ),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -529,6 +591,20 @@ mod tests {
             vec![super::Schema {
                 name: "odd/db name?%".to_owned()
             }]
+        );
+        assert_eq!(
+            client
+                .list_relations(Uuid::new_v4(), "odd/db", "my schema", 3, 100)
+                .await
+                .expect("relation catalog succeeds"),
+            super::RelationList {
+                items: vec![super::Relation {
+                    name: "odd/db.my schema".to_owned(),
+                    kind: super::RelationKind::MaterializedView,
+                }],
+                page: 3,
+                per_page: 100,
+            }
         );
         client.logout().await.expect("logout succeeds");
         assert_eq!(

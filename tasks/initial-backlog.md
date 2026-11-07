@@ -26,7 +26,7 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 | TUI-003 | Conexões TUI | TUI-002/CON-001 | Concluída — listagem paginada, criação/edição (senha vazia preserva credencial), teste e exclusão confirmada; chamadas assíncronas, mensagens sem segredo; 5 testes TUI passaram. |
 | CAT-001 | Databases | TUI-003 | Concluída — `specs/catalog.md`; `GET /api/v1/connections/{id}/databases` owner-scoped (404 para outro usuário, 502 `catalog_unavailable` sem mensagem do driver), filtra templates/sem `CONNECT`, ordenado por nome; cliente tipado e lista navegável na TUI com retorno às conexões; teste de integração do servidor e 6 testes TUI passaram. |
 | CAT-002 | Schemas | CAT-001 | Concluída — `specs/catalog.md`; `GET /api/v1/connections/{id}/databases/{database}/schemas` owner-scoped conecta ao database escolhido com a credencial salva, lista schemas com `USAGE` (inclui `pg_catalog`/`information_schema`, exclui `pg_toast*`/`pg_temp_*`), `400` para nome inválido e `502` para database indisponível; cliente tipado com nome codificado no caminho; TUI abre schemas com Enter e volta com Esc; integração do servidor, 3 testes de cliente e 7 testes TUI passaram. |
-| CAT-003 | Tabelas/views | CAT-002 | Pendente |
+| CAT-003 | Tabelas/views | CAT-002 | Concluída — `specs/catalog.md`; `GET .../schemas/{schema}/relations` paginado (padrão 25, máx. 100) lista tabelas, particionadas, views, views materializadas e foreign tables com `kind`, sem partições filhas nem filtro por privilégio do objeto; schema inexistente/sem `USAGE` retorna lista vazia; paginação e validação de identificador compartilhadas no servidor; TUI abre relações com Enter e pagina com `[`/`]`; integração do servidor, 3 testes de cliente e 8 testes TUI passaram. |
 | CAT-004 | Colunas/índices | CAT-003 | Pendente |
 | SQL-001 | Estado das abas | TUI-001 | Pendente |
 | SQL-002 | Editor/dirty tracking | SQL-001 | Pendente |
@@ -48,4 +48,4 @@ Use `docs/development/spec-driven-workflow.md` ao trabalhar em qualquer item. An
 
 ## Próxima tarefa
 
-CAT-002 está concluída com a listagem de schemas por database pela API e TUI. Próxima tarefa: CAT-003, listar tabelas/views de um schema.
+CAT-003 está concluída com a listagem paginada de tabelas/views por schema pela API e TUI. Próxima tarefa: CAT-004, listar colunas e índices de uma relação.
