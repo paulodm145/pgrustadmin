@@ -7,6 +7,7 @@ pub mod connections;
 pub mod credentials;
 pub mod executions;
 pub mod sql_files;
+pub mod users_cli;
 
 use api::router as api_router;
 use auth::handlers::router as auth_router;
@@ -20,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("server failed to start or stopped unexpectedly: {error}");
+        eprintln!("pgrustadmin-server: {error}");
         std::process::exit(1);
     }
 }
@@ -35,9 +36,10 @@ async fn run() -> io::Result<()> {
         Some(command) if command == OsStr::new("migrate") && arguments.next().is_none() => {
             migrate_metadata().await
         }
+        Some(command) if command == OsStr::new("user") => users_cli::run(arguments).await,
         Some(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: pgrustadmin-server [migrate]",
+            users_cli::USAGE,
         )),
     }
 }
