@@ -3524,7 +3524,7 @@ mod tests {
         assert!(rendered.contains("Result · 12 ms"));
         assert!(rendered.contains("first 2 of 5 stored"));
         assert!(
-            rendered.contains("#│id  │label"),
+            rendered.contains(" # │ id   │ label"),
             "grid lines between columns"
         );
         assert!(rendered.contains("label"));
