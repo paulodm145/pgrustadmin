@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
@@ -538,11 +538,9 @@ impl Grid {
             return;
         }
 
-        // With grid lines each record takes a value line and a separator line,
-        // and the header gets a separator below it.
-        let (header_height, row_height) = if self.gridlines { (2, 2) } else { (1, 1) };
-        let body_rows =
-            (usize::from(area.height).saturating_sub(header_height) / row_height).max(1);
+        // Horizontal grid lines are an underline on each row, so a record keeps
+        // a single screen line and the line spans the whole table width.
+        let body_rows = usize::from(area.height).saturating_sub(1).max(1);
         self.visible_rows.set(body_rows);
         let page_rows = self.page_rows();
         let first_row = keep_visible(self.first_row.get(), self.cursor_row, body_rows);
@@ -577,16 +575,6 @@ impl Grid {
             cell_widths.extend([1, widths[*column]]);
         }
         let vertical = if self.gridlines { "│" } else { " " };
-        let separator_row = || {
-            Row::new(cell_widths.iter().enumerate().map(|(index, width)| {
-                let text = if index % 2 == 1 {
-                    "┼".to_owned()
-                } else {
-                    "─".repeat(*width)
-                };
-                Cell::from(text).style(theme.muted())
-            }))
-        };
         let with_separators = |cells: Vec<Cell<'static>>| -> Vec<Cell<'static>> {
             let mut cells = cells.into_iter();
             let mut joined: Vec<Cell<'static>> = cells.next().into_iter().collect();
@@ -605,33 +593,16 @@ impl Grid {
             };
             format!("{}{marker}", self.columns[*column])
         }));
-        let bold = Style::default().add_modifier(Modifier::BOLD);
-        let header_cells = header_names
-            .zip(cell_widths.iter().step_by(2))
-            .map(|(name, width)| {
-                let mut lines = vec![Line::styled(name, bold)];
-                if self.gridlines {
-                    lines.push(Line::styled("─".repeat(*width), theme.muted()));
-                }
-                Cell::from(Text::from(lines))
-            })
-            .collect::<Vec<_>>();
-        let header_separator = || {
-            let mut lines = vec![Line::styled(vertical, theme.muted())];
-            if self.gridlines {
-                lines.push(Line::styled("┼", theme.muted()));
-            }
-            Cell::from(Text::from(lines))
+        let line_style = if self.gridlines {
+            theme.grid_line()
+        } else {
+            Style::default()
         };
-        let mut header_row = Vec::with_capacity(cell_widths.len());
-        for (index, cell) in header_cells.into_iter().enumerate() {
-            if index > 0 {
-                header_row.push(header_separator());
-            }
-            header_row.push(cell);
-        }
-        let header = Row::new(header_row).height(u16::try_from(header_height).unwrap_or(1));
-        let mut body = Vec::with_capacity(page_rows.len() * row_height);
+        let header_cells = header_names
+            .map(|name| Cell::from(name).style(Style::default().add_modifier(Modifier::BOLD)))
+            .collect();
+        let header = Row::new(with_separators(header_cells)).style(line_style);
+        let mut body = Vec::with_capacity(page_rows.len());
         for (index, row) in page_rows.iter().enumerate() {
             let number = Cell::from(format!("{:>number_width$}", row_offset + index + 1))
                 .style(theme.muted());
@@ -643,10 +614,7 @@ impl Grid {
                     },
                 ))
                 .collect();
-            body.push(Row::new(with_separators(values)));
-            if self.gridlines {
-                body.push(separator_row());
-            }
+            body.push(Row::new(with_separators(values)).style(line_style));
         }
         let constraints: Vec<Constraint> = cell_widths
             .iter()
@@ -655,7 +623,7 @@ impl Grid {
         let mut table = Table::new(body, constraints)
             .header(header)
             .column_spacing(0);
-        let mut state = TableState::default().with_offset(first_row * row_height);
+        let mut state = TableState::default().with_offset(first_row);
         if focused && !page_rows.is_empty() {
             table = table
                 .row_highlight_style(theme.selection())
@@ -664,7 +632,7 @@ impl Grid {
                 .iter()
                 .position(|column| *column == self.cursor_column)
                 .map(|position| 2 + 2 * position);
-            state = state.with_selected(Some(self.cursor_row * row_height));
+            state = state.with_selected(Some(self.cursor_row));
             state = state.with_selected_column(cell_column);
         }
         frame.render_stateful_widget(table, area, &mut state);
@@ -925,7 +893,7 @@ fn compare_values(
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Modifier};
 
     use super::{
         Grid, GridKey, GridRequest, GridRow, PageSize, SortOrder, ValueKind, compare_values,
@@ -1222,24 +1190,40 @@ mod tests {
     fn grid_lines_separate_rows_and_columns_and_can_be_toggled() {
         let mut grid = local(30);
         grid.page_size = PageSize::Auto;
-        let screen = render(&grid, 60, 20);
-        assert!(screen.contains("#│id  │name"), "{screen}");
-        assert!(
-            screen.contains("─┼────┼──────"),
-            "separator under the header and rows"
-        );
-        assert!(screen.contains("1│0   │NULL"));
-        let with_lines = grid.page_size();
-        assert_eq!(with_lines, 7, "two screen lines per record");
+        let (screen, underlined) = render_with_underlines(&grid, 60, 20);
+        assert!(screen.contains("# │id  │name"), "{screen}");
+        assert!(screen.contains(" 1│0   │NULL"));
+        assert!(!screen.contains('┼'), "lines do not take screen rows");
+        assert_eq!(grid.page_size(), 16, "one screen line per record");
+        // Header (row 1, inside the border) and records are underlined across
+        // the whole inner width.
+        for row in [1, 2, 17] {
+            assert!(
+                (1..59).all(|column| underlined[row * 60 + column]),
+                "row {row} underlined edge to edge"
+            );
+        }
 
         assert_eq!(press(&mut grid, KeyCode::Char('L')), GridKey::Handled);
-        let screen = render(&grid, 60, 20);
-        assert!(!screen.contains('┼'));
-        assert!(
-            screen.contains("#  id   name"),
-            "blank spacing without lines"
-        );
+        let (screen, underlined) = render_with_underlines(&grid, 60, 20);
+        assert!(screen.contains("#  id   name"), "{screen}");
         assert!(screen.contains(" 1 0    NULL"));
-        assert_eq!(grid.page_size(), 16, "one screen line per record");
+        assert!(!underlined[2 * 60 + 5], "no underline without lines");
+        assert_eq!(grid.page_size(), 16);
+    }
+
+    fn render_with_underlines(grid: &Grid, width: u16, height: u16) -> (String, Vec<bool>) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| grid.render(frame, frame.area(), &Theme::default(), " Result ", false))
+            .expect("render grid");
+        let cells = &terminal.backend().buffer().content;
+        (
+            cells.iter().map(|cell| cell.symbol()).collect(),
+            cells
+                .iter()
+                .map(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+                .collect(),
+        )
     }
 }

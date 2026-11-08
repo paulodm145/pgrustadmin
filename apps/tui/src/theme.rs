@@ -227,6 +227,15 @@ impl Theme {
         }
     }
 
+    /// Thin horizontal grid line: an underline in the secondary text color.
+    pub fn grid_line(self) -> Style {
+        let style = Style::default().add_modifier(Modifier::UNDERLINED);
+        match self.mode {
+            ColorMode::Monochrome => style,
+            _ => style.underline_color(self.color(self.palette().text_secondary)),
+        }
+    }
+
     pub fn success(self) -> Style {
         self.foreground(self.palette().success)
     }

@@ -1515,6 +1515,7 @@ dependencies = [
  "futures-util",
  "pgrustadmin-api-client",
  "ratatui",
+ "ratatui-crossterm",
  "tokio",
  "uuid",
  "zeroize",
