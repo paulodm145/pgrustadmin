@@ -44,6 +44,7 @@ pub struct StoredConnectionCredentials {
     pub database_name: String,
     pub username: String,
     pub tls_enabled: bool,
+    pub read_only: bool,
     pub credential_envelope: Vec<u8>,
 }
 
@@ -53,7 +54,7 @@ pub async fn find_connection_credentials_for_owner(
     connection_id: Uuid,
 ) -> Result<Option<StoredConnectionCredentials>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT host, port, database_name, username, tls_enabled, credential_envelope \
+        "SELECT host, port, database_name, username, tls_enabled, read_only, credential_envelope \
          FROM connections WHERE owner_id = $1 AND id = $2",
     )
     .bind(owner_id)
@@ -377,6 +378,8 @@ pub struct RelationRows {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Option<String>>>,
     pub total_rows: i64,
+    /// Primary key columns in key order; empty for views and keyless tables.
+    pub primary_key: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -457,6 +460,7 @@ pub async fn list_relation_rows(
         {
             return Err(RelationRowsError::InvalidSort);
         }
+        let primary_key = primary_key_columns(&mut connection, relation_oid).await?;
 
         let source = format!(
             "{}.{} AS t",
@@ -482,19 +486,30 @@ pub async fn list_relation_rows(
             .map(|column| format!("{}::text", quote_identifier(column)))
             .collect::<Vec<_>>()
             .join(", ");
-        let order = query
+        // The primary key orders keyless sorts and breaks ties, so pages stay
+        // stable while rows are edited. Columns are qualified with `t`: a bare
+        // name would pick the `::text` output column and sort numbers as text.
+        let order_terms = query
             .sort
             .map(|(column, direction)| {
                 let direction = match direction {
                     SortDirection::Ascending => "ASC",
                     SortDirection::Descending => "DESC",
                 };
-                format!(
-                    " ORDER BY {} {direction} NULLS LAST",
-                    quote_identifier(column)
-                )
+                format!("t.{} {direction} NULLS LAST", quote_identifier(column))
             })
-            .unwrap_or_default();
+            .into_iter()
+            .chain(
+                primary_key
+                    .iter()
+                    .map(|column| format!("t.{}", quote_identifier(column))),
+            )
+            .collect::<Vec<_>>();
+        let order = if order_terms.is_empty() {
+            String::new()
+        } else {
+            format!(" ORDER BY {}", order_terms.join(", "))
+        };
         let (limit_parameter, offset_parameter) = if query.search.is_empty() {
             ("$1", "$2")
         } else {
@@ -528,15 +543,307 @@ pub async fn list_relation_rows(
             columns,
             rows,
             total_rows,
+            primary_key,
         })
     })
     .await
     .map_err(|_| RelationRowsError::Database(sqlx::Error::PoolTimedOut))?
 }
 
+/// Primary key columns of a relation in key order.
+async fn primary_key_columns(
+    connection: &mut sqlx::PgConnection,
+    relation_oid: sqlx::postgres::types::Oid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) \
+         WHERE i.indrelid = $1 AND i.indisprimary \
+         ORDER BY array_position(i.indkey::int2[], a.attnum)",
+    )
+    .bind(relation_oid)
+    .fetch_all(connection)
+    .await
+}
+
+/// New and original text values of one column in a row change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnChange {
+    pub column: String,
+    pub value: Option<String>,
+    /// Value the client saw, compared as text before updating.
+    pub original: Option<String>,
+}
+
+/// Update of one row, identified by the text of its primary key columns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowChange {
+    pub key: Vec<(String, String)>,
+    pub columns: Vec<ColumnChange>,
+}
+
+#[derive(Debug)]
+pub enum RowChangeError {
+    /// Missing relation or schema without `USAGE`.
+    NotFound,
+    /// Not an ordinary or partitioned table, or no primary key.
+    NotEditable,
+    /// A key does not name exactly the primary key, or a column is unknown,
+    /// repeated or part of the key.
+    InvalidChange,
+    /// The row at this index no longer has the original values.
+    Conflict {
+        index: usize,
+    },
+    /// PostgreSQL refused a change; the message is the server's primary text.
+    Rejected {
+        code: Option<String>,
+        message: String,
+    },
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for RowChangeError {
+    fn from(error: sqlx::Error) -> Self {
+        match error.as_database_error() {
+            Some(database_error) => Self::Rejected {
+                code: database_error.code().map(|code| code.into_owned()),
+                message: database_error.message().to_owned(),
+            },
+            None => Self::Database(error),
+        }
+    }
+}
+
+/// Applies row changes to a table in one transaction; all or nothing.
+pub async fn update_relation_rows(
+    connection: &StoredConnectionCredentials,
+    database: &str,
+    schema: &str,
+    relation: &str,
+    password: &str,
+    changes: &[RowChange],
+) -> Result<u64, RowChangeError> {
+    let options = connection_options(connection, password)
+        .map_err(RowChangeError::Database)?
+        .database(database);
+    tokio::time::timeout(RELATION_ROWS_TIMEOUT, async {
+        let mut connection = sqlx::PgConnection::connect_with(&options)
+            .await
+            .map_err(RowChangeError::Database)?;
+        let target: Option<(sqlx::postgres::types::Oid, bool)> = sqlx::query_as(
+            "SELECT c.oid, c.relkind IN ('r', 'p') \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND has_schema_privilege(n.oid, 'USAGE') \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition",
+        )
+        .bind(schema)
+        .bind(relation)
+        .fetch_optional(&mut connection)
+        .await?;
+        let Some((relation_oid, is_table)) = target else {
+            return Err(RowChangeError::NotFound);
+        };
+        let primary_key = primary_key_columns(&mut connection, relation_oid).await?;
+        if !is_table || primary_key.is_empty() {
+            return Err(RowChangeError::NotEditable);
+        }
+        let column_types: std::collections::HashMap<String, String> = sqlx::query_as(
+            "SELECT attname::text, format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped",
+        )
+        .bind(relation_oid)
+        .fetch_all(&mut connection)
+        .await?
+        .into_iter()
+        .collect();
+        if !changes
+            .iter()
+            .all(|change| is_valid_change(change, &primary_key, &column_types))
+        {
+            return Err(RowChangeError::InvalidChange);
+        }
+
+        let table = format!(
+            "{}.{}",
+            quote_identifier(schema),
+            quote_identifier(relation)
+        );
+        let mut transaction = sqlx::Connection::begin(&mut connection).await?;
+        let mut updated = 0;
+        for (index, change) in changes.iter().enumerate() {
+            let sql = update_statement(&table, change, &column_types);
+            // Identifiers and types come from the catalog; values are parameters.
+            let mut statement = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for column in &change.columns {
+                statement = statement.bind(column.value.as_deref());
+            }
+            for (_, value) in &change.key {
+                statement = statement.bind(value.as_str());
+            }
+            for column in &change.columns {
+                statement = statement.bind(column.original.as_deref());
+            }
+            let affected = statement.execute(&mut *transaction).await?.rows_affected();
+            if affected != 1 {
+                return Err(RowChangeError::Conflict { index });
+            }
+            updated += affected;
+        }
+        transaction.commit().await?;
+        Ok(updated)
+    })
+    .await
+    .map_err(|_| RowChangeError::Database(sqlx::Error::PoolTimedOut))?
+}
+
+fn is_valid_change(
+    change: &RowChange,
+    primary_key: &[String],
+    column_types: &std::collections::HashMap<String, String>,
+) -> bool {
+    let mut key_columns: Vec<&str> = change.key.iter().map(|(name, _)| name.as_str()).collect();
+    key_columns.sort_unstable();
+    let mut expected: Vec<&str> = primary_key.iter().map(String::as_str).collect();
+    expected.sort_unstable();
+    let mut changed: Vec<&str> = change
+        .columns
+        .iter()
+        .map(|column| column.column.as_str())
+        .collect();
+    changed.sort_unstable();
+    let unique = changed.windows(2).all(|pair| pair[0] != pair[1]);
+    key_columns == expected
+        && !changed.is_empty()
+        && unique
+        && changed
+            .iter()
+            .all(|name| column_types.contains_key(*name) && !expected.contains(name))
+}
+
+/// `UPDATE` binding new values, then key values, then original values.
+fn update_statement(
+    table: &str,
+    change: &RowChange,
+    column_types: &std::collections::HashMap<String, String>,
+) -> String {
+    let type_of = |column: &str| column_types.get(column).map_or("text", String::as_str);
+    let values = change.columns.len();
+    let keys = change.key.len();
+    let assignments = change
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            format!(
+                "{} = CAST(${} AS {})",
+                quote_identifier(&column.column),
+                index + 1,
+                type_of(&column.column)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conditions = change
+        .key
+        .iter()
+        .enumerate()
+        .map(|(index, (column, _))| {
+            format!(
+                "{} = CAST(${} AS {})",
+                quote_identifier(column),
+                values + index + 1,
+                type_of(column)
+            )
+        })
+        .chain(change.columns.iter().enumerate().map(|(index, column)| {
+            format!(
+                "{}::text IS NOT DISTINCT FROM ${}",
+                quote_identifier(&column.column),
+                values + keys + index + 1
+            )
+        }))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!("UPDATE {table} SET {assignments} WHERE {conditions}")
+}
+
 #[cfg(test)]
 mod relation_rows_tests {
-    use super::{contains_pattern, quote_identifier};
+    use std::collections::HashMap;
+
+    use super::{
+        ColumnChange, RowChange, contains_pattern, is_valid_change, quote_identifier,
+        update_statement,
+    };
+
+    fn change(key: &[&str], columns: &[&str]) -> RowChange {
+        RowChange {
+            key: key
+                .iter()
+                .map(|name| ((*name).to_owned(), "1".to_owned()))
+                .collect(),
+            columns: columns
+                .iter()
+                .map(|name| ColumnChange {
+                    column: (*name).to_owned(),
+                    value: Some("new".to_owned()),
+                    original: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn types() -> HashMap<String, String> {
+        [
+            ("id", "integer"),
+            ("tenant", "uuid"),
+            ("name", "text"),
+            ("we\"ird", "character varying(20)"),
+        ]
+        .into_iter()
+        .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
+        .collect()
+    }
+
+    #[test]
+    fn changes_must_name_the_primary_key_and_other_known_columns() {
+        let key = ["id".to_owned(), "tenant".to_owned()];
+        let types = types();
+        assert!(is_valid_change(
+            &change(&["tenant", "id"], &["name"]),
+            &key,
+            &types
+        ));
+        for invalid in [
+            change(&["id"], &["name"]),
+            change(&["id", "tenant", "name"], &["we\"ird"]),
+            change(&["id", "tenant"], &[]),
+            change(&["id", "tenant"], &["missing"]),
+            change(&["id", "tenant"], &["name", "name"]),
+            change(&["id", "tenant"], &["id"]),
+        ] {
+            assert!(!is_valid_change(&invalid, &key, &types), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn update_statements_cast_parameters_and_check_original_text() {
+        let sql = update_statement(
+            "\"public\".\"t\"",
+            &change(&["id", "tenant"], &["name", "we\"ird"]),
+            &types(),
+        );
+        assert_eq!(
+            sql,
+            "UPDATE \"public\".\"t\" SET \"name\" = CAST($1 AS text), \
+             \"we\"\"ird\" = CAST($2 AS character varying(20)) \
+             WHERE \"id\" = CAST($3 AS integer) AND \"tenant\" = CAST($4 AS uuid) \
+             AND \"name\"::text IS NOT DISTINCT FROM $5 \
+             AND \"we\"\"ird\"::text IS NOT DISTINCT FROM $6"
+        );
+    }
 
     #[test]
     fn identifiers_are_quoted_and_search_wildcards_escaped() {
@@ -911,6 +1218,7 @@ mod connection_options_tests {
             database_name: "app".to_owned(),
             username: "app_user".to_owned(),
             tls_enabled,
+            read_only: false,
             credential_envelope: Vec::new(),
         }
     }

@@ -318,6 +318,44 @@ pub struct RelationRowsPage {
     pub total_rows: u64,
     pub page: u64,
     pub per_page: u64,
+    /// Primary key columns; empty when rows cannot be identified.
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+    /// Whether the grid may save changes to these rows.
+    #[serde(default)]
+    pub editable: bool,
+}
+
+/// New and original text of a changed column; `None` is SQL `NULL`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ColumnChangeInput {
+    pub column: String,
+    pub value: Option<String>,
+    pub original: Option<String>,
+}
+
+/// Changes to one row, identified by its primary key values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RowChangeInput {
+    pub key: std::collections::BTreeMap<String, String>,
+    pub columns: Vec<ColumnChangeInput>,
+}
+
+/// Outcome of saving row changes; the save is all or nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowSaveOutcome {
+    Saved {
+        updated: u64,
+    },
+    /// The row at this index changed since it was read; nothing was saved.
+    RowChanged {
+        index: usize,
+    },
+    /// PostgreSQL refused a change; nothing was saved.
+    Rejected {
+        code: Option<String>,
+        message: String,
+    },
 }
 
 /// Page, order and search of a relation rows request.
@@ -624,6 +662,61 @@ impl ApiClient {
         decode_response(request.send().await.map_err(|_| ApiError::Transport)?).await
     }
 
+    pub async fn save_relation_rows(
+        &self,
+        relation: RelationRef<'_>,
+        changes: &[RowChangeInput],
+    ) -> Result<RowSaveOutcome, ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            changes: &'a [RowChangeInput],
+        }
+        #[derive(Deserialize)]
+        struct Outcome {
+            #[serde(default)]
+            updated: u64,
+            error: Option<String>,
+            index: Option<usize>,
+            code: Option<String>,
+            message: Option<String>,
+        }
+        let response = self
+            .request(Method::POST, &relation.path("rows/changes"), true)?
+            .json(&Body { changes })
+            .send()
+            .await
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        if !matches!(
+            status,
+            StatusCode::OK | StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return Err(http_error(response).await);
+        }
+        let outcome: Outcome = response
+            .json()
+            .await
+            .map_err(|_| ApiError::InvalidResponse)?;
+        match (status, outcome.error.as_deref()) {
+            (StatusCode::OK, None) => Ok(RowSaveOutcome::Saved {
+                updated: outcome.updated,
+            }),
+            (StatusCode::CONFLICT, Some("row_changed")) => Ok(RowSaveOutcome::RowChanged {
+                index: outcome.index.ok_or(ApiError::InvalidResponse)?,
+            }),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("change_rejected")) => {
+                Ok(RowSaveOutcome::Rejected {
+                    code: outcome.code,
+                    message: outcome.message.unwrap_or_default(),
+                })
+            }
+            (_, error) => Err(ApiError::Http {
+                status: status.as_u16(),
+                code: error.and_then(known_error_code),
+            }),
+        }
+    }
+
     pub async fn list_indexes(&self, relation: RelationRef<'_>) -> Result<IndexList, ApiError> {
         self.get_json(&relation.path("indexes"), true).await
     }
@@ -702,29 +795,38 @@ async fn http_error(response: reqwest::Response) -> ApiError {
         .json::<ErrorResponse>()
         .await
         .ok()
-        .and_then(|body| match body.error.as_str() {
-            "invalid_credentials" => Some("invalid_credentials"),
-            "unauthorized" => Some("unauthorized"),
-            "invalid_request" => Some("invalid_request"),
-            "not_found" => Some("not_found"),
-            "connection_name_conflict" => Some("connection_name_conflict"),
-            "credential_encryption_unavailable" => Some("credential_encryption_unavailable"),
-            "internal_error" => Some("internal_error"),
-            "method_not_allowed" => Some("method_not_allowed"),
-            "catalog_unavailable" => Some("catalog_unavailable"),
-            "file_name_conflict" => Some("file_name_conflict"),
-            "file_conflict" => Some("file_conflict"),
-            "file_too_large" => Some("file_too_large"),
-            "file_storage_unavailable" => Some("file_storage_unavailable"),
-            "execution_limit_reached" => Some("execution_limit_reached"),
-            "server_execution_limit_reached" => Some("server_execution_limit_reached"),
-            "result_unavailable" => Some("result_unavailable"),
-            "result_expired" => Some("result_expired"),
-            "execution_not_running" => Some("execution_not_running"),
-            "relation_not_readable" => Some("relation_not_readable"),
-            _ => None,
-        });
+        .and_then(|body| known_error_code(&body.error));
     ApiError::Http { status, code }
+}
+
+/// Maps an API error code to its static form; unknown codes become `None`.
+fn known_error_code(code: &str) -> Option<&'static str> {
+    const CODES: [&str; 23] = [
+        "invalid_credentials",
+        "unauthorized",
+        "invalid_request",
+        "not_found",
+        "connection_name_conflict",
+        "credential_encryption_unavailable",
+        "internal_error",
+        "method_not_allowed",
+        "catalog_unavailable",
+        "file_name_conflict",
+        "file_conflict",
+        "file_too_large",
+        "file_storage_unavailable",
+        "execution_limit_reached",
+        "server_execution_limit_reached",
+        "result_unavailable",
+        "result_expired",
+        "execution_not_running",
+        "relation_not_readable",
+        "connection_read_only",
+        "relation_not_editable",
+        "row_changed",
+        "change_rejected",
+    ];
+    CODES.into_iter().find(|known| *known == code)
 }
 
 #[cfg(test)]
@@ -973,6 +1075,31 @@ mod tests {
                     }))
                 }),
             )
+            .route(
+                "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/rows/changes",
+                post(|Json(body): Json<serde_json::Value>| async move {
+                    let (status, response) = match body["changes"][0]["key"]["id"].as_str() {
+                        Some("1") => (
+                            axum::http::StatusCode::OK,
+                            serde_json::json!({"updated": body["changes"].as_array().map_or(0, Vec::len)}),
+                        ),
+                        Some("2") => (
+                            axum::http::StatusCode::CONFLICT,
+                            serde_json::json!({"error": "row_changed", "index": 0}),
+                        ),
+                        Some("3") => (
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            serde_json::json!({"error": "change_rejected", "code": "22P02",
+                                "message": "invalid input syntax for type integer: \"x\""}),
+                        ),
+                        _ => (
+                            axum::http::StatusCode::FORBIDDEN,
+                            serde_json::json!({"error": "connection_read_only"}),
+                        ),
+                    };
+                    (status, Json(response))
+                }),
+            )
             .route("/api/v1/failure", get(internal_error))
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1088,6 +1215,40 @@ mod tests {
             .await
             .expect("relation rows");
         assert_eq!(unsorted.rows[0], vec![Some("1|25|-|-|-".to_owned())]);
+        assert!(unsorted.primary_key.is_empty() && !unsorted.editable);
+
+        let change = |id: &str| super::RowChangeInput {
+            key: [("id".to_owned(), id.to_owned())].into(),
+            columns: vec![super::ColumnChangeInput {
+                column: "count".to_owned(),
+                value: None,
+                original: Some("1".to_owned()),
+            }],
+        };
+        assert_eq!(
+            client
+                .save_relation_rows(relation, &[change("1"), change("9")])
+                .await,
+            Ok(super::RowSaveOutcome::Saved { updated: 2 })
+        );
+        assert_eq!(
+            client.save_relation_rows(relation, &[change("2")]).await,
+            Ok(super::RowSaveOutcome::RowChanged { index: 0 })
+        );
+        assert_eq!(
+            client.save_relation_rows(relation, &[change("3")]).await,
+            Ok(super::RowSaveOutcome::Rejected {
+                code: Some("22P02".to_owned()),
+                message: "invalid input syntax for type integer: \"x\"".to_owned(),
+            })
+        );
+        assert_eq!(
+            client.save_relation_rows(relation, &[change("4")]).await,
+            Err(ApiError::Http {
+                status: 403,
+                code: Some("connection_read_only"),
+            })
+        );
         assert_eq!(
             client
                 .list_columns(relation)

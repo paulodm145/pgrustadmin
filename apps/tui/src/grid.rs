@@ -13,7 +13,10 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::theme::Theme;
+use crate::{
+    grid_edit::{CellEditor, EditorKey, PendingChanges, PendingRow, RowKey},
+    theme::Theme,
+};
 
 const MAX_COLUMN_WIDTH: usize = 40;
 const MIN_COLUMN_WIDTH: usize = 4;
@@ -70,7 +73,13 @@ pub enum GridKey {
     Handled,
     /// The remote page must be fetched again with [`Grid::request`].
     Reload,
+    /// Save the pending changes from [`Grid::pending`].
+    Save,
+    /// Handled, with a message for the screen's status line.
+    Notice(&'static str),
 }
+
+const NOT_EDITABLE: &str = "These rows cannot be edited.";
 
 #[derive(Debug)]
 enum Source {
@@ -107,6 +116,10 @@ pub struct Grid {
     show_value: bool,
     /// Spreadsheet-like lines between rows and columns.
     gridlines: bool,
+    /// Primary key columns when rows can be edited, or why they cannot.
+    editing: Result<Vec<String>, &'static str>,
+    pending: PendingChanges,
+    editor: Option<CellEditor>,
     /// Page size of the latest remote request; remote pages hold this many rows.
     requested_size: StateCell<usize>,
     // View state updated while rendering, which only has shared access.
@@ -156,6 +169,9 @@ impl Grid {
             search_input: None,
             show_value: false,
             gridlines: true,
+            editing: Err(NOT_EDITABLE),
+            pending: PendingChanges::default(),
+            editor: None,
             requested_size: StateCell::new(0),
             visible_rows: StateCell::new(20),
             first_row: StateCell::new(0),
@@ -192,6 +208,125 @@ impl Grid {
             page_rows.clear();
             *loading = false;
             *error = Some(message);
+        }
+    }
+
+    /// Allows editing rows identified by the `primary_key` columns, or
+    /// records why editing is unavailable.
+    pub fn set_editing(&mut self, editing: Result<Vec<String>, &'static str>) {
+        if editing.is_err() {
+            self.pending.clear();
+            self.editor = None;
+        }
+        self.editing = editing;
+    }
+
+    pub fn pending(&self) -> &[PendingRow] {
+        self.pending.rows()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Pasted text goes to the open cell editor; returns whether it took it.
+    pub fn paste(&mut self, text: &str) -> bool {
+        match &mut self.editor {
+            Some(editor) => {
+                editor.paste(text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Key of a row of the current page, when rows are editable.
+    fn row_key(&self, row: &GridRow) -> Option<RowKey> {
+        let key = self.editing.as_ref().ok()?;
+        key.iter()
+            .map(|name| {
+                let index = self.columns.iter().position(|column| column == name)?;
+                let value = row.get(index)?.clone()?;
+                Some((name.clone(), value))
+            })
+            .collect()
+    }
+
+    /// Cell value with any pending change applied.
+    fn shown_value<'a>(
+        &'a self,
+        row: &'a GridRow,
+        key: Option<&RowKey>,
+        column: usize,
+    ) -> Option<&'a str> {
+        if let Some(key) = key
+            && let Some(name) = self.columns.get(column)
+            && let Some(value) = self.pending.value(key, name)
+        {
+            return value.as_deref();
+        }
+        row.get(column).and_then(Option::as_deref)
+    }
+
+    fn is_pending(&self, key: Option<&RowKey>, column: usize) -> bool {
+        key.zip(self.columns.get(column))
+            .is_some_and(|(key, name)| self.pending.value(key, name).is_some())
+    }
+
+    fn active_row(&self) -> Option<GridRow> {
+        self.page_rows()
+            .get(self.cursor_row)
+            .map(|row| (*row).clone())
+    }
+
+    fn start_editing(&mut self) -> GridKey {
+        let key = match &self.editing {
+            Err(reason) => return GridKey::Notice(reason),
+            Ok(key) => key,
+        };
+        let Some(column) = self.columns.get(self.cursor_column).cloned() else {
+            return GridKey::Handled;
+        };
+        if key.contains(&column) {
+            return GridKey::Notice("Primary key columns cannot be edited.");
+        }
+        let Some(row) = self.active_row() else {
+            return GridKey::Handled;
+        };
+        let Some(row_key) = self.row_key(&row) else {
+            return GridKey::Notice("This row has no complete primary key.");
+        };
+        let original = row.get(self.cursor_column).cloned().flatten();
+        let current = self
+            .shown_value(&row, Some(&row_key), self.cursor_column)
+            .map(str::to_owned);
+        self.editor = Some(CellEditor::new(
+            row_key,
+            column,
+            original,
+            current.as_deref(),
+        ));
+        GridKey::Handled
+    }
+
+    fn discard_active_change(&mut self) -> GridKey {
+        let Some(row) = self.active_row() else {
+            return GridKey::Handled;
+        };
+        let (Some(key), Some(column)) = (
+            self.row_key(&row),
+            self.columns.get(self.cursor_column).cloned(),
+        ) else {
+            return GridKey::Handled;
+        };
+        if self.pending.discard(&key, &column) {
+            GridKey::Notice("Change discarded.")
+        } else {
+            GridKey::Handled
         }
     }
 
@@ -356,6 +491,20 @@ impl Grid {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> GridKey {
+        if let Some(editor) = &mut self.editor {
+            match editor.handle_key(key) {
+                EditorKey::Continue => {}
+                EditorKey::Cancel => self.editor = None,
+                EditorKey::Commit => {
+                    if let Some(editor) = self.editor.take() {
+                        let value = editor.value();
+                        self.pending
+                            .set(editor.key, &editor.column, editor.original, value);
+                    }
+                }
+            }
+            return GridKey::Handled;
+        }
         if let Some(input) = &mut self.search_input {
             match key.code {
                 KeyCode::Enter => {
@@ -398,7 +547,25 @@ impl Grid {
         }
 
         let rows = self.page_rows().len();
+        // Editing keys belong to relation previews; query result grids leave
+        // them to the SQL screen (`e` runs, `x` closes the tab there).
+        let editable_source = self.is_remote();
+        if editable_source && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('s') if self.pending.is_empty() => {
+                    GridKey::Notice("There are no pending changes to save.")
+                }
+                KeyCode::Char('s') => GridKey::Save,
+                _ => GridKey::Ignored,
+            };
+        }
         match key.code {
+            KeyCode::Char('e') if editable_source && rows > 0 => return self.start_editing(),
+            KeyCode::Char('x') if editable_source => return self.discard_active_change(),
+            KeyCode::Char('X') if editable_source && !self.pending.is_empty() => {
+                self.pending.clear();
+                return GridKey::Notice("All pending changes were discarded.");
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.cursor_row > 0 {
                     self.cursor_row -= 1;
@@ -516,6 +683,9 @@ impl Grid {
         if self.show_value {
             self.render_value(frame, area, theme);
         }
+        if let Some(editor) = &self.editor {
+            render_editor(frame, area, theme, editor);
+        }
     }
 
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme, focused: bool) {
@@ -613,15 +783,21 @@ impl Grid {
         let header = Row::new(with_separators(header_cells)).style(line_style);
         let mut body = Vec::with_capacity(page_rows.len());
         for (index, row) in page_rows.iter().enumerate() {
+            let key = self.row_key(row);
             let number = Cell::from(format!("{:>number_width$}", row_offset + index + 1))
                 .style(theme.muted());
             let values = std::iter::once(number)
-                .chain(shown.iter().map(
-                    |column| match row.get(*column).and_then(Option::as_deref) {
+                .chain(shown.iter().map(|column| {
+                    let cell = match self.shown_value(row, key.as_ref(), *column) {
                         Some(text) => Cell::from(truncate(text, widths[*column])),
                         None => Cell::from("NULL").style(theme.muted()),
-                    },
-                ))
+                    };
+                    if self.is_pending(key.as_ref(), *column) {
+                        cell.style(theme.warning().add_modifier(Modifier::ITALIC))
+                    } else {
+                        cell
+                    }
+                }))
                 .collect();
             body.push(Row::new(with_separators(values)).style(line_style));
         }
@@ -693,6 +869,12 @@ impl Grid {
         if matches!(self.source, Source::Remote { loading: true, .. }) {
             status.push("loading…".to_owned());
         }
+        if !self.pending.is_empty() {
+            status.push(format!(
+                "{} change(s) pending: Ctrl+S save, x/X discard",
+                self.pending.cell_count()
+            ));
+        }
         let size = match self.page_size {
             PageSize::Auto => format!("auto ({})", self.page_size()),
             PageSize::Fixed(size) => size.to_string(),
@@ -745,6 +927,45 @@ impl Grid {
             popup,
         );
     }
+}
+
+/// Centered input for the cell being edited.
+fn render_editor(frame: &mut Frame<'_>, area: Rect, theme: &Theme, editor: &CellEditor) {
+    let width = area.width.saturating_mul(4) / 5;
+    let height = 5.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let line = if editor.is_null() {
+        Line::from(vec![
+            Span::styled("NULL", theme.muted()),
+            Span::styled("▏", theme.accent()),
+        ])
+    } else {
+        let (before, after) = editor.split_at_cursor();
+        Line::from(vec![
+            Span::raw(before),
+            Span::styled("▏", theme.accent()),
+            Span::raw(after),
+        ])
+    };
+    let help = Line::styled("Enter: keep  Esc: cancel  Ctrl+N: NULL", theme.muted());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(vec![line, help])
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.focus_border())
+                    .style(theme.surface())
+                    .title(format!(" Edit {} ", editor.column)),
+            ),
+        popup,
+    );
 }
 
 /// Pager such as `« ‹ 1 … 4 [5] 6 … 40 › »`; arrows are dimmed at the ends.
