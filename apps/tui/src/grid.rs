@@ -547,8 +547,16 @@ impl Grid {
         self.first_row.set(first_row);
 
         let row_offset = self.current_page() * self.page_size();
-        let number_width = (row_offset + page_rows.len()).max(1).to_string().len();
-        let available = usize::from(area.width).saturating_sub(number_width + 1);
+        // With grid lines, content gets one space of padding on each side:
+        // before the row number and around every vertical line.
+        let (padding, vertical) = if self.gridlines {
+            (1, " │ ")
+        } else {
+            (0, " ")
+        };
+        let gap = vertical.chars().count();
+        let number_width = (row_offset + page_rows.len()).max(1).to_string().len() + padding;
+        let available = usize::from(area.width).saturating_sub(number_width + gap);
         let widths: Vec<usize> = (0..self.columns.len())
             .map(|column| self.column_width(column, &page_rows))
             .collect();
@@ -556,6 +564,7 @@ impl Grid {
             self.first_column.get(),
             self.cursor_column,
             &widths,
+            gap,
             available,
         );
         self.first_column.set(first_column);
@@ -565,16 +574,15 @@ impl Grid {
             if !shown.is_empty() && used + width > available {
                 break;
             }
-            used += width + 1;
+            used += width + gap;
             shown.push(column);
         }
 
-        // Table columns: number, then a 1-cell separator before each shown column.
+        // Table columns: number, then a separator before each shown column.
         let mut cell_widths = vec![number_width];
         for column in &shown {
-            cell_widths.extend([1, widths[*column]]);
+            cell_widths.extend([gap, widths[*column]]);
         }
-        let vertical = if self.gridlines { "│" } else { " " };
         let with_separators = |cells: Vec<Cell<'static>>| -> Vec<Cell<'static>> {
             let mut cells = cells.into_iter();
             let mut joined: Vec<Cell<'static>> = cells.next().into_iter().collect();
@@ -585,14 +593,15 @@ impl Grid {
             joined
         };
 
-        let header_names = std::iter::once("#".to_owned()).chain(shown.iter().map(|column| {
-            let marker = match self.sort {
-                Some((sorted, SortOrder::Ascending)) if sorted == *column => " ▲",
-                Some((sorted, SortOrder::Descending)) if sorted == *column => " ▼",
-                _ => "",
-            };
-            format!("{}{marker}", self.columns[*column])
-        }));
+        let header_names =
+            std::iter::once(format!("{:>number_width$}", "#")).chain(shown.iter().map(|column| {
+                let marker = match self.sort {
+                    Some((sorted, SortOrder::Ascending)) if sorted == *column => " ▲",
+                    Some((sorted, SortOrder::Descending)) if sorted == *column => " ▼",
+                    _ => "",
+                };
+                format!("{}{marker}", self.columns[*column])
+            }));
         let line_style = if self.gridlines {
             theme.grid_line()
         } else {
@@ -791,14 +800,20 @@ fn keep_visible(first: usize, position: usize, size: usize) -> usize {
 }
 
 /// First column to draw so that `cursor` fits within `available` cells.
-fn first_visible_column(first: usize, cursor: usize, widths: &[usize], available: usize) -> usize {
+fn first_visible_column(
+    first: usize,
+    cursor: usize,
+    widths: &[usize],
+    gap: usize,
+    available: usize,
+) -> usize {
     if cursor < first {
         return cursor;
     }
     let fits = |start: usize| {
         widths[start..=cursor]
             .iter()
-            .map(|width| width + 1)
+            .map(|width| width + gap)
             .sum::<usize>()
             <= available
             || start == cursor
@@ -1191,8 +1206,8 @@ mod tests {
         let mut grid = local(30);
         grid.page_size = PageSize::Auto;
         let (screen, underlined) = render_with_underlines(&grid, 60, 20);
-        assert!(screen.contains("# │id  │name"), "{screen}");
-        assert!(screen.contains(" 1│0   │NULL"));
+        assert!(screen.contains("  # │ id   │ name"), "{screen}");
+        assert!(screen.contains("  1 │ 0    │ NULL"), "padding around lines");
         assert!(!screen.contains('┼'), "lines do not take screen rows");
         assert_eq!(grid.page_size(), 16, "one screen line per record");
         // Header (row 1, inside the border) and records are underlined across
@@ -1206,7 +1221,7 @@ mod tests {
 
         assert_eq!(press(&mut grid, KeyCode::Char('L')), GridKey::Handled);
         let (screen, underlined) = render_with_underlines(&grid, 60, 20);
-        assert!(screen.contains("#  id   name"), "{screen}");
+        assert!(screen.contains(" # id   name"), "{screen}");
         assert!(screen.contains(" 1 0    NULL"));
         assert!(!underlined[2 * 60 + 5], "no underline without lines");
         assert_eq!(grid.page_size(), 16);
