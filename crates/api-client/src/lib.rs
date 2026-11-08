@@ -97,6 +97,9 @@ pub struct Connection {
     pub database: String,
     pub username: String,
     pub tls_enabled: bool,
+    /// Blocks data editing in the grid; missing from older servers.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -107,6 +110,7 @@ pub struct ConnectionInput {
     pub database: String,
     pub username: String,
     pub tls_enabled: bool,
+    pub read_only: bool,
     pub password: Option<String>,
 }
 
@@ -1223,10 +1227,12 @@ mod tests {
             database: "app".to_owned(),
             username: "app".to_owned(),
             tls_enabled: true,
+            read_only: true,
             password: Some("do-not-log".to_owned()),
         };
         let encoded = serde_json::to_value(input).expect("connection request serializes");
         assert_eq!(encoded["name"], "local");
+        assert_eq!(encoded["read_only"], true);
         server.abort();
     }
 }
