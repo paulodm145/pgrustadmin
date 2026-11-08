@@ -1631,6 +1631,10 @@ fn execution_error_message(error: ApiError) -> &'static str {
             ..
         } => "Too many SQL executions are running. Wait for one to finish.",
         ApiError::Http {
+            code: Some("server_execution_limit_reached"),
+            ..
+        } => "The server is busy with other SQL executions. Try again shortly.",
+        ApiError::Http {
             code: Some("not_found"),
             ..
         } => "The connection or execution is no longer available.",
@@ -3576,6 +3580,14 @@ mod tests {
             }),
         );
         assert!(render_text(&app).contains("Too many SQL executions are running"));
+        app.finish_execution(
+            tab_id,
+            Err(ApiError::Http {
+                status: 429,
+                code: Some("server_execution_limit_reached"),
+            }),
+        );
+        assert!(render_text(&app).contains("The server is busy with other SQL executions"));
 
         let closed = app
             .sql_tabs

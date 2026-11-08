@@ -38,27 +38,58 @@ const STOPPED_MESSAGE: &str = "The execution stopped unexpectedly.";
 pub const EXECUTION_TIMEOUT_ENV: &str = "PGRUSTADMIN_EXECUTION_TIMEOUT_SECS";
 const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 300;
 const MAX_EXECUTION_TIMEOUT_SECS: u64 = 3600;
+pub const MAX_CONCURRENT_EXECUTIONS_ENV: &str = "PGRUSTADMIN_MAX_CONCURRENT_EXECUTIONS";
+const DEFAULT_MAX_CONCURRENT_EXECUTIONS: u64 = 20;
+const MAX_MAX_CONCURRENT_EXECUTIONS: u64 = 1000;
 
 /// Parses the execution timeout from its environment value, if set.
 pub fn execution_timeout(value: Option<OsString>) -> io::Result<Duration> {
+    bounded_setting(
+        value,
+        DEFAULT_EXECUTION_TIMEOUT_SECS,
+        MAX_EXECUTION_TIMEOUT_SECS,
+        || {
+            format!(
+                "{EXECUTION_TIMEOUT_ENV} must be a whole number of seconds from 1 to \
+                 {MAX_EXECUTION_TIMEOUT_SECS}"
+            )
+        },
+    )
+    .map(Duration::from_secs)
+}
+
+/// Parses the server-wide limit of running executions, if set.
+pub fn max_concurrent_executions(value: Option<OsString>) -> io::Result<usize> {
+    bounded_setting(
+        value,
+        DEFAULT_MAX_CONCURRENT_EXECUTIONS,
+        MAX_MAX_CONCURRENT_EXECUTIONS,
+        || {
+            format!(
+                "{MAX_CONCURRENT_EXECUTIONS_ENV} must be a whole number from 1 to \
+                 {MAX_MAX_CONCURRENT_EXECUTIONS}"
+            )
+        },
+    )
+    .and_then(|limit| usize::try_from(limit).map_err(io::Error::other))
+}
+
+/// A whole number from 1 to `max`, or `default` when the variable is unset.
+fn bounded_setting(
+    value: Option<OsString>,
+    default: u64,
+    max: u64,
+    message: impl FnOnce() -> String,
+) -> io::Result<u64> {
     let Some(value) = value else {
-        return Ok(Duration::from_secs(DEFAULT_EXECUTION_TIMEOUT_SECS));
+        return Ok(default);
     };
     value
         .into_string()
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| (1..=MAX_EXECUTION_TIMEOUT_SECS).contains(seconds))
-        .map(Duration::from_secs)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{EXECUTION_TIMEOUT_ENV} must be a whole number of seconds from 1 to \
-                     {MAX_EXECUTION_TIMEOUT_SECS}"
-                ),
-            )
-        })
+        .filter(|number| (1..=max).contains(number))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, message()))
 }
 
 /// Why an execution stopped before the script finished.
@@ -126,8 +157,12 @@ enum ViewState {
     TimedOut,
 }
 
+/// Which limit of running executions refused a new one.
 #[derive(Debug, PartialEq, Eq)]
-struct RunningLimitReached;
+enum LimitReached {
+    Owner,
+    Server,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum CancelError {
@@ -147,9 +182,16 @@ enum ResultError {
 /// A `Mutex` is the simplest fit: every critical section is a short map
 /// update that never awaits, and the alternatives (a dedicated actor task or
 /// a concurrent-map crate) add code or a dependency without a concrete gain.
-#[derive(Default)]
 struct ExecutionRegistry {
     inner: Mutex<RegistryState>,
+    /// Running executions allowed across all users.
+    max_running: usize,
+}
+
+impl Default for ExecutionRegistry {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_CONCURRENT_EXECUTIONS as usize)
+    }
 }
 
 #[derive(Default)]
@@ -180,6 +222,13 @@ impl RegistryState {
 }
 
 impl ExecutionRegistry {
+    fn new(max_running: usize) -> Self {
+        Self {
+            inner: Mutex::default(),
+            max_running,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
         // Entries stay consistent even if a holder panicked: each update is a
         // single insert/remove/assignment.
@@ -192,8 +241,13 @@ impl ExecutionRegistry {
         connection_id: Uuid,
         database: &str,
         cancel: oneshot::Sender<()>,
-    ) -> Result<Uuid, RunningLimitReached> {
+    ) -> Result<Uuid, LimitReached> {
         let mut state = self.lock();
+        let running = state
+            .entries
+            .values()
+            .filter(|entry| entry.state == ExecutionState::Running)
+            .count();
         let owned: Vec<(Uuid, u64, bool)> = state
             .entries
             .iter()
@@ -201,7 +255,10 @@ impl ExecutionRegistry {
             .map(|(id, entry)| (*id, entry.sequence, entry.state == ExecutionState::Running))
             .collect();
         if owned.iter().filter(|(_, _, running)| *running).count() >= MAX_RUNNING_PER_OWNER {
-            return Err(RunningLimitReached);
+            return Err(LimitReached::Owner);
+        }
+        if running >= self.max_running {
+            return Err(LimitReached::Server);
         }
         let mut finished: Vec<(Uuid, u64)> = owned
             .iter()
@@ -363,7 +420,7 @@ struct ExecutionsState {
     timeout: Duration,
 }
 
-pub fn router(pool: PgPool, timeout: Duration) -> Router {
+pub fn router(pool: PgPool, timeout: Duration, max_running: usize) -> Router {
     Router::new()
         .route(
             "/api/v1/connections/{id}/databases/{database}/executions",
@@ -375,7 +432,7 @@ pub fn router(pool: PgPool, timeout: Duration) -> Router {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(ExecutionsState {
             pool,
-            registry: Arc::default(),
+            registry: Arc::new(ExecutionRegistry::new(max_running)),
             timeout,
         })
 }
@@ -457,11 +514,20 @@ async fn start(
             Err(error) => return error.into_response(),
         };
     let (cancel_sender, cancel_receiver) = oneshot::channel();
-    let Ok(id) = state
+    let id = match state
         .registry
         .start(owner_id, connection_id, &database, cancel_sender)
-    else {
-        return error_response(StatusCode::TOO_MANY_REQUESTS, "execution_limit_reached");
+    {
+        Ok(id) => id,
+        Err(LimitReached::Owner) => {
+            return error_response(StatusCode::TOO_MANY_REQUESTS, "execution_limit_reached");
+        }
+        Err(LimitReached::Server) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "server_execution_limit_reached",
+            );
+        }
     };
 
     let guard = FinishGuard::new(Arc::clone(&state.registry), id);
@@ -636,9 +702,9 @@ mod tests {
 
     use super::{
         CONNECTION_FAILED_MESSAGE, CancelError, Counts, ExecutionRegistry, ExecutionState,
-        FinishGuard, MAX_RESULTS_WITH_ROWS_PER_OWNER, MAX_RETAINED_PER_OWNER,
-        MAX_RUNNING_PER_OWNER, ResultError, RunningLimitReached, STOPPED_MESSAGE, ViewState,
-        execution_state, execution_timeout,
+        FinishGuard, LimitReached, MAX_RESULTS_WITH_ROWS_PER_OWNER, MAX_RETAINED_PER_OWNER,
+        MAX_RUNNING_PER_OWNER, ResultError, STOPPED_MESSAGE, ViewState, execution_state,
+        execution_timeout, max_concurrent_executions,
     };
 
     fn channel() -> tokio::sync::oneshot::Sender<()> {
@@ -665,7 +731,7 @@ mod tests {
             .collect();
         assert_eq!(
             registry.start(owner, Uuid::new_v4(), "app", channel()),
-            Err(RunningLimitReached)
+            Err(LimitReached::Owner)
         );
         assert!(
             registry
@@ -815,6 +881,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn max_concurrent_executions_defaults_and_rejects_out_of_range_values() {
+        assert_eq!(max_concurrent_executions(None).expect("default"), 20);
+        assert_eq!(
+            max_concurrent_executions(Some("1000".into())).expect("maximum"),
+            1000
+        );
+        assert_eq!(
+            max_concurrent_executions(Some("1".into())).expect("minimum"),
+            1
+        );
+        for invalid in ["0", "1001", "-1", "ten", ""] {
+            assert!(
+                max_concurrent_executions(Some(invalid.into())).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_limits_running_executions_across_owners() {
+        let registry = ExecutionRegistry::new(3);
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let ids = [
+            registry.start(first, Uuid::new_v4(), "app", channel()),
+            registry.start(first, Uuid::new_v4(), "app", channel()),
+            registry.start(second, Uuid::new_v4(), "app", channel()),
+        ]
+        .map(|started| started.expect("start below the server limit"));
+        let third = Uuid::new_v4();
+        assert_eq!(
+            registry.start(third, Uuid::new_v4(), "app", channel()),
+            Err(LimitReached::Server)
+        );
+
+        registry.finish(ids[0], succeeded(), 7);
+        assert!(
+            registry
+                .start(third, Uuid::new_v4(), "app", channel())
+                .is_ok(),
+            "finished executions free a server slot"
+        );
+        assert_eq!(
+            registry.start(second, Uuid::new_v4(), "app", channel()),
+            Err(LimitReached::Server)
+        );
+    }
+
     #[tokio::test]
     async fn cancelling_signals_only_running_executions_of_the_owner() {
         let registry = ExecutionRegistry::default();
@@ -918,7 +1033,7 @@ mod tests {
         let connection_id = created["id"].as_str().expect("connection id").to_owned();
         let start_path =
             format!("/api/v1/connections/{connection_id}/databases/pgrustadmin_test/executions");
-        let app = super::router(pool.clone(), Duration::from_secs(300));
+        let app = super::router(pool.clone(), Duration::from_secs(300), 20);
 
         let (status, started) = send(
             app.clone(),
@@ -1100,6 +1215,32 @@ mod tests {
             assert_eq!(wait_for(&app, id, owner).await["status"], "succeeded");
         }
 
+        let single = super::router(pool.clone(), Duration::from_secs(300), 1);
+        let (status, busy) = send(
+            single.clone(),
+            Method::POST,
+            &start_path,
+            owner,
+            Some(serde_json::json!({"sql": "SELECT pg_sleep(1)"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, limited) = send(
+            single.clone(),
+            Method::POST,
+            &start_path,
+            owner,
+            Some(serde_json::json!({"sql": "SELECT 1"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            limited,
+            serde_json::json!({"error": "server_execution_limit_reached"})
+        );
+        let busy = busy["id"].as_str().expect("id");
+        assert_eq!(wait_for(&single, busy, owner).await["status"], "succeeded");
+
         let marker = Uuid::new_v4().simple().to_string();
         let sleep_sql = format!("SELECT pg_sleep(30) /* cancel {marker} */");
         let (_, started) = send(
@@ -1142,7 +1283,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
 
-        let short = super::router(pool.clone(), Duration::from_secs(1));
+        let short = super::router(pool.clone(), Duration::from_secs(1), 20);
         let marker = Uuid::new_v4().simple().to_string();
         let (_, started) = send(
             short.clone(),

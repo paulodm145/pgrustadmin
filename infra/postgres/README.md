@@ -51,6 +51,8 @@ Inclua esse diretório no backup junto com o banco de metadados: os metadados re
 
 Execuções de SQL têm tempo limite único por script, padrão de 300 segundos. Para mudar, defina `PGRUSTADMIN_EXECUTION_TIMEOUT_SECS` com um inteiro de 1 a 3600 antes de iniciar o servidor; valor inválido impede a inicialização.
 
+O servidor aceita no máximo 20 execuções em andamento ao mesmo tempo, somando todos os usuários (cada usuário continua limitado a 5). Para mudar, defina `PGRUSTADMIN_MAX_CONCURRENT_EXECUTIONS` com um inteiro de 1 a 1000; valor inválido impede a inicialização.
+
 O teste de autorização precisa de um banco descartável. Crie-o uma vez:
 
 ```bash
