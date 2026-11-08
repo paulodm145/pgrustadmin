@@ -1,4 +1,5 @@
 mod grid;
+mod grid_edit;
 mod sql_editor;
 mod sql_tabs;
 mod theme;
@@ -17,8 +18,8 @@ use grid::{Grid, GridKey, GridRequest};
 use pgrustadmin_api_client::{
     ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
     ConnectionInput, ConnectionTest, Database, Execution, ExecutionRows, ExecutionStatus, Index,
-    Relation, RelationKind, RelationRef, RelationRowsPage, RelationRowsRequest, Schema, SqlFile,
-    SqlFileContent,
+    Relation, RelationKind, RelationRef, RelationRowsPage, RelationRowsRequest, RowChangeInput,
+    RowSaveOutcome, Schema, SqlFile, SqlFileContent,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -50,6 +51,8 @@ const CONNECTION_FIELDS: [&str; 8] = [
     "Read-only",
 ];
 const TLS_FIELD: usize = 6;
+const UNSAVED_ROWS_MESSAGE: &str =
+    "There are unsaved changes in the data grid: Ctrl+S saves them, X discards them.";
 const READ_ONLY_FIELD: usize = 7;
 
 #[tokio::main]
@@ -96,6 +99,7 @@ enum Operation {
     LoadRelations { connection_id: Uuid, page: u64 },
     LoadRelationDetail { connection_id: Uuid },
     LoadRelationRows { connection_id: Uuid },
+    SaveRelationRows { connection_id: Uuid },
     SaveConnection { id: Option<Uuid> },
     TestConnection { id: Uuid },
     DeleteConnection { id: Uuid },
@@ -115,6 +119,7 @@ enum OperationResult {
     Relations(Result<Vec<Relation>, ApiError>),
     RelationDetail(Result<(Vec<Column>, Vec<Index>), ApiError>),
     RelationRows(Result<RelationRowsPage, ApiError>),
+    RowsSaved(Result<RowSaveOutcome, ApiError>),
     Saved(Result<Connection, ApiError>),
     Tested(Result<ConnectionTest, ApiError>),
     Deleted(Result<(), ApiError>),
@@ -138,6 +143,7 @@ enum UiAction {
     LoadRelations(Uuid, u64),
     LoadRelationDetail(Uuid),
     LoadRelationRows(Uuid),
+    SaveRelationRows(Uuid),
     SaveConnection,
     TestConnection(Uuid),
     DeleteConnection(Uuid),
@@ -550,6 +556,13 @@ impl App {
             && matches!(self.state, ScreenState::Authenticated(_))
         {
             self.view = 1;
+            return UiAction::None;
+        }
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+            && self.view == 5
+            && self.relation_rows.as_ref().is_some_and(Grid::has_pending)
+        {
+            self.message = UNSAVED_ROWS_MESSAGE.to_owned();
             return UiAction::None;
         }
         if key.code == KeyCode::Esc
@@ -1101,7 +1114,11 @@ impl App {
             }
             return match grid.handle_key(key) {
                 GridKey::Ignored => None,
-                GridKey::Handled | GridKey::Reload => Some(UiAction::None),
+                GridKey::Handled | GridKey::Reload | GridKey::Save => Some(UiAction::None),
+                GridKey::Notice(message) => {
+                    self.message = message.to_owned();
+                    Some(UiAction::None)
+                }
             };
         }
         if self.view == 5 && self.relation_grid_focus {
@@ -1117,6 +1134,14 @@ impl App {
                     self.catalog_connection
                         .map_or(UiAction::None, UiAction::LoadRelationRows),
                 ),
+                GridKey::Save => Some(
+                    self.catalog_connection
+                        .map_or(UiAction::None, UiAction::SaveRelationRows),
+                ),
+                GridKey::Notice(message) => {
+                    self.message = message.to_owned();
+                    Some(UiAction::None)
+                }
             };
         }
         None
@@ -1204,6 +1229,13 @@ impl App {
             }
             return;
         }
+        if self.view == 5
+            && self.relation_grid_focus
+            && let Some(grid) = &mut self.relation_rows
+            && grid.paste(text)
+        {
+            return;
+        }
         if self.form.is_some() || matches!(self.state, ScreenState::EditingLogin { .. }) {
             for character in text.chars().filter(|character| !character.is_control()) {
                 self.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
@@ -1253,6 +1285,7 @@ impl App {
             UiAction::LoadSchemas(_) => self.message = "Loading schemas…".to_owned(),
             UiAction::LoadRelations(..) => self.message = "Loading relations…".to_owned(),
             UiAction::LoadRelationRows(_) => {}
+            UiAction::SaveRelationRows(_) => self.message = "Saving changes…".to_owned(),
             UiAction::LoadRelationDetail(_) => {
                 self.message = "Loading columns and indexes…".to_owned();
             }
@@ -1291,6 +1324,7 @@ impl App {
                 | Operation::LoadRelations { .. }
                 | Operation::LoadRelationDetail { .. }
                 | Operation::LoadRelationRows { .. }
+                | Operation::SaveRelationRows { .. }
         )
         .then(|| CatalogPath {
             database: self.catalog_database.clone(),
@@ -1301,6 +1335,10 @@ impl App {
                 .as_ref()
                 .map(Grid::request)
                 .unwrap_or_default(),
+            changes: match (operation, &self.relation_rows) {
+                (Operation::SaveRelationRows { .. }, Some(grid)) => row_changes(grid),
+                _ => Vec::new(),
+            },
         })
         .unwrap_or_default();
         let file_request = self.file_request(operation);
@@ -1418,9 +1456,18 @@ impl App {
             }
             OperationResult::RelationRows(Ok(page)) => {
                 if let Some(grid) = &mut self.relation_rows {
+                    let editing = if page.editable {
+                        Ok(page.primary_key)
+                    } else if page.primary_key.is_empty() {
+                        Err("Only tables with a primary key can be edited.")
+                    } else {
+                        Err("This connection is read-only.")
+                    };
                     grid.set_remote_page(page.columns, page.rows, page.total_rows);
+                    grid.set_editing(editing);
                 }
             }
+            OperationResult::RowsSaved(result) => self.apply_rows_saved(result),
             OperationResult::RelationRows(Err(error)) => {
                 if let Some(grid) = &mut self.relation_rows {
                     let message = match error {
@@ -1591,6 +1638,57 @@ impl App {
                     format!("Close a SQL tab before opening another (limit {MAX_SQL_TABS}).");
             }
         }
+    }
+
+    fn apply_rows_saved(&mut self, result: Result<RowSaveOutcome, ApiError>) {
+        self.message = match result {
+            Ok(RowSaveOutcome::Saved { updated }) => {
+                if let Some(grid) = &mut self.relation_rows {
+                    grid.clear_pending();
+                    grid.mark_loading();
+                }
+                self.relation_rows_stale = true;
+                format!("Saved {updated} row(s).")
+            }
+            Ok(RowSaveOutcome::RowChanged { index }) => {
+                let key = self
+                    .relation_rows
+                    .as_ref()
+                    .and_then(|grid| grid.pending().get(index))
+                    .map(|row| {
+                        row.key
+                            .iter()
+                            .map(|(column, value)| format!("{column}={value}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "Row {key} changed since it was loaded; nothing was saved. \
+                     Discard its changes with x, reload with r and edit again."
+                )
+            }
+            Ok(RowSaveOutcome::Rejected { code, message }) => {
+                let code = code.map(|code| format!(" [{code}]")).unwrap_or_default();
+                format!("PostgreSQL rejected the changes{code}: {message}. Nothing was saved.")
+            }
+            Err(error) => match error {
+                ApiError::Http {
+                    code: Some("connection_read_only"),
+                    ..
+                } => "This connection is read-only; nothing was saved.",
+                ApiError::Http {
+                    code: Some("relation_not_editable"),
+                    ..
+                } => "Only tables with a primary key can be edited; nothing was saved.",
+                ApiError::Http {
+                    code: Some("invalid_request"),
+                    ..
+                } => "The server refused the changes; reload the table and try again.",
+                error => api_error_message(error),
+            }
+            .to_owned(),
+        };
     }
 
     /// Reloads the relation data grid when its Auto page no longer fits.
@@ -1767,6 +1865,7 @@ fn start_action(app: &mut App, action: UiAction) {
             return;
         }
         UiAction::LoadRelationRows(connection_id) => Operation::LoadRelationRows { connection_id },
+        UiAction::SaveRelationRows(connection_id) => Operation::SaveRelationRows { connection_id },
         UiAction::ExecuteSql(tab) => {
             app.start_execution(tab);
             return;
@@ -1937,7 +2036,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "↑/↓: navigate   Enter: details   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
         if app.relation_grid_focus {
-            "↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: columns"
+            "e: edit  Ctrl+S: save  x/X: discard  ↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: columns"
         } else {
             "↑/↓: columns   Tab: data grid   r: reload   Esc: relations   q: quit"
         }
@@ -2464,8 +2563,22 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Length(1),
+            Constraint::Min(3),
+        ])
         .split(area);
+    // Status of the latest action, such as a save of the data grid.
+    let status_style = if app.message.to_lowercase().contains("nothing was saved") {
+        theme.error()
+    } else {
+        theme.muted()
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {}", app.message)).style(status_style),
+        rows[1],
+    );
     let structure = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2507,7 +2620,7 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(grid) = &app.relation_rows {
         grid.render(
             frame,
-            rows[1],
+            rows[2],
             theme,
             &format!(" Data — {}.{} ", app.catalog_schema, app.catalog_relation),
             app.relation_grid_focus,
@@ -2599,6 +2712,27 @@ struct CatalogPath {
     schema: String,
     relation: String,
     rows: GridRequest,
+    /// Pending grid changes, for a save.
+    changes: Vec<RowChangeInput>,
+}
+
+/// Pending changes of the relation grid in the API's shape.
+fn row_changes(grid: &Grid) -> Vec<RowChangeInput> {
+    grid.pending()
+        .iter()
+        .map(|row| RowChangeInput {
+            key: row.key.iter().cloned().collect(),
+            columns: row
+                .cells
+                .iter()
+                .map(|cell| pgrustadmin_api_client::ColumnChangeInput {
+                    column: cell.column.clone(),
+                    value: cell.value.clone(),
+                    original: cell.original.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 async fn run_operation(
@@ -2668,6 +2802,15 @@ async fn run_operation(
                 search: &catalog.rows.search,
             };
             OperationResult::RelationRows(client.list_relation_rows(relation, request).await)
+        }
+        Operation::SaveRelationRows { connection_id } => {
+            let relation = RelationRef {
+                connection_id,
+                database: &catalog.database,
+                schema: &catalog.schema,
+                relation: &catalog.relation,
+            };
+            OperationResult::RowsSaved(client.save_relation_rows(relation, &catalog.changes).await)
         }
         Operation::LoadRelationDetail { connection_id } => {
             let relation = RelationRef {
@@ -2767,9 +2910,10 @@ async fn run_operation(
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pgrustadmin_api_client::{
-        ApiClient, ApiError, AuthSession, Column, Connection, Database, Execution, ExecutionError,
-        ExecutionResult, ExecutionRows, ExecutionStatus, Index, Relation, RelationKind,
-        RelationRowsPage, Schema, SqlFile, SqlFileContent,
+        ApiClient, ApiError, AuthSession, Column, ColumnChangeInput, Connection, Database,
+        Execution, ExecutionError, ExecutionResult, ExecutionRows, ExecutionStatus, Index,
+        Relation, RelationKind, RelationRowsPage, RowChangeInput, RowSaveOutcome, Schema, SqlFile,
+        SqlFileContent,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
@@ -3735,7 +3879,101 @@ mod tests {
             total_rows: 120,
             page: 1,
             per_page: 25,
+            primary_key: vec!["id".to_owned()],
+            editable: true,
         }
+    }
+
+    #[tokio::test]
+    async fn relation_grid_edits_cells_and_saves_them_together() {
+        let mut app = authenticated_app();
+        let connection_id = Uuid::new_v4();
+        app.view = 5;
+        app.catalog_connection = Some(connection_id);
+        app.catalog_relation = "users".to_owned();
+        app.relation_rows = Some(Grid::remote());
+        app.apply_result(OperationResult::RelationRows(Ok(rows_page(5))));
+        press(&mut app, KeyCode::Tab);
+        assert!(app.relation_grid_focus);
+
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.message, "Primary key columns cannot be edited.");
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char('e'));
+        assert!(render_text(&app).contains("Edit email"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        app.handle_paste("new@x.io");
+        press(&mut app, KeyCode::Enter);
+        let rendered = render_text(&app);
+        assert!(rendered.contains("new@x.io"), "pending value is shown");
+        assert!(rendered.contains("1 change(s) pending"));
+        assert!(rendered.contains("Ctrl+S: save"));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, 5, "unsaved changes keep the table open");
+        assert!(app.message.contains("unsaved changes"));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.confirm_quit && !app.should_quit);
+
+        let grid = app.relation_rows.as_ref().expect("grid");
+        assert_eq!(
+            super::row_changes(grid),
+            vec![RowChangeInput {
+                key: [("id".to_owned(), "0".to_owned())].into(),
+                columns: vec![ColumnChangeInput {
+                    column: "email".to_owned(),
+                    value: Some("new@x.io".to_owned()),
+                    original: Some("user0@x.io".to_owned()),
+                }],
+            }]
+        );
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            UiAction::SaveRelationRows(id) if id == connection_id
+        ));
+
+        app.apply_result(OperationResult::RowsSaved(Ok(RowSaveOutcome::Rejected {
+            code: Some("23505".to_owned()),
+            message: "duplicate key value violates unique constraint".to_owned(),
+        })));
+        assert!(
+            app.message
+                .contains("PostgreSQL rejected the changes [23505]")
+        );
+        assert!(
+            render_text(&app).contains("PostgreSQL rejected the changes [23505]"),
+            "save errors are shown on the table screen"
+        );
+        app.apply_result(OperationResult::RowsSaved(Ok(RowSaveOutcome::RowChanged {
+            index: 0,
+        })));
+        assert!(app.message.contains("Row id=0 changed since it was loaded"));
+        assert!(
+            app.relation_rows.as_ref().is_some_and(Grid::has_pending),
+            "failed saves keep the changes"
+        );
+
+        app.apply_result(OperationResult::RowsSaved(Ok(RowSaveOutcome::Saved {
+            updated: 1,
+        })));
+        assert_eq!(app.message, "Saved 1 row(s).");
+        assert!(!app.relation_rows.as_ref().is_some_and(Grid::has_pending));
+        assert!(app.relation_rows_stale, "saved rows are reloaded");
+        app.relation_rows_stale = false;
+
+        let mut read_only = rows_page(5);
+        read_only.editable = false;
+        app.apply_result(OperationResult::RelationRows(Ok(read_only)));
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.message, "This connection is read-only.");
+        let mut keyless = rows_page(5);
+        keyless.editable = false;
+        keyless.primary_key.clear();
+        app.apply_result(OperationResult::RelationRows(Ok(keyless)));
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.message, "Only tables with a primary key can be edited.");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, 4, "nothing pending, Esc leaves");
     }
 
     #[tokio::test]

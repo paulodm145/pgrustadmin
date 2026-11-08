@@ -9,12 +9,13 @@ use axum::{
     routing::get,
 };
 use pgrustadmin_postgres_driver::{
-    Column, ColumnGenerated, ColumnIdentity, ConnectionData, ConnectionSummary, PgPool,
-    PostgresError, RelationKind, RelationRowsError, RelationRowsQuery, SortDirection,
-    StoredConnectionCredentials, create_connection, delete_connection_for_owner,
-    find_connection_credentials_for_owner, find_connection_for_owner, list_columns,
-    list_connections_for_owner, list_databases, list_indexes, list_relation_rows, list_relations,
-    list_schemas, test_database_connection, update_connection_for_owner,
+    Column, ColumnChange, ColumnGenerated, ColumnIdentity, ConnectionData, ConnectionSummary,
+    PgPool, PostgresError, RelationKind, RelationRowsError, RelationRowsQuery, RowChange,
+    RowChangeError, SortDirection, StoredConnectionCredentials, create_connection,
+    delete_connection_for_owner, find_connection_credentials_for_owner, find_connection_for_owner,
+    list_columns, list_connections_for_owner, list_databases, list_indexes, list_relation_rows,
+    list_relations, list_schemas, test_database_connection, update_connection_for_owner,
+    update_relation_rows,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -54,6 +55,10 @@ pub fn router(pool: PgPool) -> Router {
         .route(
             "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/rows",
             get(list_remote_rows),
+        )
+        .route(
+            "/api/v1/connections/{id}/databases/{database}/schemas/{schema}/relations/{relation}/rows/changes",
+            axum::routing::post(save_remote_rows),
         )
         .with_state(pool)
 }
@@ -529,6 +534,9 @@ struct RowsResponse {
     total_rows: i64,
     page: u64,
     per_page: u64,
+    primary_key: Vec<String>,
+    /// A table with a primary key on a connection that is not read-only.
+    editable: bool,
 }
 
 async fn list_remote_rows(
@@ -583,11 +591,13 @@ async fn list_remote_rows(
     .await
     {
         Ok(rows) => Json(RowsResponse {
+            editable: !rows.primary_key.is_empty() && !target.connection.read_only,
             columns: rows.columns,
             rows: rows.rows,
             total_rows: rows.total_rows,
             page,
             per_page,
+            primary_key: rows.primary_key,
         })
         .into_response(),
         Err(RelationRowsError::NotFound) => not_found(),
@@ -600,6 +610,126 @@ async fn list_remote_rows(
         )
             .into_response(),
         Err(RelationRowsError::Database(_)) => catalog_unavailable(),
+    }
+}
+
+/// Row changes sent per save; one transaction applies them all.
+const MAX_ROW_CHANGES: usize = 500;
+
+#[derive(Deserialize)]
+struct RowChangesRequest {
+    changes: Vec<RowChangeRequest>,
+}
+
+#[derive(Deserialize)]
+struct RowChangeRequest {
+    key: std::collections::BTreeMap<String, String>,
+    columns: Vec<ColumnChangeRequest>,
+}
+
+#[derive(Deserialize)]
+struct ColumnChangeRequest {
+    column: String,
+    value: Option<String>,
+    original: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RowChangesResponse {
+    updated: u64,
+}
+
+#[derive(Serialize)]
+struct RowConflictResponse {
+    error: &'static str,
+    index: usize,
+}
+
+#[derive(Serialize)]
+struct ChangeRejectedResponse {
+    error: &'static str,
+    code: Option<String>,
+    message: String,
+}
+
+async fn save_remote_rows(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    path: Result<RelationDetailPath, PathRejection>,
+    request: Result<Json<RowChangesRequest>, JsonRejection>,
+) -> Response {
+    let target = match relation_detail_target(&pool, &headers, path).await {
+        Ok(target) => target,
+        Err(error) => return error.into_response(),
+    };
+    let Ok(Json(RowChangesRequest { changes })) = request else {
+        return bad_request();
+    };
+    if changes.is_empty() || changes.len() > MAX_ROW_CHANGES {
+        return bad_request();
+    }
+    if target.connection.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "connection_read_only",
+            }),
+        )
+            .into_response();
+    }
+    let changes: Vec<RowChange> = changes
+        .into_iter()
+        .map(|change| RowChange {
+            key: change.key.into_iter().collect(),
+            columns: change
+                .columns
+                .into_iter()
+                .map(|column| ColumnChange {
+                    column: column.column,
+                    value: column.value,
+                    original: column.original,
+                })
+                .collect(),
+        })
+        .collect();
+    match update_relation_rows(
+        &target.connection,
+        &target.database,
+        &target.schema,
+        &target.relation,
+        &target.password,
+        &changes,
+    )
+    .await
+    {
+        Ok(updated) => Json(RowChangesResponse { updated }).into_response(),
+        Err(RowChangeError::NotFound) => not_found(),
+        Err(RowChangeError::NotEditable) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "relation_not_editable",
+            }),
+        )
+            .into_response(),
+        Err(RowChangeError::InvalidChange) => bad_request(),
+        Err(RowChangeError::Conflict { index }) => (
+            StatusCode::CONFLICT,
+            Json(RowConflictResponse {
+                error: "row_changed",
+                index,
+            }),
+        )
+            .into_response(),
+        Err(RowChangeError::Rejected { code, message }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ChangeRejectedResponse {
+                error: "change_rejected",
+                code,
+                message,
+            }),
+        )
+            .into_response(),
+        Err(RowChangeError::Database(_)) => catalog_unavailable(),
     }
 }
 
@@ -1594,6 +1724,184 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "quoted identifiers");
         assert_eq!(weird["columns"], serde_json::json!(["Mixed Col"]));
         assert_eq!(weird["rows"], serde_json::json!([["x"], [null]]));
+        assert_eq!(weird["primary_key"], serde_json::json!([]));
+        assert_eq!(weird["editable"], false, "keyless tables are read-only");
+
+        for extra in 4..=10 {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {catalog_schema}.a_table (email) VALUES ('z{extra}@x.io')"
+            )))
+            .execute(&pool)
+            .await
+            .expect("insert more rows");
+        }
+        let ids = |json: &serde_json::Value| {
+            json["rows"]
+                .as_array()
+                .expect("rows array")
+                .iter()
+                .map(|row| row[0].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let (_, page) = read_json(rows_request("per_page=3&page=4").await).await;
+        assert_eq!(ids(&page), ["10"], "the key orders numbers as numbers");
+        let (_, page) = read_json(rows_request("sort=id&direction=desc&per_page=2").await).await;
+        assert_eq!(ids(&page), ["10", "9"], "typed sort on a column");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {catalog_schema}.a_table WHERE id > 3"
+        )))
+        .execute(&pool)
+        .await
+        .expect("remove extra rows");
+
+        let (_, page) = read_json(rows_request("").await).await;
+        assert_eq!(page["primary_key"], serde_json::json!(["id"]));
+        assert_eq!(page["editable"], true);
+        assert_eq!(
+            emails(&page),
+            ["b@x.io", "a@x.io", "c%_@x.io"],
+            "unsorted pages follow the primary key"
+        );
+
+        let changes_path = format!("{rows_path}/changes");
+        let save = |changes: serde_json::Value| {
+            let app = app.clone();
+            let uri = changes_path.clone();
+            let token = owner_token.as_str().to_owned();
+            async move {
+                send_request(
+                    app,
+                    Method::POST,
+                    &uri,
+                    Some(&token),
+                    Some(serde_json::json!({ "changes": changes })),
+                )
+                .await
+            }
+        };
+        let email_change = |id: &str, value: &str, original: &str| {
+            serde_json::json!({
+                "key": {"id": id},
+                "columns": [{"column": "email", "value": value, "original": original}]
+            })
+        };
+        let injected = "x'); DROP TABLE users; --";
+        let (status, saved) = read_json(
+            save(serde_json::json!([
+                email_change("1", "b2@x.io", "b@x.io"),
+                email_change("3", injected, "c%_@x.io"),
+                {"key": {"id": "2"}, "columns": [
+                    {"column": "created_at", "value": "2026-03-04 05:06:07+00", "original": null}
+                ]}
+            ]))
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved, serde_json::json!({"updated": 3}));
+        let (_, page) = read_json(rows_request("").await).await;
+        assert_eq!(emails(&page), ["b2@x.io", "a@x.io", injected]);
+        assert_eq!(page["rows"][1][2], "2026-03-04 05:06:07+00");
+
+        let (status, stale) = read_json(
+            save(serde_json::json!([
+                email_change("2", "a2@x.io", "a@x.io"),
+                email_change("1", "b3@x.io", "b@x.io")
+            ]))
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            stale,
+            serde_json::json!({"error": "row_changed", "index": 1})
+        );
+        let (_, page) = read_json(rows_request("").await).await;
+        assert_eq!(
+            emails(&page),
+            ["b2@x.io", "a@x.io", injected],
+            "a failed save changes nothing"
+        );
+
+        for (column, value, original, sqlstate) in [
+            (
+                "created_at",
+                serde_json::json!("not a date"),
+                "2026-01-02 00:00:00+00",
+                "22007",
+            ),
+            ("email_lower", serde_json::json!("x"), "b@x.io", "428C9"),
+            ("email", serde_json::Value::Null, "b2@x.io", "23502"),
+        ] {
+            let (status, rejected) = read_json(
+                save(serde_json::json!([{"key": {"id": "1"}, "columns": [
+                    {"column": column, "value": value, "original": original}
+                ]}]))
+                .await,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{column}: {rejected}"
+            );
+            assert_eq!(rejected["error"], "change_rejected");
+            assert_eq!(rejected["code"], sqlstate, "{rejected}");
+            assert!(
+                rejected["message"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            );
+        }
+
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([{"key": {}, "columns": [
+                {"column": "email", "value": "x", "original": null}]}]),
+            serde_json::json!([{"key": {"id": "1"}, "columns": [
+                {"column": "id", "value": "9", "original": "1"}]}]),
+            serde_json::json!([{"key": {"id": "1"}, "columns": [
+                {"column": "missing", "value": "x", "original": null}]}]),
+            serde_json::json!([{"key": {"id": "1"}, "columns": []}]),
+        ] {
+            let (status, _) = read_json(save(invalid.clone()).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+        }
+
+        let (status, keyless) = read_json(
+            send_request(
+                app.clone(),
+                Method::POST,
+                &format!(
+                    "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations/we%22ird%20table/rows/changes"
+                ),
+                Some(owner_token.as_str()),
+                Some(serde_json::json!({"changes": [{"key": {"Mixed Col": "x"}, "columns": [
+                    {"column": "Mixed Col", "value": "y", "original": "x"}]}]})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(keyless["error"], "relation_not_editable");
+
+        sqlx::query("UPDATE connections SET read_only = TRUE WHERE id = $1::uuid")
+            .bind(connection_id)
+            .execute(&pool)
+            .await
+            .expect("mark connection read-only");
+        let (_, page) = read_json(rows_request("").await).await;
+        assert_eq!(page["editable"], false, "read-only connections");
+        let (status, blocked) =
+            read_json(save(serde_json::json!([email_change("2", "a2@x.io", "a@x.io")])).await)
+                .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(blocked["error"], "connection_read_only");
+        sqlx::query("UPDATE connections SET read_only = FALSE WHERE id = $1::uuid")
+            .bind(connection_id)
+            .execute(&pool)
+            .await
+            .expect("restore editable connection");
 
         for detail in ["columns", "indexes"] {
             let missing_relation = send_request(
