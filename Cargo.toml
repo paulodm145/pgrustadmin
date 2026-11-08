@@ -34,5 +34,8 @@ zeroize = "1"
 tower = { version = "0.5.2", default-features = false, features = ["util"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+# Colored underlines for the data grid lines; enabling it through `ratatui`
+# would also lock its termina and termwiz backends.
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["underline-color"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures-util = "0.3"
