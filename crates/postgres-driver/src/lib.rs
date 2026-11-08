@@ -23,6 +23,7 @@ pub struct ConnectionSummary {
     pub database_name: String,
     pub username: String,
     pub tls_enabled: bool,
+    pub read_only: bool,
 }
 
 pub struct ConnectionData<'a> {
@@ -32,6 +33,8 @@ pub struct ConnectionData<'a> {
     pub database_name: &'a str,
     pub username: &'a str,
     pub tls_enabled: bool,
+    /// `None` keeps the stored value on update and means `false` on create.
+    pub read_only: Option<bool>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -800,7 +803,7 @@ pub async fn list_connections_for_owner(
     offset: i64,
 ) -> Result<Vec<ConnectionSummary>, PostgresError> {
     sqlx::query_as(
-        "SELECT id, name, host, port, database_name, username, tls_enabled \
+        "SELECT id, name, host, port, database_name, username, tls_enabled, read_only \
          FROM connections WHERE owner_id = $1 \
          ORDER BY name, id LIMIT $2 OFFSET $3",
     )
@@ -817,7 +820,7 @@ pub async fn find_connection_for_owner(
     connection_id: Uuid,
 ) -> Result<Option<ConnectionSummary>, PostgresError> {
     sqlx::query_as(
-        "SELECT id, name, host, port, database_name, username, tls_enabled \
+        "SELECT id, name, host, port, database_name, username, tls_enabled, read_only \
          FROM connections WHERE owner_id = $1 AND id = $2",
     )
     .bind(owner_id)
@@ -835,9 +838,10 @@ pub async fn create_connection(
 ) -> Result<ConnectionSummary, PostgresError> {
     sqlx::query_as(
         "INSERT INTO connections \
-         (id, owner_id, name, host, port, database_name, username, tls_enabled, credential_envelope) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-         RETURNING id, name, host, port, database_name, username, tls_enabled",
+         (id, owner_id, name, host, port, database_name, username, tls_enabled, \
+          credential_envelope, read_only) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, FALSE)) \
+         RETURNING id, name, host, port, database_name, username, tls_enabled, read_only",
     )
     .bind(connection_id)
     .bind(owner_id)
@@ -848,6 +852,7 @@ pub async fn create_connection(
     .bind(connection.username)
     .bind(connection.tls_enabled)
     .bind(credential_envelope)
+    .bind(connection.read_only)
     .fetch_one(pool)
     .await
 }
@@ -862,9 +867,10 @@ pub async fn update_connection_for_owner(
     sqlx::query_as(
         "UPDATE connections SET name = $3, host = $4, port = $5, \
          database_name = $6, username = $7, tls_enabled = $8, \
-         credential_envelope = COALESCE($9, credential_envelope), updated_at = now() \
+         credential_envelope = COALESCE($9, credential_envelope), \
+         read_only = COALESCE($10, read_only), updated_at = now() \
          WHERE owner_id = $1 AND id = $2 \
-         RETURNING id, name, host, port, database_name, username, tls_enabled",
+         RETURNING id, name, host, port, database_name, username, tls_enabled, read_only",
     )
     .bind(owner_id)
     .bind(connection_id)
@@ -875,6 +881,7 @@ pub async fn update_connection_for_owner(
     .bind(connection.username)
     .bind(connection.tls_enabled)
     .bind(credential_envelope)
+    .bind(connection.read_only)
     .fetch_optional(pool)
     .await
 }

@@ -69,6 +69,8 @@ struct ConnectionRequest {
     tls_enabled: bool,
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    read_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +111,7 @@ struct ValidatedConnection {
     database_name: String,
     username: String,
     tls_enabled: bool,
+    read_only: Option<bool>,
     password: Option<Zeroizing<String>>,
 }
 
@@ -127,6 +130,7 @@ struct ConnectionResponse {
     database: String,
     username: String,
     tls_enabled: bool,
+    read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -878,6 +882,7 @@ fn validate_request(
         database_name,
         username,
         tls_enabled: request.tls_enabled,
+        read_only: request.read_only,
         password,
     })
 }
@@ -890,6 +895,7 @@ fn connection_data(connection: &ValidatedConnection) -> ConnectionData<'_> {
         database_name: &connection.database_name,
         username: &connection.username,
         tls_enabled: connection.tls_enabled,
+        read_only: connection.read_only,
     }
 }
 
@@ -917,6 +923,7 @@ impl TryFrom<ConnectionSummary> for ConnectionResponse {
             database: connection.database_name,
             username: connection.username,
             tls_enabled: connection.tls_enabled,
+            read_only: connection.read_only,
         })
     }
 }
@@ -1015,6 +1022,7 @@ mod tests {
             username: " app ".to_owned(),
             tls_enabled: true,
             password: Some("secret".to_owned()),
+            read_only: None,
         }
     }
 
@@ -1138,6 +1146,7 @@ mod tests {
             .as_str()
             .expect("response has connection ID");
         assert_eq!(created_json["tls_enabled"], false);
+        assert_eq!(created_json["read_only"], false, "editable by default");
         assert!(created_json.get("password").is_none());
         assert!(created_json.get("credential_envelope").is_none());
         let stored_envelope: Vec<u8> =
@@ -1656,6 +1665,17 @@ mod tests {
         .await
         .expect("drop catalog fixture");
 
+        let mut read_only = payload.clone();
+        read_only["read_only"] = serde_json::json!(true);
+        let marked = send_request(
+            app.clone(),
+            Method::PUT,
+            &format!("/api/v1/connections/{connection_id}"),
+            Some(owner_token.as_str()),
+            Some(read_only),
+        )
+        .await;
+        assert_eq!(marked.status(), StatusCode::OK);
         let mut invalid_credentials = payload.clone();
         invalid_credentials["password"] = serde_json::json!("incorrect-test-password");
         let updated = send_request(
@@ -1667,6 +1687,16 @@ mod tests {
         )
         .await;
         assert_eq!(updated.status(), StatusCode::OK);
+        let updated: serde_json::Value = serde_json::from_slice(
+            &to_bytes(updated.into_body(), 4096)
+                .await
+                .expect("read update response"),
+        )
+        .expect("decode update response");
+        assert_eq!(
+            updated["read_only"], true,
+            "omitting read_only keeps the stored value"
+        );
         let failed_test = send_request(
             app.clone(),
             Method::POST,

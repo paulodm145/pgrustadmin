@@ -39,9 +39,18 @@ const EXECUTION_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// View index of the SQL tabs section; catalog views use 2..=5.
 const SQL_VIEW: usize = 6;
 const MENU_ITEMS: [&str; 2] = ["Overview", "Connections"];
-const CONNECTION_FIELDS: [&str; 7] = [
-    "Name", "Host", "Port", "Database", "Username", "Password", "TLS",
+const CONNECTION_FIELDS: [&str; 8] = [
+    "Name",
+    "Host",
+    "Port",
+    "Database",
+    "Username",
+    "Password",
+    "TLS",
+    "Read-only",
 ];
+const TLS_FIELD: usize = 6;
+const READ_ONLY_FIELD: usize = 7;
 
 #[tokio::main]
 async fn main() {
@@ -194,6 +203,7 @@ struct ConnectionForm {
     username: String,
     password: Zeroizing<String>,
     tls_enabled: bool,
+    read_only: bool,
     focus: usize,
 }
 
@@ -208,6 +218,7 @@ impl ConnectionForm {
             username: String::new(),
             password: Zeroizing::new(String::new()),
             tls_enabled: true,
+            read_only: false,
             focus: 0,
         }
     }
@@ -222,6 +233,7 @@ impl ConnectionForm {
             username: connection.username.clone(),
             password: Zeroizing::new(String::new()),
             tls_enabled: connection.tls_enabled,
+            read_only: connection.read_only,
             focus: 0,
         }
     }
@@ -249,6 +261,7 @@ impl ConnectionForm {
             database: self.database.clone(),
             username: self.username.clone(),
             tls_enabled: self.tls_enabled,
+            read_only: self.read_only,
             password: (!self.password.is_empty()).then(|| self.password.to_string()),
         })
     }
@@ -263,11 +276,15 @@ impl ConnectionForm {
             KeyCode::BackTab | KeyCode::Up => {
                 self.focus = (self.focus + CONNECTION_FIELDS.len() - 1) % CONNECTION_FIELDS.len();
             }
-            KeyCode::Left | KeyCode::Right if self.focus == 6 => {
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.focus == TLS_FIELD => {
                 self.tls_enabled = !self.tls_enabled;
             }
-            KeyCode::Char(' ') if self.focus == 6 => self.tls_enabled = !self.tls_enabled,
-            KeyCode::Enter if self.focus == 6 => return true,
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self.focus == READ_ONLY_FIELD =>
+            {
+                self.read_only = !self.read_only;
+            }
+            KeyCode::Enter if self.focus == READ_ONLY_FIELD => return true,
             KeyCode::Enter => self.focus = (self.focus + 1) % CONNECTION_FIELDS.len(),
             KeyCode::Backspace => match self.focus {
                 0 => {
@@ -2044,7 +2061,11 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let layout = responsive_layout(area);
     let items = app.connections.iter().map(|connection| {
         ListItem::new(vec![
-            Line::from(connection.name.as_str()),
+            Line::from(if connection.read_only {
+                format!("{} [read-only]", connection.name)
+            } else {
+                connection.name.clone()
+            }),
             Line::from(format!("  {}:{}", connection.host, connection.port)),
         ])
     });
@@ -2073,6 +2094,10 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     "disabled"
                 }
+            )),
+            Line::from(format!(
+                "Read-only: {}",
+                if connection.read_only { "yes" } else { "no" }
             )),
             Line::from("Password: stored securely"),
         ])
@@ -2530,6 +2555,11 @@ fn render_connection_form(
         } else {
             "Disabled".to_owned()
         },
+        if form.read_only {
+            "Yes (data editing blocked)".to_owned()
+        } else {
+            "No".to_owned()
+        },
     ];
     let lines = CONNECTION_FIELDS
         .iter()
@@ -2748,8 +2778,8 @@ mod tests {
 
     use super::{
         App, ConnectionForm, FinishedExecution, LoginField, MAX_SQL_TABS, OperationResult,
-        SQL_VIEW, ScreenState, TabExecution, TabId, TrackedExecution, UiAction,
-        mentions_explain_analyze, render,
+        READ_ONLY_FIELD, SQL_VIEW, ScreenState, TLS_FIELD, TabExecution, TabId, TrackedExecution,
+        UiAction, mentions_explain_analyze, render,
     };
 
     fn client() -> ApiClient {
@@ -2840,10 +2870,27 @@ mod tests {
             database: "app".to_owned(),
             username: "app".to_owned(),
             tls_enabled: true,
+            read_only: false,
         };
-        let form = ConnectionForm::edit(&connection);
+        let mut form = ConnectionForm::edit(&connection);
         let input = form.input().expect("editing without password is valid");
         assert!(input.password.is_none());
+        assert!(!input.read_only);
+
+        form.focus = READ_ONLY_FIELD;
+        assert!(!form.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
+        assert!(form.read_only, "space toggles read-only");
+        assert!(form.input().expect("valid").read_only);
+        form.focus = TLS_FIELD;
+        assert!(
+            !form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "Enter on TLS moves on"
+        );
+        assert_eq!(form.focus, READ_ONLY_FIELD);
+        assert!(
+            form.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            "Enter on the last field submits"
+        );
     }
 
     #[test]
@@ -2858,6 +2905,7 @@ mod tests {
             database: "app".to_owned(),
             username: "app".to_owned(),
             tls_enabled: true,
+            read_only: false,
         });
         let id = app.connections[0].id;
         assert!(
@@ -2885,6 +2933,7 @@ mod tests {
             database: "app".to_owned(),
             username: "app".to_owned(),
             tls_enabled: true,
+            read_only: false,
         };
         app.connections.push(connection.clone());
         assert!(matches!(
@@ -3994,6 +4043,7 @@ mod tests {
                 database: "app".to_owned(),
                 username: "app".to_owned(),
                 tls_enabled: true,
+                read_only: false,
             })
             .collect();
         assert!(matches!(
