@@ -713,6 +713,7 @@ async fn http_error(response: reqwest::Response) -> ApiError {
             "file_too_large" => Some("file_too_large"),
             "file_storage_unavailable" => Some("file_storage_unavailable"),
             "execution_limit_reached" => Some("execution_limit_reached"),
+            "server_execution_limit_reached" => Some("server_execution_limit_reached"),
             "result_unavailable" => Some("result_unavailable"),
             "result_expired" => Some("result_expired"),
             "execution_not_running" => Some("execution_not_running"),
@@ -906,10 +907,15 @@ mod tests {
             .route(
                 "/api/v1/connections/{id}/databases/{database}/executions",
                 post(|Path((_, database)): Path<(Uuid, String)>| async move {
-                    if database == "busy db" {
+                    let limit = match database.as_str() {
+                        "busy db" => Some("execution_limit_reached"),
+                        "full server" => Some("server_execution_limit_reached"),
+                        _ => None,
+                    };
+                    if let Some(limit) = limit {
                         return (
                             axum::http::StatusCode::TOO_MANY_REQUESTS,
-                            Json(serde_json::json!({"error": "execution_limit_reached"})),
+                            Json(serde_json::json!({"error": limit})),
                         );
                     }
                     (
@@ -1149,6 +1155,15 @@ mod tests {
             Err(ApiError::Http {
                 status: 429,
                 code: Some("execution_limit_reached"),
+            })
+        );
+        assert_eq!(
+            client
+                .start_execution(file_id, "full server", "SELECT 1")
+                .await,
+            Err(ApiError::Http {
+                status: 429,
+                code: Some("server_execution_limit_reached"),
             })
         );
         client

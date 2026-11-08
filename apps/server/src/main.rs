@@ -12,7 +12,10 @@ pub mod users_cli;
 use api::router as api_router;
 use auth::handlers::router as auth_router;
 use connections::router as connections_router;
-use executions::{EXECUTION_TIMEOUT_ENV, execution_timeout, router as executions_router};
+use executions::{
+    EXECUTION_TIMEOUT_ENV, MAX_CONCURRENT_EXECUTIONS_ENV, execution_timeout,
+    max_concurrent_executions, router as executions_router,
+};
 use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
 use sql_files::{SQL_FILES_DIR_ENV, router as sql_files_router};
 use tokio::net::TcpListener;
@@ -47,6 +50,8 @@ async fn run() -> io::Result<()> {
 async fn run_server() -> io::Result<()> {
     let bind_addr = configured_bind_addr()?;
     let execution_timeout = execution_timeout(std::env::var_os(EXECUTION_TIMEOUT_ENV))?;
+    let max_executions =
+        max_concurrent_executions(std::env::var_os(MAX_CONCURRENT_EXECUTIONS_ENV))?;
     let database_url = std::env::var("PGRUSTADMIN_METADATA_DATABASE_URL").map_err(|_| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -69,7 +74,11 @@ async fn run_server() -> io::Result<()> {
         .merge(api_router())
         .merge(auth_router(metadata_pool.clone()))
         .merge(connections_router(metadata_pool.clone()))
-        .merge(executions_router(metadata_pool.clone(), execution_timeout))
+        .merge(executions_router(
+            metadata_pool.clone(),
+            execution_timeout,
+            max_executions,
+        ))
         .merge(sql_files_router(metadata_pool, sql_files_dir));
     axum::serve(listener, app).await
 }
