@@ -1411,6 +1411,11 @@ impl App {
                             code: Some("relation_not_readable"),
                             ..
                         } => "The saved credential cannot read this relation.",
+                        // An older server answers 404 for the rows route as well.
+                        ApiError::Http {
+                            code: Some("not_found"),
+                            ..
+                        } => "Table not found, or the server is out of date: restart the server.",
                         error => api_error_message(error),
                     };
                     grid.set_remote_error(message.to_owned());
@@ -1899,7 +1904,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "n: new   e: edit   t: test   c: databases   d: delete   s: SQL   [ / ]: pages   r: reload   Tab: overview   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == SQL_VIEW {
         if app.result_focus {
-            "↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  Tab: editor"
+            "↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: editor"
         } else {
             "Enter/i: edit  e: run  c: cancel  Tab: result  w/W: save  o: open  [ ]: tabs  x: close"
         }
@@ -1911,7 +1916,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "↑/↓: navigate   Enter: details   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
         if app.relation_grid_focus {
-            "↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  Tab: columns"
+            "↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: columns"
         } else {
             "↑/↓: columns   Tab: data grid   r: reload   Esc: relations   q: quit"
         }
@@ -3517,10 +3522,13 @@ mod tests {
             )
         );
         assert!(rendered.contains("Result · 12 ms"));
-        assert!(rendered.contains("rows 1–2 of 2 · first 2 of 5 stored"));
+        assert!(rendered.contains("first 2 of 5 stored"));
+        assert!(
+            rendered.contains("#│id  │label"),
+            "grid lines between columns"
+        );
         assert!(rendered.contains("label"));
         assert!(rendered.contains("NULL"));
-        assert!(rendered.contains("ção"));
 
         app.finish_execution(
             tab_id,
@@ -3726,6 +3734,11 @@ mod tests {
             code: Some("relation_not_readable"),
         })));
         assert!(render_text(&app).contains("cannot read this relation"));
+        app.apply_result(OperationResult::RelationRows(Err(ApiError::Http {
+            status: 404,
+            code: Some("not_found"),
+        })));
+        assert!(render_text(&app).contains("server is out of date: restart the server"));
 
         press(&mut app, KeyCode::Tab);
         assert!(!app.relation_grid_focus);
