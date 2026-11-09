@@ -240,6 +240,29 @@ impl Theme {
         self.foreground(self.palette().success)
     }
 
+    /// Highlighted success notice: background-colored text on the success
+    /// color; their contrast is checked with the text roles below.
+    pub fn success_banner(self) -> Style {
+        self.banner(self.palette().success)
+    }
+
+    /// Highlighted error notice, like [`Theme::success_banner`].
+    pub fn error_banner(self) -> Style {
+        self.banner(self.palette().error)
+    }
+
+    fn banner(self, color: Rgb) -> Style {
+        match self.mode {
+            ColorMode::Monochrome => {
+                Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            }
+            _ => Style::default()
+                .fg(self.color(self.palette().background))
+                .bg(self.color(color))
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
     pub fn warning(self) -> Style {
         self.foreground(self.palette().warning)
     }

@@ -1,3 +1,4 @@
+mod dialog;
 mod grid;
 mod grid_edit;
 mod sql_editor;
@@ -13,6 +14,7 @@ use crossterm::{
     },
     execute,
 };
+use dialog::{Notice, NoticeKind, render_dialog};
 use futures_util::StreamExt;
 use grid::{Grid, GridKey, GridRequest};
 use pgrustadmin_api_client::{
@@ -51,8 +53,14 @@ const CONNECTION_FIELDS: [&str; 8] = [
     "Read-only",
 ];
 const TLS_FIELD: usize = 6;
-const UNSAVED_ROWS_MESSAGE: &str =
-    "There are unsaved changes in the data grid: Ctrl+S saves them, X discards them.";
+
+/// Confirmation asked before acting on pending data grid changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowsConfirm {
+    Save,
+    /// Leaving the table with pending changes.
+    Leave,
+}
 const READ_ONLY_FIELD: usize = 7;
 
 #[tokio::main]
@@ -357,6 +365,11 @@ struct App {
     sql_editing: bool,
     confirm_close_tab: bool,
     confirm_quit: bool,
+    confirm_rows: Option<RowsConfirm>,
+    /// Return to the relation list once the running save succeeds.
+    leave_after_save: bool,
+    /// Highlighted outcome shown above the data grid.
+    notice: Option<Notice>,
     file_prompt: Option<FilePrompt>,
     /// Name submitted from the prompt for the pending create operation.
     file_name: String,
@@ -426,6 +439,9 @@ impl App {
             sql_editing: false,
             confirm_close_tab: false,
             confirm_quit: false,
+            confirm_rows: None,
+            leave_after_save: false,
+            notice: None,
             file_prompt: None,
             file_name: String::new(),
             save_conflict: None,
@@ -471,6 +487,9 @@ impl App {
         if ctrl_c {
             self.request_quit();
             return UiAction::None;
+        }
+        if let Some(confirm) = self.confirm_rows {
+            return self.handle_rows_confirm(confirm, key);
         }
         if let Some(tab) = self.confirm_explain {
             match key.code {
@@ -547,6 +566,15 @@ impl App {
             self.handle_editor_key(key);
             return UiAction::None;
         }
+        if self.view == 5
+            && key.code == KeyCode::Char('s')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(self.state, ScreenState::Authenticated(_))
+            && self.relation_rows.is_some()
+        {
+            self.request_rows_save();
+            return UiAction::None;
+        }
         if let Some(action) = self.route_grid_key(key) {
             return action;
         }
@@ -558,11 +586,8 @@ impl App {
             self.view = 1;
             return UiAction::None;
         }
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-            && self.view == 5
-            && self.relation_rows.as_ref().is_some_and(Grid::has_pending)
-        {
-            self.message = UNSAVED_ROWS_MESSAGE.to_owned();
+        if key.code == KeyCode::Esc && self.view == 5 && self.pending_row_changes() > 0 {
+            self.confirm_rows = Some(RowsConfirm::Leave);
             return UiAction::None;
         }
         if key.code == KeyCode::Esc
@@ -1134,12 +1159,13 @@ impl App {
                     self.catalog_connection
                         .map_or(UiAction::None, UiAction::LoadRelationRows),
                 ),
-                GridKey::Save => Some(
-                    self.catalog_connection
-                        .map_or(UiAction::None, UiAction::SaveRelationRows),
-                ),
+                GridKey::Save => {
+                    self.request_rows_save();
+                    Some(UiAction::None)
+                }
                 GridKey::Notice(message) => {
                     self.message = message.to_owned();
+                    self.notice = Some(Notice::new(NoticeKind::Info, message));
                     Some(UiAction::None)
                 }
             };
@@ -1161,13 +1187,71 @@ impl App {
         }
     }
 
+    /// Asks before quitting, listing work that would be lost.
     fn request_quit(&mut self) {
+        self.confirm_quit = true;
         let dirty = self.sql_tabs.dirty_count();
-        if dirty == 0 {
-            self.should_quit = true;
-        } else {
-            self.confirm_quit = true;
+        if dirty > 0 {
             self.message = format!("{dirty} SQL tab(s) have unsaved changes.");
+        }
+    }
+
+    /// Changed cells waiting to be saved in the relation data grid.
+    fn pending_row_changes(&self) -> usize {
+        self.relation_rows.as_ref().map_or(0, |grid| {
+            grid.pending().iter().map(|row| row.cells.len()).sum()
+        })
+    }
+
+    fn request_rows_save(&mut self) {
+        if self.pending_row_changes() == 0 {
+            self.notice = Some(Notice::new(
+                NoticeKind::Info,
+                "There are no pending changes to save.",
+            ));
+        } else {
+            self.confirm_rows = Some(RowsConfirm::Save);
+        }
+    }
+
+    fn save_rows_action(&mut self) -> UiAction {
+        if self.pending.is_some() {
+            self.leave_after_save = false;
+            self.notice = Some(Notice::new(
+                NoticeKind::Info,
+                "Another request is running; save again in a moment.",
+            ));
+            return UiAction::None;
+        }
+        self.catalog_connection
+            .map_or(UiAction::None, UiAction::SaveRelationRows)
+    }
+
+    fn handle_rows_confirm(&mut self, confirm: RowsConfirm, key: KeyEvent) -> UiAction {
+        match (confirm, key.code) {
+            (RowsConfirm::Save, KeyCode::Char('y' | 'Y') | KeyCode::Enter) => {
+                self.confirm_rows = None;
+                self.save_rows_action()
+            }
+            (RowsConfirm::Leave, KeyCode::Char('s' | 'S')) => {
+                self.confirm_rows = None;
+                self.leave_after_save = true;
+                self.save_rows_action()
+            }
+            (RowsConfirm::Leave, KeyCode::Char('d' | 'D')) => {
+                self.confirm_rows = None;
+                if let Some(grid) = &mut self.relation_rows {
+                    grid.clear_pending();
+                }
+                self.view = 4;
+                self.message = "Pending changes discarded.".to_owned();
+                UiAction::None
+            }
+            (_, KeyCode::Char('n' | 'N') | KeyCode::Esc) => {
+                self.confirm_rows = None;
+                UiAction::None
+            }
+            _ => UiAction::None,
         }
     }
 
@@ -1641,13 +1725,19 @@ impl App {
     }
 
     fn apply_rows_saved(&mut self, result: Result<RowSaveOutcome, ApiError>) {
+        let leave = std::mem::take(&mut self.leave_after_save);
+        let saved = matches!(result, Ok(RowSaveOutcome::Saved { .. }));
         self.message = match result {
             Ok(RowSaveOutcome::Saved { updated }) => {
                 if let Some(grid) = &mut self.relation_rows {
                     grid.clear_pending();
                     grid.mark_loading();
                 }
-                self.relation_rows_stale = true;
+                if leave && self.view == 5 {
+                    self.view = 4;
+                } else {
+                    self.relation_rows_stale = true;
+                }
                 format!("Saved {updated} row(s).")
             }
             Ok(RowSaveOutcome::RowChanged { index }) => {
@@ -1689,6 +1779,12 @@ impl App {
             }
             .to_owned(),
         };
+        let kind = if saved {
+            NoticeKind::Success
+        } else {
+            NoticeKind::Error
+        };
+        self.notice = Some(Notice::new(kind, self.message.clone()));
     }
 
     /// Reloads the relation data grid when its Auto page no longer fits.
@@ -2001,7 +2097,11 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     }
 
     let footer_text = if app.confirm_quit {
-        "Unsaved SQL changes will be lost. Quit anyway? y: quit   n/Esc: cancel"
+        "Quit PGRustAdmin? y: quit   n/Esc: stay"
+    } else if app.confirm_rows == Some(RowsConfirm::Save) {
+        "Save the pending changes? Enter/y: save   n/Esc: back"
+    } else if app.confirm_rows == Some(RowsConfirm::Leave) {
+        "Unsaved changes: s: save   d: discard and leave   Esc: stay"
     } else if app.confirm_explain.is_some() {
         "EXPLAIN ANALYZE runs the analyzed statement. Execute anyway? y: run   n/Esc: cancel"
     } else if app.confirm_close_tab {
@@ -2036,9 +2136,9 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "↑/↓: navigate   Enter: details   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
         if app.relation_grid_focus {
-            "e: edit  Ctrl+S: save  x/X: discard  ↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: columns"
+            "e: edit  Ctrl+S: save  x/X: discard  Esc: back  ↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: columns"
         } else {
-            "↑/↓: columns   Tab: data grid   r: reload   Esc: relations   q: quit"
+            "↑/↓: columns   Tab: data grid   Ctrl+S: save changes   r: reload   Esc: relations   q: quit"
         }
     } else if matches!(app.state, ScreenState::Authenticated(_)) {
         "Tab/Enter: open Connections   s: SQL tabs   F2: theme   q/Esc: quit"
@@ -2049,6 +2149,68 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL)),
         sections[2],
     );
+    render_confirmations(frame, app);
+}
+
+/// Centered dialogs for confirmations that guard against losing work.
+fn render_confirmations(frame: &mut Frame<'_>, app: &App) {
+    let theme = &app.theme;
+    let pending = app.pending_row_changes();
+    let table = format!("{}.{}", app.catalog_schema, app.catalog_relation);
+    let action = |text: &'static str| Line::styled(text, theme.focus());
+    if app.confirm_quit {
+        let mut lines = vec![Line::from("Quit PGRustAdmin?")];
+        let dirty = app.sql_tabs.dirty_count();
+        if dirty > 0 {
+            lines.push(Line::styled(
+                format!("{dirty} SQL tab(s) have unsaved changes."),
+                theme.warning(),
+            ));
+        }
+        if pending > 0 {
+            lines.push(Line::styled(
+                format!("{pending} unsaved change(s) in {table} will be lost."),
+                theme.warning(),
+            ));
+        }
+        lines.extend([Line::from(""), action("y: quit    n/Esc: stay")]);
+        let border = if dirty + pending > 0 {
+            theme.warning()
+        } else {
+            theme.focus_border()
+        };
+        render_dialog(frame, frame.area(), theme, "Quit", lines, border);
+    } else if let Some(confirm) = app.confirm_rows {
+        let rows = app
+            .relation_rows
+            .as_ref()
+            .map_or(0, |grid| grid.pending().len());
+        let (title, lines) = match confirm {
+            RowsConfirm::Save => (
+                "Save changes",
+                vec![
+                    Line::from(format!(
+                        "Save {pending} change(s) in {rows} row(s) to {table}?"
+                    )),
+                    Line::styled(
+                        "All are saved together; if one fails, nothing is saved.",
+                        theme.muted(),
+                    ),
+                    Line::from(""),
+                    action("Enter/y: save    n/Esc: back"),
+                ],
+            ),
+            RowsConfirm::Leave => (
+                "Unsaved changes",
+                vec![
+                    Line::from(format!("{table} has {pending} unsaved change(s).")),
+                    Line::from(""),
+                    action("s: save    d: discard and leave    Esc: stay"),
+                ],
+            ),
+        };
+        render_dialog(frame, frame.area(), theme, title, lines, theme.warning());
+    }
 }
 
 fn render_login(frame: &mut Frame<'_>, area: Rect, app: &App, state: &ScreenState) {
@@ -2561,24 +2723,22 @@ fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
 
 fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
+    // A colored notice (save result) or the latest status sits above the grid.
+    let notice = app.notice.as_ref().filter(|notice| notice.is_active());
+    let status_height = notice.map_or(1, |notice| notice.height(area.width));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage(40),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
             Constraint::Min(3),
         ])
         .split(area);
-    // Status of the latest action, such as a save of the data grid.
-    let status_style = if app.message.to_lowercase().contains("nothing was saved") {
-        theme.error()
-    } else {
-        theme.muted()
+    let status = match notice {
+        Some(notice) => Paragraph::new(notice.label()).style(notice.style(theme)),
+        None => Paragraph::new(format!(" {}", app.message)).style(theme.muted()),
     };
-    frame.render_widget(
-        Paragraph::new(format!(" {}", app.message)).style(status_style),
-        rows[1],
-    );
+    frame.render_widget(status.wrap(ratatui::widgets::Wrap { trim: false }), rows[1]);
     let structure = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2921,9 +3081,9 @@ mod tests {
     use crate::grid::Grid;
 
     use super::{
-        App, ConnectionForm, FinishedExecution, LoginField, MAX_SQL_TABS, OperationResult,
-        READ_ONLY_FIELD, SQL_VIEW, ScreenState, TLS_FIELD, TabExecution, TabId, TrackedExecution,
-        UiAction, mentions_explain_analyze, render,
+        App, ConnectionForm, FinishedExecution, LoginField, MAX_SQL_TABS, NoticeKind,
+        OperationResult, READ_ONLY_FIELD, RowsConfirm, SQL_VIEW, ScreenState, TLS_FIELD,
+        TabExecution, TabId, TrackedExecution, UiAction, mentions_explain_analyze, render,
     };
 
     fn client() -> ApiClient {
@@ -3445,7 +3605,10 @@ mod tests {
     fn quitting_with_dirty_sql_tabs_requires_confirmation() {
         let mut app = app_with_sql_tab();
         press(&mut app, KeyCode::Char('q'));
-        assert!(app.should_quit, "no dirty tabs quits immediately");
+        assert!(app.confirm_quit && !app.should_quit, "quitting always asks");
+        assert!(render_text(&app).contains("Quit PGRustAdmin?"));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit);
 
         let mut app = app_with_sql_tab();
         app.sql_tabs
@@ -3911,8 +4074,17 @@ mod tests {
 
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, 5, "unsaved changes keep the table open");
-        assert!(app.message.contains("unsaved changes"));
+        assert_eq!(app.confirm_rows, Some(RowsConfirm::Leave));
+        let rendered = render_text(&app);
+        assert!(rendered.contains(".users has 1 unsaved change(s)."));
+        assert!(rendered.contains("d: discard and leave"));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.view, app.confirm_rows), (5, None), "Esc stays");
+
         press(&mut app, KeyCode::Char('q'));
+        assert!(app.confirm_quit && !app.should_quit);
+        assert!(render_text(&app).contains("1 unsaved change(s) in .users will be lost."));
+        press(&mut app, KeyCode::Char('n'));
         assert!(!app.confirm_quit && !app.should_quit);
 
         let grid = app.relation_rows.as_ref().expect("grid");
@@ -3927,8 +4099,21 @@ mod tests {
                 }],
             }]
         );
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.relation_grid_focus);
+        assert!(matches!(app.handle_key(ctrl_s), UiAction::None));
+        assert_eq!(
+            app.confirm_rows,
+            Some(RowsConfirm::Save),
+            "Ctrl+S works without the grid focus"
+        );
+        assert!(render_text(&app).contains("Save 1 change(s) in 1 row(s) to .users?"));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.confirm_rows, None);
+        app.handle_key(ctrl_s);
         assert!(matches!(
-            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            press(&mut app, KeyCode::Enter),
             UiAction::SaveRelationRows(id) if id == connection_id
         ));
 
@@ -3941,15 +4126,20 @@ mod tests {
                 .contains("PostgreSQL rejected the changes [23505]")
         );
         assert!(
-            render_text(&app).contains("PostgreSQL rejected the changes [23505]"),
+            render_text(&app).contains("✖ PostgreSQL rejected the changes [23505]"),
             "save errors are shown on the table screen"
+        );
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.kind),
+            Some(NoticeKind::Error)
         );
         app.apply_result(OperationResult::RowsSaved(Ok(RowSaveOutcome::RowChanged {
             index: 0,
         })));
         assert!(app.message.contains("Row id=0 changed since it was loaded"));
-        assert!(
-            app.relation_rows.as_ref().is_some_and(Grid::has_pending),
+        assert_eq!(
+            app.pending_row_changes(),
+            1,
             "failed saves keep the changes"
         );
 
@@ -3957,9 +4147,16 @@ mod tests {
             updated: 1,
         })));
         assert_eq!(app.message, "Saved 1 row(s).");
-        assert!(!app.relation_rows.as_ref().is_some_and(Grid::has_pending));
+        assert!(render_text(&app).contains("✔ Saved 1 row(s)."));
+        assert_eq!(
+            app.notice.as_ref().map(|notice| notice.kind),
+            Some(NoticeKind::Success)
+        );
+        assert_eq!(app.pending_row_changes(), 0);
         assert!(app.relation_rows_stale, "saved rows are reloaded");
         app.relation_rows_stale = false;
+        press(&mut app, KeyCode::Tab);
+        assert!(app.relation_grid_focus);
 
         let mut read_only = rows_page(5);
         read_only.editable = false;
@@ -3974,6 +4171,48 @@ mod tests {
         assert_eq!(app.message, "Only tables with a primary key can be edited.");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, 4, "nothing pending, Esc leaves");
+    }
+
+    #[test]
+    fn leaving_a_table_with_pending_changes_saves_or_discards_them() {
+        let mut app = authenticated_app();
+        app.view = 5;
+        app.catalog_connection = Some(Uuid::new_v4());
+        app.relation_rows = Some(Grid::remote());
+        app.apply_result(OperationResult::RelationRows(Ok(rows_page(3))));
+        let edit = |app: &mut App| {
+            app.relation_grid_focus = true;
+            press(app, KeyCode::Right);
+            press(app, KeyCode::Char('e'));
+            app.handle_paste("x");
+            press(app, KeyCode::Enter);
+            assert_eq!(app.pending_row_changes(), 1);
+        };
+
+        edit(&mut app);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.view, 4, "discard and leave");
+        assert_eq!(app.pending_row_changes(), 0);
+
+        app.view = 5;
+        edit(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('s')),
+            UiAction::SaveRelationRows(_)
+        ));
+        app.apply_result(OperationResult::RowsSaved(Ok(RowSaveOutcome::RowChanged {
+            index: 0,
+        })));
+        assert_eq!(app.view, 5, "a failed save stays on the table");
+        assert_eq!(app.pending_row_changes(), 1);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('s'));
+        app.apply_result(OperationResult::RowsSaved(Ok(RowSaveOutcome::Saved {
+            updated: 1,
+        })));
+        assert_eq!(app.view, 4, "a successful save leaves");
     }
 
     #[tokio::test]
