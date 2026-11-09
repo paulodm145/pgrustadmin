@@ -17,7 +17,7 @@ Para aplicar migrations ao banco de metadados, defina `PGRUSTADMIN_METADATA_DATA
 cargo run -p pgrustadmin-server -- migrate
 ```
 
-Não registre nem compartilhe o valor da URL; ela contém credenciais. O servidor normal não aplica migrations automaticamente.
+Não registre nem compartilhe o valor da URL; ela contém credenciais. O servidor normal não aplica migrations automaticamente e não inicia enquanto houver migration pendente: a mensagem de erro lista as pendentes. Depois de atualizar o código, rode `migrate` antes de subir o servidor.
 
 Após aplicar as migrations, o servidor usa a mesma variável para autenticação e atende apenas em `127.0.0.1:3000` por padrão:
 

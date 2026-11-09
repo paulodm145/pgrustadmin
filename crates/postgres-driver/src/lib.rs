@@ -1044,6 +1044,26 @@ pub async fn run_metadata_migrations(pool: &PgPool) -> Result<(), MigrateError> 
     METADATA_MIGRATOR.run(pool).await
 }
 
+/// Embedded migrations not yet applied successfully to the metadata
+/// database, as `(version, description)`, in order.
+pub async fn pending_metadata_migrations(pool: &PgPool) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    let has_table: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await?;
+    let applied: Vec<i64> = if has_table {
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(pool)
+            .await?
+    } else {
+        Vec::new()
+    };
+    Ok(METADATA_MIGRATOR
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version))
+        .map(|migration| (migration.version, migration.description.to_string()))
+        .collect())
+}
+
 pub async fn create_session(
     pool: &PgPool,
     user_id: Uuid,
