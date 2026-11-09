@@ -11,11 +11,11 @@ use axum::{
 use pgrustadmin_postgres_driver::{
     Column, ColumnChange, ColumnGenerated, ColumnIdentity, ConnectionData, ConnectionSummary,
     PgPool, PostgresError, RelationKind, RelationRowsError, RelationRowsQuery, RowChange,
-    RowChangeError, SortDirection, StoredConnectionCredentials, create_connection,
-    delete_connection_for_owner, find_connection_credentials_for_owner, find_connection_for_owner,
-    list_columns, list_connections_for_owner, list_databases, list_indexes, list_relation_rows,
-    list_relations, list_schemas, test_database_connection, update_connection_for_owner,
-    update_relation_rows,
+    RowChangeError, RowColumn, RowColumnKind, SortDirection, StoredConnectionCredentials,
+    create_connection, delete_connection_for_owner, find_connection_credentials_for_owner,
+    find_connection_for_owner, list_columns, list_connections_for_owner, list_databases,
+    list_indexes, list_relation_rows, list_relations, list_schemas, test_database_connection,
+    update_connection_for_owner, update_relation_rows,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -528,8 +528,38 @@ struct RowsQuery {
 }
 
 #[derive(Serialize)]
+struct RowColumnResponse {
+    name: String,
+    #[serde(rename = "type")]
+    data_type: String,
+    nullable: bool,
+    /// `boolean`, `enum` or `other`.
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enum_values: Option<Vec<String>>,
+}
+
+impl From<RowColumn> for RowColumnResponse {
+    fn from(column: RowColumn) -> Self {
+        let (kind, enum_values) = match column.kind {
+            RowColumnKind::Boolean => ("boolean", None),
+            RowColumnKind::Enum(labels) => ("enum", Some(labels)),
+            RowColumnKind::Other => ("other", None),
+        };
+        Self {
+            name: column.name,
+            data_type: column.data_type,
+            nullable: column.nullable,
+            kind,
+            enum_values,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct RowsResponse {
     columns: Vec<String>,
+    column_info: Vec<RowColumnResponse>,
     rows: Vec<Vec<Option<String>>>,
     total_rows: i64,
     page: u64,
@@ -593,6 +623,11 @@ async fn list_remote_rows(
         Ok(rows) => Json(RowsResponse {
             editable: !rows.primary_key.is_empty() && !target.connection.read_only,
             columns: rows.columns,
+            column_info: rows
+                .column_info
+                .into_iter()
+                .map(RowColumnResponse::from)
+                .collect(),
             rows: rows.rows,
             total_rows: rows.total_rows,
             page,
@@ -1884,6 +1919,91 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(keyless["error"], "relation_not_editable");
+
+        for statement in [
+            format!("CREATE TYPE {catalog_schema}.mood AS ENUM ('sad', 'ok', 'happy')"),
+            format!("CREATE DOMAIN {catalog_schema}.flag AS boolean"),
+            format!(
+                "CREATE TABLE {catalog_schema}.g_flags (id int PRIMARY KEY, \
+                 active boolean NOT NULL, mood {catalog_schema}.mood, \
+                 flagged {catalog_schema}.flag, note text)"
+            ),
+            format!("INSERT INTO {catalog_schema}.g_flags VALUES (1, true, 'ok', NULL, 'x')"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .expect("create typed fixture");
+        }
+        let flags_path = format!(
+            "/api/v1/connections/{connection_id}/databases/pgrustadmin_test/schemas/{catalog_schema}/relations/g_flags"
+        );
+        let read_flags = || {
+            let app = app.clone();
+            let uri = format!("{flags_path}/rows");
+            let token = owner_token.as_str().to_owned();
+            async move { send_request(app, Method::GET, &uri, Some(&token), None).await }
+        };
+        let (status, flags) = read_json(read_flags().await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            flags["column_info"],
+            serde_json::json!([
+                {"name": "id", "type": "integer", "nullable": false, "kind": "other"},
+                {"name": "active", "type": "boolean", "nullable": false, "kind": "boolean"},
+                {"name": "mood", "type": format!("{catalog_schema}.mood"), "nullable": true,
+                 "kind": "enum", "enum_values": ["sad", "ok", "happy"]},
+                {"name": "flagged", "type": format!("{catalog_schema}.flag"), "nullable": true,
+                 "kind": "boolean"},
+                {"name": "note", "type": "text", "nullable": true, "kind": "other"},
+            ])
+        );
+        assert_eq!(
+            flags["rows"][0],
+            serde_json::json!(["1", "true", "ok", null, "x"])
+        );
+
+        let save_flags = |columns: serde_json::Value| {
+            let app = app.clone();
+            let uri = format!("{flags_path}/rows/changes");
+            let token = owner_token.as_str().to_owned();
+            async move {
+                send_request(
+                    app,
+                    Method::POST,
+                    &uri,
+                    Some(&token),
+                    Some(
+                        serde_json::json!({"changes": [{"key": {"id": "1"}, "columns": columns}]}),
+                    ),
+                )
+                .await
+            }
+        };
+        let (status, saved) = read_json(
+            save_flags(serde_json::json!([
+                {"column": "active", "value": "false", "original": "true"},
+                {"column": "mood", "value": "happy", "original": "ok"},
+                {"column": "flagged", "value": "true", "original": null}
+            ]))
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let (_, flags) = read_json(read_flags().await).await;
+        assert_eq!(
+            flags["rows"][0],
+            serde_json::json!(["1", "false", "happy", "true", "x"])
+        );
+        let (status, rejected) = read_json(
+            save_flags(serde_json::json!([
+                {"column": "mood", "value": "angry", "original": "happy"}
+            ]))
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(rejected["code"], "22P02", "not an enum label: {rejected}");
 
         sqlx::query("UPDATE connections SET read_only = TRUE WHERE id = $1::uuid")
             .bind(connection_id)

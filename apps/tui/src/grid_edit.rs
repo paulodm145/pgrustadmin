@@ -207,11 +207,220 @@ impl CellEditor {
     }
 }
 
+/// Editor used for a column's cells.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ColumnEditor {
+    #[default]
+    Text,
+    /// `[x]`/`[ ]` toggled in place.
+    Boolean,
+    /// One of these labels, picked from a list (enums).
+    Choice(Vec<String>),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColumnType {
+    pub editor: ColumnEditor,
+    pub nullable: bool,
+}
+
+/// Whether a PostgreSQL boolean text is true; `None` for other text.
+pub fn boolean_value(text: &str) -> Option<bool> {
+    match text {
+        "true" | "t" => Some(true),
+        "false" | "f" => Some(false),
+        _ => None,
+    }
+}
+
+/// Next value when toggling a boolean: true, false, then `NULL` when the
+/// column accepts it.
+pub fn toggled_boolean(current: Option<&str>, nullable: bool) -> Option<String> {
+    let next = match current.and_then(boolean_value) {
+        Some(true) => Some(false),
+        Some(false) if nullable => None,
+        Some(false) | None => Some(true),
+    };
+    next.map(|value| value.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerKey {
+    Continue,
+    Pick,
+    Cancel,
+}
+
+/// List of allowed values for one cell, filtered by typing.
+#[derive(Debug)]
+pub struct ChoicePicker {
+    pub key: RowKey,
+    pub column: String,
+    pub original: Option<String>,
+    /// Allowed values; `None` is `NULL`, offered for nullable columns.
+    options: Vec<Option<String>>,
+    filter: String,
+    /// Position in [`ChoicePicker::visible`].
+    selected: usize,
+}
+
+impl ChoicePicker {
+    pub fn new(
+        key: RowKey,
+        column: String,
+        original: Option<String>,
+        labels: &[String],
+        nullable: bool,
+        current: Option<&str>,
+    ) -> Self {
+        let mut options: Vec<Option<String>> = labels.iter().cloned().map(Some).collect();
+        if nullable {
+            options.push(None);
+        }
+        let selected = options
+            .iter()
+            .position(|option| option.as_deref() == current)
+            .unwrap_or(0);
+        Self {
+            key,
+            column,
+            original,
+            options,
+            filter: String::new(),
+            selected,
+        }
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Options matching the filter, case-insensitively.
+    pub fn visible(&self) -> Vec<&Option<String>> {
+        let needle = self.filter.to_lowercase();
+        self.options
+            .iter()
+            .filter(|option| {
+                option
+                    .as_deref()
+                    .unwrap_or("NULL")
+                    .to_lowercase()
+                    .contains(&needle)
+            })
+            .collect()
+    }
+
+    /// The highlighted value; `None` inside is `NULL`.
+    pub fn choice(&self) -> Option<Option<String>> {
+        self.visible()
+            .get(self.selected)
+            .map(|option| (*option).clone())
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> PickerKey {
+        let count = self.visible().len();
+        match key.code {
+            KeyCode::Enter if count > 0 => return PickerKey::Pick,
+            KeyCode::Esc => return PickerKey::Cancel,
+            KeyCode::Up if count > 0 => self.selected = (self.selected + count - 1) % count,
+            KeyCode::Down if count > 0 => self.selected = (self.selected + 1) % count,
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End => self.selected = count.saturating_sub(1),
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.selected = 0;
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.filter.push(character);
+                self.selected = 0;
+            }
+            _ => {}
+        }
+        PickerKey::Continue
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        self.filter
+            .extend(text.chars().filter(|character| !character.is_control()));
+        self.selected = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{CellEditor, EditorKey, PendingChanges, RowKey};
+    use super::{
+        CellEditor, ChoicePicker, EditorKey, PendingChanges, PickerKey, RowKey, boolean_value,
+        toggled_boolean,
+    };
+
+    #[test]
+    fn booleans_toggle_through_null_only_when_nullable() {
+        assert_eq!(boolean_value("t"), Some(true));
+        assert_eq!(boolean_value("false"), Some(false));
+        assert_eq!(boolean_value("yes"), None);
+        assert_eq!(
+            toggled_boolean(Some("true"), false).as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            toggled_boolean(Some("false"), false).as_deref(),
+            Some("true")
+        );
+        assert_eq!(toggled_boolean(Some("f"), true), None);
+        assert_eq!(toggled_boolean(None, true).as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn choice_picker_filters_moves_and_offers_null_for_nullable_columns() {
+        let press = |picker: &mut ChoicePicker, code: KeyCode| {
+            picker.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+        };
+        let labels = ["sad".to_owned(), "ok".to_owned(), "happy".to_owned()];
+        let mut picker =
+            ChoicePicker::new(key("1"), "mood".to_owned(), None, &labels, true, Some("ok"));
+        assert_eq!(
+            picker.choice(),
+            Some(Some("ok".to_owned())),
+            "starts on the value"
+        );
+        assert_eq!(picker.visible().len(), 4);
+        press(&mut picker, KeyCode::Down);
+        press(&mut picker, KeyCode::Down);
+        assert_eq!(picker.choice(), Some(None), "NULL is the last option");
+        press(&mut picker, KeyCode::Down);
+        assert_eq!(
+            picker.choice(),
+            Some(Some("sad".to_owned())),
+            "wraps around"
+        );
+
+        press(&mut picker, KeyCode::Char('A'));
+        assert_eq!(picker.visible().len(), 2, "sad and happy match");
+        picker.paste("pp");
+        assert_eq!(picker.choice(), Some(Some("happy".to_owned())));
+        assert_eq!(press(&mut picker, KeyCode::Enter), PickerKey::Pick);
+        picker.paste("zzz");
+        assert_eq!(picker.choice(), None);
+        assert_eq!(
+            press(&mut picker, KeyCode::Enter),
+            PickerKey::Continue,
+            "nothing to pick"
+        );
+        assert_eq!(press(&mut picker, KeyCode::Esc), PickerKey::Cancel);
+
+        let required = ChoicePicker::new(key("1"), "mood".to_owned(), None, &labels, false, None);
+        assert_eq!(required.visible().len(), 3, "no NULL for NOT NULL columns");
+    }
 
     fn key(id: &str) -> RowKey {
         vec![("id".to_owned(), id.to_owned())]

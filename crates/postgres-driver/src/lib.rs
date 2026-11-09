@@ -373,9 +373,30 @@ pub struct RelationRowsQuery<'a> {
     pub offset: i64,
 }
 
+/// How the data grid can edit a column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowColumnKind {
+    Boolean,
+    /// Labels of an enum type, in sort order.
+    Enum(Vec<String>),
+    Other,
+}
+
+/// Type information of a relation column for the data grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowColumn {
+    pub name: String,
+    /// `format_type` of the declared type, such as `character varying(20)`.
+    pub data_type: String,
+    pub nullable: bool,
+    /// Kind of the type, looking through domains to their base type.
+    pub kind: RowColumnKind,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct RelationRows {
     pub columns: Vec<String>,
+    pub column_info: Vec<RowColumn>,
     pub rows: Vec<Vec<Option<String>>>,
     pub total_rows: i64,
     /// Primary key columns in key order; empty for views and keyless tables.
@@ -448,13 +469,11 @@ pub async fn list_relation_rows(
         let Some(relation_oid) = relation_oid else {
             return Err(RelationRowsError::NotFound);
         };
-        let columns: Vec<String> = sqlx::query_scalar(
-            "SELECT attname::text FROM pg_attribute \
-             WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
-        )
-        .bind(relation_oid)
-        .fetch_all(&mut connection)
-        .await?;
+        let column_info = row_columns(&mut connection, relation_oid).await?;
+        let columns: Vec<String> = column_info
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
         if let Some((column, _)) = query.sort
             && !columns.iter().any(|name| name == column)
         {
@@ -541,6 +560,7 @@ pub async fn list_relation_rows(
         connection.close().await?;
         Ok(RelationRows {
             columns,
+            column_info,
             rows,
             total_rows,
             primary_key,
@@ -548,6 +568,50 @@ pub async fn list_relation_rows(
     })
     .await
     .map_err(|_| RelationRowsError::Database(sqlx::Error::PoolTimedOut))?
+}
+
+/// Columns of a relation with the type details the grid editors need.
+async fn row_columns(
+    connection: &mut sqlx::PgConnection,
+    relation_oid: sqlx::postgres::types::Oid,
+) -> Result<Vec<RowColumn>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct TypedColumn {
+        name: String,
+        data_type: String,
+        nullable: bool,
+        boolean: bool,
+        enum_labels: Option<Vec<String>>,
+    }
+    let rows: Vec<TypedColumn> = sqlx::query_as(
+        "SELECT a.attname::text AS name, format_type(a.atttypid, a.atttypmod) AS data_type, \
+                NOT a.attnotnull AS nullable, base.oid = 'boolean'::regtype AS boolean, \
+                CASE WHEN base.typtype = 'e' THEN ARRAY( \
+                    SELECT e.enumlabel::text FROM pg_enum e \
+                    WHERE e.enumtypid = base.oid ORDER BY e.enumsortorder) END AS enum_labels \
+         FROM pg_attribute a \
+         JOIN pg_type declared ON declared.oid = a.atttypid \
+         JOIN pg_type base ON base.oid = CASE WHEN declared.typtype = 'd' \
+                                              THEN declared.typbasetype ELSE declared.oid END \
+         WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY a.attnum",
+    )
+    .bind(relation_oid)
+    .fetch_all(connection)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|column| RowColumn {
+            name: column.name,
+            data_type: column.data_type,
+            nullable: column.nullable,
+            kind: match (column.boolean, column.enum_labels) {
+                (true, _) => RowColumnKind::Boolean,
+                (false, Some(labels)) => RowColumnKind::Enum(labels),
+                (false, None) => RowColumnKind::Other,
+            },
+        })
+        .collect())
 }
 
 /// Primary key columns of a relation in key order.

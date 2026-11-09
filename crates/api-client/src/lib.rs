@@ -321,9 +321,36 @@ pub struct RelationRowsPage {
     /// Primary key columns; empty when rows cannot be identified.
     #[serde(default)]
     pub primary_key: Vec<String>,
+    /// Type details of `columns`, in the same order; empty from older servers.
+    #[serde(default)]
+    pub column_info: Vec<RowColumnInfo>,
     /// Whether the grid may save changes to these rows.
     #[serde(default)]
     pub editable: bool,
+}
+
+/// How the data grid can edit a column.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RowColumnKind {
+    Boolean,
+    Enum,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RowColumnInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+    pub nullable: bool,
+    #[serde(default)]
+    pub kind: RowColumnKind,
+    /// Labels of an enum column, in sort order.
+    #[serde(default)]
+    pub enum_values: Vec<String>,
 }
 
 /// New and original text of a changed column; `None` is SQL `NULL`.
@@ -1072,6 +1099,8 @@ mod tests {
                         "total_rows": 2,
                         "page": 1,
                         "per_page": 25,
+                        "column_info": [{"name": "query", "type": "mood", "nullable": true,
+                            "kind": "enum", "enum_values": ["sad", "ok"]}],
                     }))
                 }),
             )
@@ -1216,6 +1245,21 @@ mod tests {
             .expect("relation rows");
         assert_eq!(unsorted.rows[0], vec![Some("1|25|-|-|-".to_owned())]);
         assert!(unsorted.primary_key.is_empty() && !unsorted.editable);
+        assert_eq!(
+            unsorted.column_info,
+            vec![super::RowColumnInfo {
+                name: "query".to_owned(),
+                data_type: "mood".to_owned(),
+                nullable: true,
+                kind: super::RowColumnKind::Enum,
+                enum_values: vec!["sad".to_owned(), "ok".to_owned()],
+            }]
+        );
+        let future: super::RowColumnInfo = serde_json::from_value(serde_json::json!(
+            {"name": "a", "type": "x", "nullable": false, "kind": "range"}
+        ))
+        .expect("unknown kinds decode");
+        assert_eq!(future.kind, super::RowColumnKind::Other);
 
         let change = |id: &str| super::RowChangeInput {
             key: [("id".to_owned(), id.to_owned())].into(),
