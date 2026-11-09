@@ -225,10 +225,6 @@ impl Grid {
         self.pending.rows()
     }
 
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
     pub fn clear_pending(&mut self) {
         self.pending.clear();
     }
