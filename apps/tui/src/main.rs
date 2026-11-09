@@ -346,6 +346,8 @@ struct App {
     state: ScreenState,
     view: usize,
     connections: Vec<Connection>,
+    /// Why the latest connection list request failed.
+    connections_error: Option<&'static str>,
     selected_connection: usize,
     connection_page: u64,
     catalog_connection: Option<Uuid>,
@@ -418,6 +420,7 @@ impl App {
             },
             view: 0,
             connections: Vec::new(),
+            connections_error: None,
             selected_connection: 0,
             connection_page: 1,
             catalog_connection: None,
@@ -1482,6 +1485,7 @@ impl App {
                 };
             }
             OperationResult::Connections(Ok(connections)) => {
+                self.connections_error = None;
                 self.connections = connections;
                 self.selected_connection = self
                     .selected_connection
@@ -1493,7 +1497,9 @@ impl App {
                 };
             }
             OperationResult::Connections(Err(error)) => {
-                self.message = api_error_message(error).to_owned();
+                let message = api_error_message(error);
+                self.connections_error = Some(message);
+                self.message = format!("Could not load connections: {message}");
             }
             OperationResult::Databases(Ok(databases)) => {
                 self.databases = databases;
@@ -2361,6 +2367,12 @@ fn render_connections(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 if connection.read_only { "yes" } else { "no" }
             )),
             Line::from("Password: stored securely"),
+        ])
+    } else if let Some(error) = app.connections_error {
+        Text::from(vec![
+            Line::styled("Could not load the saved connections.", theme.error()),
+            Line::styled(error, theme.error()),
+            Line::from("Press r to try again."),
         ])
     } else {
         Text::from("No saved connections. Press n to add one.")
@@ -4171,6 +4183,25 @@ mod tests {
         assert_eq!(app.message, "Only tables with a primary key can be edited.");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, 4, "nothing pending, Esc leaves");
+    }
+
+    #[test]
+    fn a_failed_connection_list_is_not_shown_as_empty() {
+        let mut app = authenticated_app();
+        app.view = 1;
+        app.apply_result(OperationResult::Connections(Err(ApiError::Http {
+            status: 500,
+            code: Some("internal_error"),
+        })));
+        let rendered = render_text(&app);
+        assert!(rendered.contains("Could not load the saved connections."));
+        assert!(rendered.contains("Press r to try again."));
+        assert!(!rendered.contains("No saved connections"));
+
+        app.apply_result(OperationResult::Connections(Ok(Vec::new())));
+        let rendered = render_text(&app);
+        assert!(rendered.contains("No saved connections. Press n to add one."));
+        assert!(!rendered.contains("Could not load"));
     }
 
     #[test]

@@ -8,7 +8,7 @@ Criar a primeira migração versionada para o banco PostgreSQL dedicado a metada
 
 - Usar migrations SQL versionadas do SQLx.
 - Criar somente a tabela `users`, conforme AUTH-001: UUID v4, email canônico único, hash de senha, estado ativo e instante de criação UTC.
-- O comando de migração é explícito: a aplicação nunca executa migrations automaticamente. O operador as aplica com `pgrustadmin-server migrate`.
+- O comando de migração é explícito: a aplicação nunca executa migrations automaticamente. O operador as aplica com `pgrustadmin-server migrate`. Ao iniciar, o servidor compara as migrations embutidas com as aplicadas com sucesso em `_sqlx_migrations` e, se faltar alguma, não sobe: termina com erro listando versão e descrição das pendentes e pedindo `pgrustadmin-server migrate`.
 - O comando usa `PGRUSTADMIN_METADATA_DATABASE_URL`; o valor não pode aparecer nos logs nem ser gravado no repositório.
 - Sessões, conexões, arquivos e preferências entram em migrations posteriores, quando suas especificações estiverem prontas.
 

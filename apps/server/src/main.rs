@@ -16,7 +16,9 @@ use executions::{
     EXECUTION_TIMEOUT_ENV, MAX_CONCURRENT_EXECUTIONS_ENV, execution_timeout,
     max_concurrent_executions, router as executions_router,
 };
-use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
+use pgrustadmin_postgres_driver::{
+    PgPool, connect_metadata_pool, pending_metadata_migrations, run_metadata_migrations,
+};
 use sql_files::{SQL_FILES_DIR_ENV, router as sql_files_router};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -61,6 +63,7 @@ async fn run_server() -> io::Result<()> {
     let metadata_pool = connect_metadata_pool(&database_url)
         .await
         .map_err(|_| io::Error::other("could not connect to metadata database"))?;
+    ensure_metadata_migrated(&metadata_pool).await?;
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
 
@@ -101,6 +104,27 @@ async fn migrate_metadata() -> io::Result<()> {
 
     tracing::info!("metadata migrations applied");
     Ok(())
+}
+
+/// Refuses to serve a metadata database that lacks migrations this build
+/// expects; queries would otherwise fail later with unclear errors.
+async fn ensure_metadata_migrated(pool: &PgPool) -> io::Result<()> {
+    let pending = pending_metadata_migrations(pool)
+        .await
+        .map_err(|_| io::Error::other("could not read the metadata migration state"))?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let names = pending
+        .iter()
+        .map(|(version, description)| format!("{version:04} {description}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(io::Error::other(format!(
+        "the metadata database has {} pending migration(s) ({names}); \
+         run `pgrustadmin-server migrate` and start the server again",
+        pending.len()
+    )))
 }
 
 fn configured_bind_addr() -> io::Result<SocketAddr> {
@@ -153,4 +177,61 @@ fn initialize_logging() -> io::Result<()> {
         .with_env_filter(filter)
         .try_init()
         .map_err(|_| io::Error::other("could not initialize logging"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use pgrustadmin_postgres_driver::{connect_metadata_pool, run_metadata_migrations};
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use uuid::Uuid;
+
+    use super::ensure_metadata_migrated;
+
+    #[tokio::test]
+    async fn the_server_refuses_a_metadata_database_with_pending_migrations() {
+        let database_url = env::var("PGRUSTADMIN_TEST_DATABASE_URL")
+            .expect("PGRUSTADMIN_TEST_DATABASE_URL is required for database tests");
+        let pool = connect_metadata_pool(&database_url)
+            .await
+            .expect("connect to the test metadata database");
+        run_metadata_migrations(&pool)
+            .await
+            .expect("apply metadata migrations");
+        ensure_metadata_migrated(&pool)
+            .await
+            .expect("a migrated database is accepted");
+
+        // An empty schema first in the search path hides the migration table.
+        let schema = format!("unmigrated_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&pool)
+            .await
+            .expect("create empty schema");
+        let options: PgConnectOptions = database_url.parse().expect("parse test URL");
+        let empty = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.options([("search_path", schema.as_str())]))
+            .await
+            .expect("connect with the empty schema");
+        let error = ensure_metadata_migrated(&empty)
+            .await
+            .expect_err("pending migrations stop the server");
+        let message = error.to_string();
+        assert!(
+            message.contains("pending migration(s) (0001 create users"),
+            "{message}"
+        );
+        assert!(
+            message.contains("0006 add connection read only"),
+            "{message}"
+        );
+        assert!(message.contains("pgrustadmin-server migrate"), "{message}");
+        empty.close().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema}")))
+            .execute(&pool)
+            .await
+            .expect("drop empty schema");
+    }
 }
