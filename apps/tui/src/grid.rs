@@ -14,7 +14,10 @@ use ratatui::{
 };
 
 use crate::{
-    grid_edit::{CellEditor, EditorKey, PendingChanges, PendingRow, RowKey},
+    grid_edit::{
+        CellEditor, ChoicePicker, ColumnEditor, ColumnType, EditorKey, PendingChanges, PendingRow,
+        PickerKey, RowKey, boolean_value, toggled_boolean,
+    },
     theme::Theme,
 };
 
@@ -120,6 +123,9 @@ pub struct Grid {
     editing: Result<Vec<String>, &'static str>,
     pending: PendingChanges,
     editor: Option<CellEditor>,
+    picker: Option<ChoicePicker>,
+    /// Editor per column, aligned with `columns`; missing means text.
+    column_types: Vec<ColumnType>,
     /// Page size of the latest remote request; remote pages hold this many rows.
     requested_size: StateCell<usize>,
     // View state updated while rendering, which only has shared access.
@@ -172,6 +178,8 @@ impl Grid {
             editing: Err(NOT_EDITABLE),
             pending: PendingChanges::default(),
             editor: None,
+            picker: None,
+            column_types: Vec::new(),
             requested_size: StateCell::new(0),
             visible_rows: StateCell::new(20),
             first_row: StateCell::new(0),
@@ -217,8 +225,22 @@ impl Grid {
         if editing.is_err() {
             self.pending.clear();
             self.editor = None;
+            self.picker = None;
         }
         self.editing = editing;
+    }
+
+    /// Editors of the columns, in column order; boolean columns also show
+    /// as checkboxes.
+    pub fn set_column_types(&mut self, column_types: Vec<ColumnType>) {
+        self.column_types = column_types;
+    }
+
+    fn column_editor(&self, column: usize) -> &ColumnEditor {
+        static TEXT: ColumnEditor = ColumnEditor::Text;
+        self.column_types
+            .get(column)
+            .map_or(&TEXT, |column_type| &column_type.editor)
     }
 
     pub fn pending(&self) -> &[PendingRow] {
@@ -231,6 +253,10 @@ impl Grid {
 
     /// Pasted text goes to the open cell editor; returns whether it took it.
     pub fn paste(&mut self, text: &str) -> bool {
+        if let Some(picker) = &mut self.picker {
+            picker.paste(text);
+            return true;
+        }
         match &mut self.editor {
             Some(editor) => {
                 editor.paste(text);
@@ -279,6 +305,8 @@ impl Grid {
             .map(|row| (*row).clone())
     }
 
+    /// Opens the editor that fits the active cell's column: a toggle for
+    /// booleans, a list for enums and a text field otherwise.
     fn start_editing(&mut self) -> GridKey {
         let key = match &self.editing {
             Err(reason) => return GridKey::Notice(reason),
@@ -300,12 +328,34 @@ impl Grid {
         let current = self
             .shown_value(&row, Some(&row_key), self.cursor_column)
             .map(str::to_owned);
-        self.editor = Some(CellEditor::new(
-            row_key,
-            column,
-            original,
-            current.as_deref(),
-        ));
+        let nullable = self
+            .column_types
+            .get(self.cursor_column)
+            .is_none_or(|column_type| column_type.nullable);
+        match self.column_editor(self.cursor_column).clone() {
+            ColumnEditor::Boolean => {
+                let value = toggled_boolean(current.as_deref(), nullable);
+                self.pending.set(row_key, &column, original, value);
+            }
+            ColumnEditor::Choice(labels) => {
+                self.picker = Some(ChoicePicker::new(
+                    row_key,
+                    column,
+                    original,
+                    &labels,
+                    nullable,
+                    current.as_deref(),
+                ));
+            }
+            ColumnEditor::Text => {
+                self.editor = Some(CellEditor::new(
+                    row_key,
+                    column,
+                    original,
+                    current.as_deref(),
+                ));
+            }
+        }
         GridKey::Handled
     }
 
@@ -487,6 +537,21 @@ impl Grid {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> GridKey {
+        if let Some(picker) = &mut self.picker {
+            match picker.handle_key(key) {
+                PickerKey::Continue => {}
+                PickerKey::Cancel => self.picker = None,
+                PickerKey::Pick => {
+                    if let Some(picker) = self.picker.take()
+                        && let Some(value) = picker.choice()
+                    {
+                        self.pending
+                            .set(picker.key, &picker.column, picker.original, value);
+                    }
+                }
+            }
+            return GridKey::Handled;
+        }
         if let Some(editor) = &mut self.editor {
             match editor.handle_key(key) {
                 EditorKey::Continue => {}
@@ -557,6 +622,13 @@ impl Grid {
         }
         match key.code {
             KeyCode::Char('e') if editable_source && rows > 0 => return self.start_editing(),
+            KeyCode::Char(' ')
+                if editable_source
+                    && rows > 0
+                    && *self.column_editor(self.cursor_column) == ColumnEditor::Boolean =>
+            {
+                return self.start_editing();
+            }
             KeyCode::Char('x') if editable_source => return self.discard_active_change(),
             KeyCode::Char('X') if editable_source && !self.pending.is_empty() => {
                 self.pending.clear();
@@ -682,6 +754,9 @@ impl Grid {
         if let Some(editor) = &self.editor {
             render_editor(frame, area, theme, editor);
         }
+        if let Some(picker) = &self.picker {
+            render_picker(frame, area, theme, picker);
+        }
     }
 
     fn render_table(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme, focused: bool) {
@@ -784,9 +859,15 @@ impl Grid {
                 .style(theme.muted());
             let values = std::iter::once(number)
                 .chain(shown.iter().map(|column| {
-                    let cell = match self.shown_value(row, key.as_ref(), *column) {
-                        Some(text) => Cell::from(truncate(text, widths[*column])),
-                        None => Cell::from("NULL").style(theme.muted()),
+                    let value = self.shown_value(row, key.as_ref(), *column);
+                    let checkbox = (*self.column_editor(*column) == ColumnEditor::Boolean)
+                        .then(|| value.and_then(boolean_value))
+                        .flatten();
+                    let cell = match (checkbox, value) {
+                        (Some(true), _) => Cell::from("[x]"),
+                        (Some(false), _) => Cell::from("[ ]"),
+                        (None, Some(text)) => Cell::from(truncate(text, widths[*column])),
+                        (None, None) => Cell::from("NULL").style(theme.muted()),
                     };
                     if self.is_pending(key.as_ref(), *column) {
                         cell.style(theme.warning().add_modifier(Modifier::ITALIC))
@@ -923,6 +1004,58 @@ impl Grid {
             popup,
         );
     }
+}
+
+/// Centered list of the values allowed in an enum cell.
+fn render_picker(frame: &mut Frame<'_>, area: Rect, theme: &Theme, picker: &ChoicePicker) {
+    let visible = picker.visible();
+    let list_height = visible.len().clamp(1, 10);
+    let height = u16::try_from(list_height + 4)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let width = (area.width / 2).max(30).min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let first = picker.selected().saturating_sub(list_height - 1);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Filter: ", theme.muted()),
+        Span::raw(picker.filter().to_owned()),
+        Span::styled("▏", theme.accent()),
+    ])];
+    if visible.is_empty() {
+        lines.push(Line::styled("No value matches.", theme.muted()));
+    }
+    for (index, option) in visible.iter().enumerate().skip(first).take(list_height) {
+        let (text, style) = match option {
+            Some(label) => (label.clone(), Style::default()),
+            None => ("NULL".to_owned(), theme.muted()),
+        };
+        let line = if index == picker.selected() {
+            Line::styled(format!("› {text}"), theme.selection())
+        } else {
+            Line::styled(format!("  {text}"), style)
+        };
+        lines.push(line);
+    }
+    lines.push(Line::styled(
+        "↑↓: choose  Enter: keep  Esc: cancel  type: filter",
+        theme.muted(),
+    ));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme.focus_border())
+                .style(theme.surface())
+                .title(format!(" Choose {} ", picker.column)),
+        ),
+        popup,
+    );
 }
 
 /// Centered input for the cell being edited.

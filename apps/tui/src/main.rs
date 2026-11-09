@@ -17,18 +17,19 @@ use crossterm::{
 use dialog::{Notice, NoticeKind, render_dialog};
 use futures_util::StreamExt;
 use grid::{Grid, GridKey, GridRequest};
+use grid_edit::{ColumnEditor, ColumnType};
 use pgrustadmin_api_client::{
     ApiClient, ApiError, AuthSession, Column, ColumnGenerated, ColumnIdentity, Connection,
     ConnectionInput, ConnectionTest, Database, Execution, ExecutionRows, ExecutionStatus, Index,
     Relation, RelationKind, RelationRef, RelationRowsPage, RelationRowsRequest, RowChangeInput,
-    RowSaveOutcome, Schema, SqlFile, SqlFileContent,
+    RowColumnInfo, RowColumnKind, RowSaveOutcome, Schema, SqlFile, SqlFileContent,
 };
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use sql_tabs::{MAX_SQL_TABS, SqlTab, SqlTabs, TabExecution, TabFile, TabId};
 use theme::{THEME_ENV, Theme, detect_color_mode, parse_theme_name};
@@ -1553,6 +1554,7 @@ impl App {
                     } else {
                         Err("This connection is read-only.")
                     };
+                    grid.set_column_types(column_types(&page.columns, &page.column_info));
                     grid.set_remote_page(page.columns, page.rows, page.total_rows);
                     grid.set_editing(editing);
                 }
@@ -2002,13 +2004,19 @@ fn render(frame: &mut Frame<'_>, app: &App) {
     let theme = &app.theme;
     let area = frame.area();
     frame.render_widget(Block::default().style(theme.base()), area);
+    let footer_text = footer_text(app);
+    // Bordered footer: shortcuts take one line, or two when they do not fit.
+    let footer_lines = if footer_text.chars().count() > usize::from(area.width.saturating_sub(2)) {
+        2
+    } else {
+        1
+    };
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(1),
-            // Bordered footer: one line of shortcuts between the borders.
-            Constraint::Length(3),
+            Constraint::Length(footer_lines + 2),
         ])
         .split(area);
     frame.render_widget(
@@ -2102,7 +2110,18 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         state => render_login(frame, sections[1], app, state),
     }
 
-    let footer_text = if app.confirm_quit {
+    frame.render_widget(
+        Paragraph::new(footer_text)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL)),
+        sections[2],
+    );
+    render_confirmations(frame, app);
+}
+
+/// Shortcuts for the current screen and prompt.
+fn footer_text(app: &App) -> &'static str {
+    if app.confirm_quit {
         "Quit PGRustAdmin? y: quit   n/Esc: stay"
     } else if app.confirm_rows == Some(RowsConfirm::Save) {
         "Save the pending changes? Enter/y: save   n/Esc: back"
@@ -2142,7 +2161,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "↑/↓: navigate   Enter: details   [ / ]: pages   r: reload   Tab/Esc: schemas   q: quit"
     } else if matches!(app.state, ScreenState::Authenticated(_)) && app.view == 5 {
         if app.relation_grid_focus {
-            "e: edit  Ctrl+S: save  x/X: discard  Esc: back  ↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: columns"
+            "e: edit  Space: toggle [x]  Ctrl+S: save  x/X: discard  Esc: back  ↑↓←→: move  [ ]: page  g/G: first/last  +/-: size  s: sort  /: search  Enter: value  L: lines  Tab: columns"
         } else {
             "↑/↓: columns   Tab: data grid   Ctrl+S: save changes   r: reload   Esc: relations   q: quit"
         }
@@ -2150,12 +2169,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         "Tab/Enter: open Connections   s: SQL tabs   F2: theme   q/Esc: quit"
     } else {
         "Tab: next field   Enter: continue/sign in   Esc: quit"
-    };
-    frame.render_widget(
-        Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL)),
-        sections[2],
-    );
-    render_confirmations(frame, app);
+    }
 }
 
 /// Centered dialogs for confirmations that guard against losing work.
@@ -2750,7 +2764,7 @@ fn render_relation_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Some(notice) => Paragraph::new(notice.label()).style(notice.style(theme)),
         None => Paragraph::new(format!(" {}", app.message)).style(theme.muted()),
     };
-    frame.render_widget(status.wrap(ratatui::widgets::Wrap { trim: false }), rows[1]);
+    frame.render_widget(status.wrap(Wrap { trim: false }), rows[1]);
     let structure = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2886,6 +2900,26 @@ struct CatalogPath {
     rows: GridRequest,
     /// Pending grid changes, for a save.
     changes: Vec<RowChangeInput>,
+}
+
+/// Grid editors for `columns`, from the server's type details.
+fn column_types(columns: &[String], info: &[RowColumnInfo]) -> Vec<ColumnType> {
+    columns
+        .iter()
+        .map(|name| {
+            info.iter().find(|column| column.name == *name).map_or_else(
+                ColumnType::default,
+                |column| ColumnType {
+                    editor: match column.kind {
+                        RowColumnKind::Boolean => ColumnEditor::Boolean,
+                        RowColumnKind::Enum => ColumnEditor::Choice(column.enum_values.clone()),
+                        RowColumnKind::Other => ColumnEditor::Text,
+                    },
+                    nullable: column.nullable,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Pending changes of the relation grid in the API's shape.
@@ -3084,8 +3118,8 @@ mod tests {
     use pgrustadmin_api_client::{
         ApiClient, ApiError, AuthSession, Column, ColumnChangeInput, Connection, Database,
         Execution, ExecutionError, ExecutionResult, ExecutionRows, ExecutionStatus, Index,
-        Relation, RelationKind, RelationRowsPage, RowChangeInput, RowSaveOutcome, Schema, SqlFile,
-        SqlFileContent,
+        Relation, RelationKind, RelationRowsPage, RowChangeInput, RowColumnInfo, RowColumnKind,
+        RowSaveOutcome, Schema, SqlFile, SqlFileContent,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use uuid::Uuid;
@@ -4055,6 +4089,7 @@ mod tests {
             page: 1,
             per_page: 25,
             primary_key: vec!["id".to_owned()],
+            column_info: Vec::new(),
             editable: true,
         }
     }
@@ -4183,6 +4218,90 @@ mod tests {
         assert_eq!(app.message, "Only tables with a primary key can be edited.");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, 4, "nothing pending, Esc leaves");
+    }
+
+    #[test]
+    fn boolean_cells_toggle_in_place_and_enums_pick_from_a_list() {
+        let mut app = authenticated_app();
+        app.view = 5;
+        app.catalog_connection = Some(Uuid::new_v4());
+        app.catalog_relation = "flags".to_owned();
+        app.relation_rows = Some(Grid::remote());
+        let info =
+            |name: &str, kind: RowColumnKind, nullable: bool, labels: &[&str]| RowColumnInfo {
+                name: name.to_owned(),
+                data_type: "x".to_owned(),
+                nullable,
+                kind,
+                enum_values: labels.iter().map(|label| (*label).to_owned()).collect(),
+            };
+        app.apply_result(OperationResult::RelationRows(Ok(RelationRowsPage {
+            columns: vec!["id".to_owned(), "active".to_owned(), "mood".to_owned()],
+            rows: vec![vec![
+                Some("1".to_owned()),
+                Some("true".to_owned()),
+                Some("ok".to_owned()),
+            ]],
+            total_rows: 1,
+            page: 1,
+            per_page: 25,
+            primary_key: vec!["id".to_owned()],
+            column_info: vec![
+                info("id", RowColumnKind::Other, false, &[]),
+                info("active", RowColumnKind::Boolean, false, &[]),
+                info("mood", RowColumnKind::Enum, true, &["sad", "ok", "happy"]),
+            ],
+            editable: true,
+        })));
+        app.relation_grid_focus = true;
+        assert!(
+            render_text(&app).contains("[x]"),
+            "booleans show as checkboxes"
+        );
+
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(render_text(&app).contains("[ ]"));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            app.pending_row_changes(),
+            0,
+            "NOT NULL booleans go back to true, the original"
+        );
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.pending_row_changes(), 1, "e toggles too");
+
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.pending_row_changes(), 1, "Space only toggles booleans");
+        press(&mut app, KeyCode::Char('e'));
+        let rendered = render_text(&app);
+        assert!(rendered.contains("Choose mood"));
+        assert!(rendered.contains("› ok"), "the current value is selected");
+        assert!(rendered.contains("NULL"), "nullable enums offer NULL");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(!render_text(&app).contains("Choose mood"));
+
+        let grid = app.relation_rows.as_ref().expect("grid");
+        assert_eq!(
+            super::row_changes(grid),
+            vec![RowChangeInput {
+                key: [("id".to_owned(), "1".to_owned())].into(),
+                columns: vec![
+                    ColumnChangeInput {
+                        column: "active".to_owned(),
+                        value: Some("false".to_owned()),
+                        original: Some("true".to_owned()),
+                    },
+                    ColumnChangeInput {
+                        column: "mood".to_owned(),
+                        value: Some("happy".to_owned()),
+                        original: Some("ok".to_owned()),
+                    },
+                ],
+            }]
+        );
     }
 
     #[test]
